@@ -1,0 +1,31 @@
+[package]
+name = "mesh-bc-tester-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust desktop MQTT tester for the Bluetooth Mesh BC light northbound protocol"
+publish = false
+
+[[bin]]
+name = "mesh-bc-tester-rs"
+path = "rust_src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.42", features = ["serde"] }
+dirs = "6.0.0"
+eframe = "0.34.1"
+egui = "0.34.1"
+egui_extras = "0.34.1"
+rfd = "0.15.4"
+rumqttc = "0.25.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[package.metadata.packager]
+before-packaging-command = "cargo build --release --locked"
+product-name = "Mesh BC Tester"
+identifier = "com.codex.mesh-bc-tester-rs"
+publisher = "Codex"
+out-dir = "dist/packages"
+
+[package.metadata.packager.deb]
+section = "utils"
