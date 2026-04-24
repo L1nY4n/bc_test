@@ -82,8 +82,33 @@ pub struct DeviceRuntimeState {
     pub rx_count: u64,
     pub pending_count: u32,
     pub last_opcode: String,
+    pub last_result_label: String,
     pub last_result: String,
+    pub last_rtt_ms: String,
     pub last_summary: String,
+    pub last_version: String,
+    pub last_device_model: String,
+    pub last_mesh_addr: String,
+    pub last_switch_state: String,
+    pub last_run_mode: String,
+    pub last_remote_network_enable: String,
+    pub last_heartbeat_interval: String,
+    pub last_group_linkage: String,
+    pub last_linkage_mode: String,
+    pub last_microwave_setting: String,
+    pub last_linkage_group_state: String,
+    pub last_scene_id: String,
+    pub last_energy_kwh: String,
+    pub last_power_w: String,
+    pub last_a_light_total: String,
+    pub last_a_light_preview: String,
+    pub last_group_info: String,
+    pub last_scene_summary: String,
+    pub last_motion_event: String,
+    pub last_mac_addr: String,
+    pub last_partition_addr: String,
+    pub last_lane_group_addr: String,
+    pub last_adjacent_group_addr: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,11 +167,27 @@ impl TransferKind {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub broker: BrokerProfile,
     pub devices: Vec<DeviceProfile>,
     pub next_device_id: u64,
+    pub transfer_packet_delay_ms: u64,
+    pub transfer_ack_timeout_secs: u64,
+    pub transfer_max_retries: u8,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            broker: BrokerProfile::default(),
+            devices: Vec::new(),
+            next_device_id: 0,
+            transfer_packet_delay_ms: 15,
+            transfer_ack_timeout_secs: 10,
+            transfer_max_retries: 2,
+        }
+    }
 }
 
 impl AppConfig {

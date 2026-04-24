@@ -14,9 +14,9 @@ use crate::models::{
 };
 use crate::mqtt::{MqttEvent, MqttRuntime};
 use crate::protocol::{
-    COMMANDS, FieldKind, build_command_payload, build_transfer_packets, command_by_key,
-    current_time_stamp, expected_response_opcode, parse_opcode, redact_json, summarize_payload,
-    transfer_preview,
+    COMMANDS, FieldKind, build_command_payload, build_transfer_packets, classify_execution_result,
+    command_by_key, current_time_stamp, decode_payload_details, expected_response_opcode,
+    parse_opcode, redact_json, response_can_omit_timestamp, summarize_payload, transfer_preview,
 };
 use crate::store::{load_config, save_config};
 
@@ -34,14 +34,21 @@ pub struct MeshBcTesterApp {
     mqtt: MqttRuntime,
     runtime_states: HashMap<u64, DeviceRuntimeState>,
     logs: Vec<LogEntry>,
+    recent_operations: Vec<OperationRecord>,
     show_selected_logs_only: bool,
+    log_filter_text: String,
     transfer_kind: TransferKind,
     transfer_file: String,
     transfer_version: u8,
     transfer_voice_name: String,
+    transfer_packet_delay_ms: u64,
+    transfer_ack_timeout_secs: u64,
+    transfer_max_retries: u8,
     system_notice: String,
+    pending_confirmation: Option<PendingConfirmation>,
     pending_requests: Vec<PendingRequest>,
     active_transfers: Vec<ActiveTransfer>,
+    device_last_seen_at: HashMap<u64, Instant>,
 }
 
 struct PendingRequest {
@@ -55,6 +62,15 @@ struct PendingRequest {
     time_stamp: Option<u64>,
 }
 
+struct OperationRecord {
+    timestamp: String,
+    device_name: String,
+    opcode: String,
+    status: String,
+    detail: String,
+    rtt_ms: String,
+}
+
 struct ActiveTransfer {
     device_local_id: u64,
     device_name: String,
@@ -66,14 +82,48 @@ struct ActiveTransfer {
     next_send_at: Instant,
     waiting_ack_opcode: Option<u32>,
     waiting_since: Option<Instant>,
+    last_sent_index: Option<usize>,
+    last_sent_time_stamp: Option<u64>,
+    retry_count: u8,
+    max_retries: u8,
     status: String,
+    terminal: bool,
+    succeeded: bool,
+    paused: bool,
+    failure_packet_index: Option<usize>,
+    last_failure_reason: String,
+}
+
+struct PendingConfirmation {
+    title: String,
+    detail: String,
+    action: PendingAction,
+}
+
+enum PendingAction {
+    PresetSend {
+        items: Vec<(DeviceProfile, Value)>,
+    },
+    RawSend {
+        items: Vec<(DeviceProfile, Value, Option<u32>)>,
+    },
+    TransferQueue {
+        devices: Vec<DeviceProfile>,
+        packets: Vec<Value>,
+        preview: Value,
+        byte_size: usize,
+        kind: TransferKind,
+    },
 }
 
 const TRANSFER_PACKET_DELAY_MS: u64 = 15;
 const TRANSFER_ACK_TIMEOUT_SECS: u64 = 10;
+const TRANSFER_MAX_RETRIES: u8 = 2;
 const MAX_TRANSFER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TRANSFER_PACKETS: usize = 6000;
 const MAX_TRANSFER_TOTAL_PUBLISHES: usize = 12000;
+const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
+const MAX_OPERATION_HISTORY: usize = 300;
 
 impl MeshBcTesterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -83,6 +133,21 @@ impl MeshBcTesterApp {
             config.next_device_id = 1;
         }
         let broker_editor = config.broker.clone();
+        let transfer_packet_delay_ms = if config.transfer_packet_delay_ms == 0 {
+            TRANSFER_PACKET_DELAY_MS
+        } else {
+            config.transfer_packet_delay_ms
+        };
+        let transfer_ack_timeout_secs = if config.transfer_ack_timeout_secs == 0 {
+            TRANSFER_ACK_TIMEOUT_SECS
+        } else {
+            config.transfer_ack_timeout_secs
+        };
+        let transfer_max_retries = if config.transfer_max_retries == 0 {
+            TRANSFER_MAX_RETRIES
+        } else {
+            config.transfer_max_retries
+        };
         let command_key = COMMANDS
             .first()
             .map(|spec| spec.key.to_string())
@@ -118,14 +183,21 @@ impl MeshBcTesterApp {
             mqtt: MqttRuntime::default(),
             runtime_states,
             logs: Vec::new(),
+            recent_operations: Vec::new(),
             show_selected_logs_only: false,
+            log_filter_text: String::new(),
             transfer_kind: TransferKind::BcOta,
             transfer_file: String::new(),
             transfer_version: 1,
             transfer_voice_name: "voice.adpcm".into(),
+            transfer_packet_delay_ms,
+            transfer_ack_timeout_secs,
+            transfer_max_retries,
             system_notice: String::new(),
+            pending_confirmation: None,
             pending_requests: Vec::new(),
             active_transfers: Vec::new(),
+            device_last_seen_at: HashMap::new(),
         }
     }
 
@@ -134,6 +206,23 @@ impl MeshBcTesterApp {
         if self.logs.len() > 2000 {
             self.logs.drain(0..self.logs.len().saturating_sub(2000));
         }
+    }
+
+    fn append_operation(&mut self, record: OperationRecord) {
+        self.recent_operations.push(record);
+        if self.recent_operations.len() > MAX_OPERATION_HISTORY {
+            self.recent_operations.drain(
+                0..self
+                    .recent_operations
+                    .len()
+                    .saturating_sub(MAX_OPERATION_HISTORY),
+            );
+        }
+    }
+
+    fn set_device_result(state: &mut DeviceRuntimeState, label: &str, text: String) {
+        state.last_result_label = label.to_string();
+        state.last_result = text;
     }
 
     fn selected_device_refs(&self) -> Vec<&DeviceProfile> {
@@ -148,16 +237,25 @@ impl MeshBcTesterApp {
         self.config
             .devices
             .iter()
-            .find(|device| topic == device.up_topic || topic == device.down_topic)
+            .find(|device| topic == device.up_topic)
     }
 
     fn process_mqtt_events(&mut self) {
         self.collect_pending_timeouts();
         self.collect_transfer_timeouts();
+        self.collect_device_offline_timeouts();
         while let Ok(event) = self.mqtt.events_rx.try_recv() {
             match event {
                 MqttEvent::Connection { message } => {
                     self.connection_status = message.clone();
+                    if message != "已连接" {
+                        for state in self.runtime_states.values_mut() {
+                            state.online = false;
+                            state.pending_count = 0;
+                        }
+                        self.pending_requests.clear();
+                        self.active_transfers.clear();
+                    }
                     self.append_log(LogEntry {
                         timestamp: now_display(),
                         direction: LogDirection::System,
@@ -173,9 +271,20 @@ impl MeshBcTesterApp {
                 MqttEvent::Message { topic, payload } => {
                     let device = self.device_by_topic(&topic).cloned();
                     let parsed: Option<Value> = serde_json::from_str(&payload).ok();
+                    let mut rx_status = "接收".to_string();
                     if let (Some(device), Some(parsed)) = (&device, &parsed) {
                         self.resolve_transfer_ack(device, parsed);
                         self.resolve_pending_request(device, parsed);
+                        if let Some((status, _)) = classify_execution_result(parsed) {
+                            rx_status = status.to_string();
+                        } else if parsed
+                            .get("opcode")
+                            .and_then(Value::as_u64)
+                            .map(|opcode| opcode == 0x10 || opcode == 0x1B)
+                            .unwrap_or(false)
+                        {
+                            rx_status = "事件".into();
+                        }
                     }
                     let (device_name, device_id, opcode, summary) = if let Some(device) = &device {
                         let opcode = parsed
@@ -192,8 +301,13 @@ impl MeshBcTesterApp {
                         state.online = true;
                         state.last_seen = now_display();
                         state.rx_count += 1;
+                        self.device_last_seen_at
+                            .insert(device.local_id, Instant::now());
                         state.last_opcode = opcode.clone();
                         state.last_summary = summary.clone();
+                        if let Some(parsed) = &parsed {
+                            Self::update_device_state_from_payload(state, parsed);
+                        }
                         (
                             device.name.clone(),
                             device.device_id.clone(),
@@ -224,7 +338,7 @@ impl MeshBcTesterApp {
                         device_id,
                         topic,
                         opcode,
-                        status: "接收".into(),
+                        status: rx_status,
                         summary,
                         payload: display_payload,
                     });
@@ -233,8 +347,163 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn update_device_state_from_payload(state: &mut DeviceRuntimeState, payload: &Value) {
+        let Some(opcode) = payload
+            .get("opcode")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+        else {
+            return;
+        };
+
+        match opcode {
+            0x47 => {
+                if let Some(version) = payload.get("version").and_then(Value::as_str) {
+                    state.last_version = version.to_string();
+                }
+                if let Some(model) = payload.get("dev_model").and_then(Value::as_str) {
+                    state.last_device_model = model.to_string();
+                }
+            }
+            0x4F => {
+                if let Some(mesh_addr) = payload.get("value").and_then(Value::as_str) {
+                    state.last_mesh_addr = mesh_addr.to_string();
+                }
+            }
+            0x1B => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                        if bytes.len() >= 2 {
+                            state.last_switch_state = bytes[0].to_string();
+                            state.last_run_mode = bytes[1].to_string();
+                            if bytes.len() >= 3 {
+                                state.last_version = format!("0x{:02X}", bytes[2]);
+                            }
+                        }
+                    }
+                }
+            }
+            0x1D => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                        if bytes.len() >= 2 {
+                            match bytes[0] {
+                                0 => state.last_version = format!("0x{:02X}", bytes[1]),
+                                1 => state.last_run_mode = bytes[1].to_string(),
+                                4 => state.last_remote_network_enable = bytes[1].to_string(),
+                                5 => state.last_heartbeat_interval = bytes[1].to_string(),
+                                6 => state.last_group_linkage = bytes[1].to_string(),
+                                7 => state.last_switch_state = bytes[1].to_string(),
+                                9 => state.last_linkage_mode = bytes[1].to_string(),
+                                12 => state.last_microwave_setting = bytes[1].to_string(),
+                                8 | 255 => {
+                                    if bytes.len() >= 7 {
+                                        state.last_mac_addr = bytes[1..7]
+                                            .iter()
+                                            .map(|byte| format!("{byte:02X}"))
+                                            .collect::<Vec<_>>()
+                                            .join(":");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            0x22 | 0x26 => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                        if !bytes.is_empty() {
+                            state.last_scene_id = bytes[0].to_string();
+                        }
+                        if bytes.len() >= 5 {
+                            state.last_run_mode = bytes[4].to_string();
+                        }
+                        if bytes.len() >= 6 {
+                            state.last_switch_state = bytes[5].to_string();
+                        }
+                        state.last_scene_summary = format!(
+                            "场景{} 模式{} 开关{}",
+                            state.last_scene_id, state.last_run_mode, state.last_switch_state
+                        );
+                    }
+                }
+            }
+            0x29 => {
+                if let Some(power) = payload.get("power").and_then(Value::as_u64) {
+                    state.last_power_w = power.to_string();
+                }
+                if let Some(energy) = payload.get("energy_consumption").and_then(Value::as_u64) {
+                    state.last_energy_kwh = energy.to_string();
+                }
+            }
+            0x51 => {
+                if let Some(total) = payload.get("array_total_size").and_then(Value::as_u64) {
+                    state.last_a_light_total = total.to_string();
+                }
+                if let Some(first) = payload
+                    .get("value_array")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(Value::as_str)
+                {
+                    state.last_a_light_preview =
+                        crate::protocol::decode_a_light_entry_public(first);
+                }
+            }
+            0x32 => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    state.last_linkage_group_state = value.to_string();
+                }
+            }
+            0x1F => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    let compact = value.chars().take(24).collect::<String>();
+                    state.last_group_info = compact;
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                        if !bytes.is_empty() && bytes[0] == 0 && bytes.len() >= 7 {
+                            let partition = u16::from_be_bytes([bytes[1], bytes[2]]);
+                            let lane = u16::from_be_bytes([bytes[3], bytes[4]]);
+                            let adjacent = u16::from_be_bytes([bytes[5], bytes[6]]);
+                            state.last_partition_addr = if partition == 0 || partition == 0xFFFF {
+                                String::new()
+                            } else {
+                                format!("0x{partition:04X}")
+                            };
+                            state.last_lane_group_addr = if lane == 0 || lane == 0xFFFF {
+                                String::new()
+                            } else {
+                                format!("0x{lane:04X}")
+                            };
+                            state.last_adjacent_group_addr = if adjacent == 0 || adjacent == 0xFFFF
+                            {
+                                String::new()
+                            } else {
+                                format!("0x{adjacent:04X}")
+                            };
+                        }
+                    }
+                }
+            }
+            0x10 => {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    state.last_motion_event = match value {
+                        "FF" => "检测到有人".into(),
+                        "00" => "检测到离开".into(),
+                        _ => format!("未知事件({value})"),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn connect(&mut self) {
         self.config.broker = self.broker_editor.clone();
+        self.config.transfer_packet_delay_ms = self.transfer_packet_delay_ms;
+        self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
+        self.config.transfer_max_retries = self.transfer_max_retries;
         self.connection_status = "连接中...".into();
         self.mqtt.connect(&self.config.broker);
         self.sync_subscriptions();
@@ -270,7 +539,7 @@ impl MeshBcTesterApp {
             .map(|value| format!("0x{value:02X}"))
             .unwrap_or_else(|| "-".into());
         state.last_opcode = opcode.clone();
-        state.last_result = format!("已发送({source})");
+        Self::set_device_result(state, "发送", format!("已发送({source})"));
         if source != "transfer" {
             if let Some(opcode_num) = payload.get("opcode").and_then(Value::as_u64) {
                 let time_stamp = payload.get("time_stamp").and_then(Value::as_u64);
@@ -289,9 +558,17 @@ impl MeshBcTesterApp {
                             time_stamp: Some(time_stamp),
                         });
                         state.pending_count = state.pending_count.saturating_add(1);
-                        state.last_result = format!("等待应答(0x{:02X})", expected_opcode);
+                        Self::set_device_result(
+                            state,
+                            "待应答",
+                            format!("等待应答(0x{:02X})", expected_opcode),
+                        );
                     } else {
-                        state.last_result = format!("已发送({source}, 未跟踪应答)");
+                        Self::set_device_result(
+                            state,
+                            "发送",
+                            format!("已发送({source}, 未跟踪应答)"),
+                        );
                     }
                 }
             }
@@ -308,10 +585,18 @@ impl MeshBcTesterApp {
             device_name: device.name.clone(),
             device_id: device.device_id.clone(),
             topic: device.down_topic.clone(),
-            opcode,
+            opcode: opcode.clone(),
             status: source.to_uppercase(),
             summary: summarize_payload(&redacted),
             payload: logged_payload,
+        });
+        self.append_operation(OperationRecord {
+            timestamp: now_display(),
+            device_name: device.name.clone(),
+            opcode: opcode.clone(),
+            status: source.to_uppercase(),
+            detail: summarize_payload(&redacted),
+            rtt_ms: String::new(),
         });
         Ok(())
     }
@@ -327,6 +612,65 @@ impl MeshBcTesterApp {
             return None;
         }
         Some(devices)
+    }
+
+    fn should_confirm_preset_send(&self, command_key: &str, target_count: usize) -> bool {
+        matches!(
+            command_key,
+            "set_network"
+                | "set_mqtt_service"
+                | "set_dns"
+                | "network_management"
+                | "reset_mesh_device"
+        ) || target_count > 1
+    }
+
+    fn should_confirm_transfer(&self, target_count: usize, packet_count: usize) -> bool {
+        target_count > 1 || packet_count > 10
+    }
+
+    fn should_confirm_raw_send(&self, opcode: u32, target_count: usize) -> bool {
+        matches!(
+            opcode,
+            0x02 | 0x33 | 0x48 | 0x4A | 0x52 | 0x40 | 0x43 | 0x54 | 0x5C
+        ) || target_count > 1
+    }
+
+    fn execute_preset_send(&mut self, items: Vec<(DeviceProfile, Value)>) {
+        for (device, payload) in items {
+            if let Err(err) = self.send_payload_to_device(&device, &payload, "preset", None) {
+                self.system_notice = err;
+                return;
+            }
+        }
+    }
+
+    fn execute_raw_send(&mut self, items: Vec<(DeviceProfile, Value, Option<u32>)>) {
+        for (device, payload, expected_override) in items {
+            if let Err(err) =
+                self.send_payload_to_device(&device, &payload, "raw", expected_override)
+            {
+                self.system_notice = err;
+                return;
+            }
+        }
+    }
+
+    fn execute_pending_confirmation(&mut self) {
+        let Some(pending) = self.pending_confirmation.take() else {
+            return;
+        };
+        match pending.action {
+            PendingAction::PresetSend { items } => self.execute_preset_send(items),
+            PendingAction::RawSend { items } => self.execute_raw_send(items),
+            PendingAction::TransferQueue {
+                devices,
+                packets,
+                preview,
+                byte_size,
+                kind,
+            } => self.queue_transfer_action(devices, preview, packets, byte_size, kind),
+        }
     }
 
     fn normalize_raw_payload_for_device(
@@ -371,15 +715,12 @@ impl MeshBcTesterApp {
             return;
         };
         let response_time_stamp = payload.get("time_stamp").and_then(Value::as_u64);
-        let position = self.pending_requests.iter().position(|request| {
-            request.device_local_id == device.local_id
-                && request.expected_opcode == opcode
-                && request
-                    .time_stamp
-                    .zip(response_time_stamp)
-                    .map(|(expected, actual)| expected == actual)
-                    .unwrap_or(false)
-        });
+        let position = match_pending_request_index(
+            &self.pending_requests,
+            device.local_id,
+            opcode,
+            response_time_stamp,
+        );
 
         let Some(position) = position else {
             return;
@@ -387,30 +728,48 @@ impl MeshBcTesterApp {
         let request = self.pending_requests.remove(position);
         let state = self.runtime_states.entry(device.local_id).or_default();
         state.pending_count = state.pending_count.saturating_sub(1);
-        let value_text = payload
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or("ACK");
-        let status = if value_text.contains("Error") || value_text.contains("失败") {
-            "错误"
-        } else {
-            "ACK"
-        };
-        state.last_result = format!(
-            "{} 0x{:02X} -> 0x{:02X}",
-            status, request.opcode, request.expected_opcode
+        state.last_rtt_ms = format!("{}", request.sent_at.elapsed().as_millis());
+        let rtt_ms = state.last_rtt_ms.clone();
+        let (status, result_summary) = classify_execution_result(payload)
+            .map(|(status, summary)| (status, summary))
+            .unwrap_or_else(|| {
+                let fallback = payload
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ACK")
+                    .to_string();
+                ("ACK", fallback)
+            });
+        Self::set_device_result(
+            state,
+            status,
+            format!(
+                "{} 0x{:02X} -> 0x{:02X}",
+                status, request.opcode, request.expected_opcode
+            ),
         );
         self.append_log(LogEntry {
             timestamp: now_display(),
             direction: LogDirection::System,
-            device_name: request.device_name,
-            device_id: request.device_id,
-            topic: request.topic,
+            device_name: request.device_name.clone(),
+            device_id: request.device_id.clone(),
+            topic: request.topic.clone(),
             opcode: format!("0x{:02X}", request.expected_opcode),
             status: status.into(),
-            summary: summarize_payload(&redact_json(payload)),
+            summary: result_summary.clone(),
             payload: serde_json::to_string_pretty(&redact_json(payload))
                 .unwrap_or_else(|_| payload.to_string()),
+        });
+        self.append_operation(OperationRecord {
+            timestamp: now_display(),
+            device_name: request.device_name,
+            opcode: format!(
+                "0x{:02X} -> 0x{:02X}",
+                request.opcode, request.expected_opcode
+            ),
+            status: status.into(),
+            detail: summarize_payload(&redact_json(payload)),
+            rtt_ms,
         });
     }
 
@@ -427,21 +786,36 @@ impl MeshBcTesterApp {
             let request = self.pending_requests.remove(index);
             if let Some(state) = self.runtime_states.get_mut(&request.device_local_id) {
                 state.pending_count = state.pending_count.saturating_sub(1);
-                state.last_result = format!(
-                    "超时 0x{:02X} -> 0x{:02X}",
-                    request.opcode, request.expected_opcode
+                Self::set_device_result(
+                    state,
+                    "超时",
+                    format!(
+                        "超时 0x{:02X} -> 0x{:02X}",
+                        request.opcode, request.expected_opcode
+                    ),
                 );
             }
             self.append_log(LogEntry {
                 timestamp: now_display(),
                 direction: LogDirection::System,
-                device_name: request.device_name,
-                device_id: request.device_id,
-                topic: request.topic,
+                device_name: request.device_name.clone(),
+                device_id: request.device_id.clone(),
+                topic: request.topic.clone(),
                 opcode: format!("0x{:02X}", request.expected_opcode),
                 status: "超时".into(),
                 summary: "等待应答超时(10秒)".into(),
                 payload: String::new(),
+            });
+            self.append_operation(OperationRecord {
+                timestamp: now_display(),
+                device_name: request.device_name,
+                opcode: format!(
+                    "0x{:02X} -> 0x{:02X}",
+                    request.opcode, request.expected_opcode
+                ),
+                status: "超时".into(),
+                detail: "等待应答超时(10秒)".into(),
+                rtt_ms: String::new(),
             });
         }
     }
@@ -526,12 +900,26 @@ impl MeshBcTesterApp {
             .enumerate()
             .filter(|(_, entry)| {
                 if !self.show_selected_logs_only || self.selected_devices.is_empty() {
-                    return true;
-                }
-                self.config.devices.iter().any(|device| {
+                } else if !self.config.devices.iter().any(|device| {
                     self.selected_devices.contains(&device.local_id)
                         && device.device_id == entry.device_id
-                })
+                }) {
+                    return false;
+                }
+                if self.log_filter_text.trim().is_empty() {
+                    return true;
+                }
+                let needle = self.log_filter_text.to_lowercase();
+                [
+                    entry.device_name.as_str(),
+                    entry.device_id.as_str(),
+                    entry.topic.as_str(),
+                    entry.opcode.as_str(),
+                    entry.status.as_str(),
+                    entry.summary.as_str(),
+                ]
+                .iter()
+                .any(|field| field.to_lowercase().contains(&needle))
             })
             .collect()
     }
@@ -593,6 +981,26 @@ impl MeshBcTesterApp {
             );
             return;
         }
+        if self.should_confirm_transfer(devices.len(), packets.len()) {
+            self.pending_confirmation = Some(PendingConfirmation {
+                title: "确认发起传输".into(),
+                detail: format!(
+                    "类型：{}，目标设备：{} 台，文件大小：{} 字节，分包：{}",
+                    self.transfer_kind.label(),
+                    devices.len(),
+                    bytes.len(),
+                    packets.len()
+                ),
+                action: PendingAction::TransferQueue {
+                    devices,
+                    packets,
+                    preview,
+                    byte_size: bytes.len(),
+                    kind: self.transfer_kind,
+                },
+            });
+            return;
+        }
         let total_publishes = packets.len().saturating_mul(devices.len());
         if total_publishes > MAX_TRANSFER_TOTAL_PUBLISHES {
             self.system_notice = format!(
@@ -601,6 +1009,17 @@ impl MeshBcTesterApp {
             );
             return;
         }
+        self.queue_transfer_action(devices, preview, packets, bytes.len(), self.transfer_kind);
+    }
+
+    fn queue_transfer_action(
+        &mut self,
+        devices: Vec<DeviceProfile>,
+        preview: Value,
+        packets: Vec<Value>,
+        byte_size: usize,
+        kind: TransferKind,
+    ) {
         self.append_log(LogEntry {
             timestamp: now_display(),
             direction: LogDirection::System,
@@ -615,14 +1034,43 @@ impl MeshBcTesterApp {
             status: "传输".into(),
             summary: format!(
                 "{} | 文件={} | 分包={}",
-                self.transfer_kind.label(),
-                bytes.len(),
+                kind.label(),
+                byte_size,
                 packets.len()
             ),
             payload: serde_json::to_string_pretty(&redact_json(&preview))
                 .unwrap_or_else(|_| preview.to_string()),
         });
         for device in devices {
+            if self
+                .active_transfers
+                .iter()
+                .any(|transfer| transfer.device_local_id == device.local_id)
+            {
+                self.append_log(LogEntry {
+                    timestamp: now_display(),
+                    direction: LogDirection::System,
+                    device_name: device.name.clone(),
+                    device_id: device.device_id.clone(),
+                    topic: device.down_topic.clone(),
+                    opcode: "-".into(),
+                    status: "跳过".into(),
+                    summary: "该设备已有活跃传输任务".into(),
+                    payload: String::new(),
+                });
+                continue;
+            }
+            if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                Self::set_device_result(
+                    state,
+                    "传输",
+                    format!(
+                        "{} 已排队，共{}包",
+                        self.transfer_kind.label(),
+                        packets.len()
+                    ),
+                );
+            }
             self.active_transfers.push(ActiveTransfer {
                 device_local_id: device.local_id,
                 device_name: device.name.clone(),
@@ -634,7 +1082,16 @@ impl MeshBcTesterApp {
                 next_send_at: Instant::now(),
                 waiting_ack_opcode: None,
                 waiting_since: None,
+                last_sent_index: None,
+                last_sent_time_stamp: None,
+                retry_count: 0,
+                max_retries: self.transfer_max_retries,
                 status: "已排队".into(),
+                terminal: false,
+                succeeded: false,
+                paused: false,
+                failure_packet_index: None,
+                last_failure_reason: String::new(),
             });
         }
     }
@@ -650,6 +1107,12 @@ impl MeshBcTesterApp {
             .collect();
 
         for index in 0..self.active_transfers.len() {
+            if self.active_transfers[index].terminal {
+                continue;
+            }
+            if self.active_transfers[index].paused {
+                continue;
+            }
             if self.active_transfers[index].waiting_ack_opcode.is_some() {
                 continue;
             }
@@ -664,20 +1127,46 @@ impl MeshBcTesterApp {
             let device_local_id = self.active_transfers[index].device_local_id;
             let Some(device) = devices_by_id.get(&device_local_id) else {
                 self.active_transfers[index].status = "设备已删除".into();
+                self.active_transfers[index].next_index =
+                    self.active_transfers[index].packets.len();
+                self.active_transfers[index].waiting_ack_opcode = None;
+                self.active_transfers[index].waiting_since = None;
+                self.active_transfers[index].terminal = true;
+                self.active_transfers[index].succeeded = false;
+                self.active_transfers[index].paused = false;
+                if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                    Self::set_device_result(state, "失败", "设备已删除".into());
+                }
                 continue;
             };
             let packet = self.active_transfers[index].packets
                 [self.active_transfers[index].next_index]
                 .clone();
+            let packet_index = self.active_transfers[index].next_index;
             let opcode = packet.get("opcode").and_then(Value::as_u64).unwrap_or(0) as u32;
             match self.send_payload_to_device(device, &packet, "transfer", None) {
                 Ok(()) => {
+                    self.active_transfers[index].last_sent_index = Some(packet_index);
+                    self.active_transfers[index].last_sent_time_stamp =
+                        packet.get("time_stamp").and_then(Value::as_u64);
                     self.active_transfers[index].next_index += 1;
                     self.active_transfers[index].status = format!(
                         "发送中 {}/{}",
                         self.active_transfers[index].next_index,
                         self.active_transfers[index].packets.len()
                     );
+                    if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                        Self::set_device_result(
+                            state,
+                            "传输",
+                            format!(
+                                "{} 发送中 {}/{}",
+                                self.active_transfers[index].kind.label(),
+                                self.active_transfers[index].next_index,
+                                self.active_transfers[index].packets.len()
+                            ),
+                        );
+                    }
                     if let Some(expected_ack) = transfer_expected_ack_opcode(
                         self.active_transfers[index].kind,
                         opcode,
@@ -688,13 +1177,23 @@ impl MeshBcTesterApp {
                         self.active_transfers[index].waiting_since = Some(now);
                         self.active_transfers[index].status =
                             format!("等待ACK 0x{:02X}", expected_ack);
+                        if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                            Self::set_device_result(
+                                state,
+                                "待应答",
+                                format!("传输等待ACK 0x{:02X}", expected_ack),
+                            );
+                        }
                     } else {
                         self.active_transfers[index].next_send_at =
-                            now + Duration::from_millis(TRANSFER_PACKET_DELAY_MS);
+                            now + Duration::from_millis(self.transfer_packet_delay_ms);
                     }
                 }
                 Err(err) => {
-                    self.active_transfers[index].status = format!("发送失败: {err}");
+                    self.retry_or_fail_transfer(index, packet_index, format!("发送失败: {err}"));
+                    if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                        Self::set_device_result(state, "错误", format!("传输发送失败: {err}"));
+                    }
                     self.system_notice = err;
                 }
             }
@@ -704,23 +1203,80 @@ impl MeshBcTesterApp {
         for (index, transfer) in self.active_transfers.iter().enumerate() {
             if transfer.next_index >= transfer.packets.len()
                 && transfer.waiting_ack_opcode.is_none()
+                && !transfer.terminal
             {
                 completed.push(index);
             }
         }
-        for index in completed.into_iter().rev() {
-            let transfer = self.active_transfers.remove(index);
+        for index in completed {
+            let (
+                device_local_id,
+                device_name,
+                device_id,
+                down_topic,
+                status,
+                summary,
+                succeeded,
+                kind_label,
+                transfer_status,
+            ) = {
+                let transfer = &mut self.active_transfers[index];
+                transfer.terminal = true;
+                transfer.succeeded = !(transfer.status.contains("拒绝")
+                    || transfer.status.contains("超时")
+                    || transfer.status.contains("失败"));
+                let status = if transfer.succeeded {
+                    "完成".to_string()
+                } else {
+                    "失败".to_string()
+                };
+                let summary = if transfer.succeeded {
+                    format!("{} 传输完成", transfer.kind.label())
+                } else {
+                    format!("{} 传输失败: {}", transfer.kind.label(), transfer.status)
+                };
+                (
+                    transfer.device_local_id,
+                    transfer.device_name.clone(),
+                    transfer.device_id.clone(),
+                    transfer.down_topic.clone(),
+                    status,
+                    summary,
+                    transfer.succeeded,
+                    transfer.kind.label().to_string(),
+                    transfer.status.clone(),
+                )
+            };
             self.append_log(LogEntry {
                 timestamp: now_display(),
                 direction: LogDirection::System,
-                device_name: transfer.device_name,
-                device_id: transfer.device_id,
-                topic: transfer.down_topic,
+                device_name: device_name.clone(),
+                device_id: device_id.clone(),
+                topic: down_topic.clone(),
                 opcode: "-".into(),
-                status: "完成".into(),
-                summary: format!("{} 传输完成", transfer.kind.label()),
+                status: status.clone(),
+                summary: summary.clone(),
                 payload: String::new(),
             });
+            self.append_operation(OperationRecord {
+                timestamp: now_display(),
+                device_name: device_name.clone(),
+                opcode: kind_label.clone(),
+                status: status.clone(),
+                detail: summary.clone(),
+                rtt_ms: String::new(),
+            });
+            if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                Self::set_device_result(
+                    state,
+                    if succeeded { "成功" } else { "失败" },
+                    if succeeded {
+                        format!("{kind_label} 传输完成")
+                    } else {
+                        format!("{kind_label} 传输失败: {transfer_status}")
+                    },
+                );
+            }
         }
     }
 
@@ -733,56 +1289,548 @@ impl MeshBcTesterApp {
             return;
         };
         let position = self.active_transfers.iter().position(|transfer| {
+            let timestamp_matches = if transfer
+                .waiting_ack_opcode
+                .map(response_can_omit_timestamp)
+                .unwrap_or(false)
+            {
+                true
+            } else {
+                transfer
+                    .last_sent_time_stamp
+                    .zip(payload.get("time_stamp").and_then(Value::as_u64))
+                    .map(|(expected, actual)| expected == actual)
+                    .unwrap_or(false)
+            };
             transfer.device_local_id == device.local_id
                 && transfer.waiting_ack_opcode == Some(opcode)
+                && timestamp_matches
         });
         let Some(position) = position else {
             return;
         };
         let transfer = &mut self.active_transfers[position];
-        if matches!(opcode, 0x41 | 0x44) {
-            let consent = payload.get("value").and_then(Value::as_u64).unwrap_or(0);
-            if consent != 1 {
-                transfer.status = "设备拒绝继续传输".into();
-                self.append_log(LogEntry {
-                    timestamp: now_display(),
-                    direction: LogDirection::System,
-                    device_name: transfer.device_name.clone(),
-                    device_id: transfer.device_id.clone(),
-                    topic: transfer.down_topic.clone(),
-                    opcode: format!("0x{:02X}", opcode),
-                    status: "拒绝".into(),
-                    summary: "设备未同意继续传输".into(),
-                    payload: serde_json::to_string_pretty(&redact_json(payload))
-                        .unwrap_or_else(|_| payload.to_string()),
-                });
+        if let Some((status, summary)) = classify_execution_result(payload) {
+            if status == "错误" {
+                let device_name = transfer.device_name.clone();
+                let device_id = transfer.device_id.clone();
+                let down_topic = transfer.down_topic.clone();
+                let op_device_name = device_name.clone();
+                let op_summary = summary.clone();
+                transfer.status = format!("ACK失败: {summary}");
                 transfer.next_index = transfer.packets.len();
                 transfer.waiting_ack_opcode = None;
                 transfer.waiting_since = None;
+                transfer.terminal = true;
+                transfer.succeeded = false;
+                transfer.paused = false;
+                let payload_text = serde_json::to_string_pretty(&redact_json(payload))
+                    .unwrap_or_else(|_| payload.to_string());
+                self.append_log(LogEntry {
+                    timestamp: now_display(),
+                    direction: LogDirection::System,
+                    device_name,
+                    device_id,
+                    topic: down_topic,
+                    opcode: format!("0x{:02X}", opcode),
+                    status: "错误".into(),
+                    summary,
+                    payload: payload_text,
+                });
+                self.append_operation(OperationRecord {
+                    timestamp: now_display(),
+                    device_name: op_device_name,
+                    opcode: format!("0x{:02X}", opcode),
+                    status: "错误".into(),
+                    detail: op_summary,
+                    rtt_ms: String::new(),
+                });
+                return;
+            }
+        }
+        if matches!(opcode, 0x41 | 0x44) {
+            let consent = payload.get("value").and_then(Value::as_u64).unwrap_or(0);
+            if consent != 1 {
+                let device_name = transfer.device_name.clone();
+                let device_id = transfer.device_id.clone();
+                let down_topic = transfer.down_topic.clone();
+                let op_device_name = device_name.clone();
+                transfer.status = "设备拒绝继续传输".into();
+                transfer.next_index = transfer.packets.len();
+                transfer.waiting_ack_opcode = None;
+                transfer.waiting_since = None;
+                transfer.terminal = true;
+                transfer.succeeded = false;
+                let payload_text = serde_json::to_string_pretty(&redact_json(payload))
+                    .unwrap_or_else(|_| payload.to_string());
+                transfer.failure_packet_index = transfer.last_sent_index;
+                transfer.last_failure_reason = "设备未同意继续传输".into();
+                if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                    Self::set_device_result(state, "拒绝", "设备未同意继续传输".into());
+                }
+                self.append_log(LogEntry {
+                    timestamp: now_display(),
+                    direction: LogDirection::System,
+                    device_name,
+                    device_id,
+                    topic: down_topic,
+                    opcode: format!("0x{:02X}", opcode),
+                    status: "拒绝".into(),
+                    summary: "设备未同意继续传输".into(),
+                    payload: payload_text,
+                });
+                self.append_operation(OperationRecord {
+                    timestamp: now_display(),
+                    device_name: op_device_name,
+                    opcode: format!("0x{:02X}", opcode),
+                    status: "拒绝".into(),
+                    detail: "设备未同意继续传输".into(),
+                    rtt_ms: String::new(),
+                });
                 return;
             }
         }
         transfer.waiting_ack_opcode = None;
         transfer.waiting_since = None;
-        transfer.next_send_at = Instant::now() + Duration::from_millis(TRANSFER_PACKET_DELAY_MS);
-        transfer.status = "收到ACK".into();
+        if matches!(opcode, 0x41 | 0x44) {
+            transfer.paused = true;
+            transfer.status = "已获同意，等待继续".into();
+            if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                Self::set_device_result(state, "待继续", "已获同意，等待继续".into());
+            }
+        } else {
+            transfer.paused = false;
+            transfer.next_send_at =
+                Instant::now() + Duration::from_millis(TRANSFER_PACKET_DELAY_MS);
+            transfer.status = "收到ACK".into();
+            if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                Self::set_device_result(state, "成功", "收到传输ACK".into());
+            }
+        }
     }
 
     fn collect_transfer_timeouts(&mut self) {
-        let timeout = Duration::from_secs(TRANSFER_ACK_TIMEOUT_SECS);
-        for transfer in &mut self.active_transfers {
+        let timeout = Duration::from_secs(self.transfer_ack_timeout_secs);
+        let now = Instant::now();
+        let mut timed_out = Vec::new();
+        for (index, transfer) in self.active_transfers.iter().enumerate() {
             if let (Some(expected_ack), Some(waiting_since)) =
                 (transfer.waiting_ack_opcode, transfer.waiting_since)
             {
-                if Instant::now().duration_since(waiting_since) >= timeout {
-                    transfer.status = format!("ACK超时 0x{:02X}", expected_ack);
-                    transfer.next_index = transfer.packets.len();
-                    transfer.waiting_ack_opcode = None;
-                    transfer.waiting_since = None;
+                if now.duration_since(waiting_since) >= timeout {
+                    timed_out.push((index, expected_ack));
+                }
+            }
+        }
+        for (index, expected_ack) in timed_out {
+            let device_local_id = self.active_transfers[index].device_local_id;
+            let retry_from = self.active_transfers[index]
+                .last_sent_index
+                .unwrap_or(self.active_transfers[index].next_index.saturating_sub(1));
+            self.retry_or_fail_transfer(
+                index,
+                retry_from,
+                format!("ACK超时 0x{:02X}", expected_ack),
+            );
+            if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                Self::set_device_result(
+                    state,
+                    "超时",
+                    format!("传输ACK超时 0x{:02X}", expected_ack),
+                );
+            }
+        }
+    }
+
+    fn collect_device_offline_timeouts(&mut self) {
+        let timeout = Duration::from_secs(DEVICE_OFFLINE_TIMEOUT_SECS);
+        let now = Instant::now();
+        for (device_id, last_seen_at) in &self.device_last_seen_at {
+            if now.duration_since(*last_seen_at) >= timeout {
+                if let Some(state) = self.runtime_states.get_mut(device_id) {
+                    state.online = false;
                 }
             }
         }
     }
+
+    fn cancel_transfers_for_devices(&mut self, device_ids: &[u64]) {
+        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+        let mut cancelled = Vec::new();
+        for transfer in &mut self.active_transfers {
+            if device_ids.contains(&transfer.device_local_id) {
+                transfer.terminal = true;
+                transfer.succeeded = false;
+                transfer.waiting_ack_opcode = None;
+                transfer.waiting_since = None;
+                transfer.status = "已取消".into();
+                transfer.paused = false;
+                cancelled.push((
+                    transfer.device_name.clone(),
+                    transfer.device_id.clone(),
+                    transfer.down_topic.clone(),
+                    transfer.kind.label().to_string(),
+                ));
+            }
+        }
+        for (device_name, device_id, down_topic, kind_label) in cancelled {
+            let device_id_for_lookup = device_id.clone();
+            self.append_log(LogEntry {
+                timestamp: now_display(),
+                direction: LogDirection::System,
+                device_name: device_name.clone(),
+                device_id: device_id.clone(),
+                topic: down_topic.clone(),
+                opcode: "-".into(),
+                status: "取消".into(),
+                summary: format!("{kind_label} 传输已取消"),
+                payload: String::new(),
+            });
+            self.append_operation(OperationRecord {
+                timestamp: now_display(),
+                device_name: device_name.clone(),
+                opcode: kind_label.clone(),
+                status: "取消".into(),
+                detail: "传输已取消".into(),
+                rtt_ms: String::new(),
+            });
+            if let Some(device) = self
+                .config
+                .devices
+                .iter()
+                .find(|device| device.device_id == device_id_for_lookup)
+            {
+                if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                    Self::set_device_result(state, "取消", format!("{kind_label} 传输已取消"));
+                }
+            }
+        }
+    }
+
+    fn retry_failed_transfers_for_devices(&mut self, device_ids: &[u64]) {
+        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+        for transfer in &mut self.active_transfers {
+            if !device_ids.contains(&transfer.device_local_id) {
+                continue;
+            }
+            if transfer.terminal && !transfer.succeeded {
+                transfer.terminal = false;
+                transfer.status = "重新排队".into();
+                transfer.next_index = transfer.last_sent_index.unwrap_or(0);
+                transfer.waiting_ack_opcode = None;
+                transfer.waiting_since = None;
+                transfer.next_send_at = Instant::now();
+                transfer.retry_count = 0;
+                transfer.paused = false;
+                if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                    Self::set_device_result(state, "重试", "失败传输重新排队".into());
+                }
+            }
+        }
+    }
+
+    fn resume_transfers_for_devices(&mut self, device_ids: &[u64]) {
+        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+        for transfer in &mut self.active_transfers {
+            if device_ids.contains(&transfer.device_local_id)
+                && transfer.paused
+                && !transfer.terminal
+            {
+                transfer.paused = false;
+                transfer.status = "继续传输".into();
+                transfer.next_send_at = Instant::now();
+                if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                    Self::set_device_result(state, "继续", "继续传输".into());
+                }
+            }
+        }
+    }
+
+    fn clear_terminal_transfers(&mut self) {
+        self.active_transfers.retain(|transfer| !transfer.terminal);
+    }
+
+    fn export_evidence(&mut self) {
+        let Some(path) = FileDialog::new()
+            .set_file_name("mesh-bc-test-evidence.json")
+            .save_file()
+        else {
+            return;
+        };
+
+        let device_states = self
+            .config
+            .devices
+            .iter()
+            .map(|device| {
+                let state = self
+                    .runtime_states
+                    .get(&device.local_id)
+                    .cloned()
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "name": device.name,
+                    "device_id": device.device_id,
+                    "up_topic": device.up_topic,
+                    "down_topic": device.down_topic,
+                    "mesh_dev_type": device.mesh_dev_type,
+                    "default_dest_addr": device.default_dest_addr,
+                    "subscribe_enabled": device.subscribe_enabled,
+                    "runtime": {
+                        "online": state.online,
+                        "last_seen": state.last_seen,
+                        "tx_count": state.tx_count,
+                        "rx_count": state.rx_count,
+                        "pending_count": state.pending_count,
+                        "last_opcode": state.last_opcode,
+                        "last_result_label": state.last_result_label,
+                        "last_result": state.last_result,
+                        "last_rtt_ms": state.last_rtt_ms,
+                        "last_summary": state.last_summary,
+                        "last_version": state.last_version,
+                        "last_device_model": state.last_device_model,
+                        "last_mesh_addr": state.last_mesh_addr,
+                        "last_switch_state": state.last_switch_state,
+                        "last_run_mode": state.last_run_mode,
+                        "last_remote_network_enable": state.last_remote_network_enable,
+                        "last_heartbeat_interval": state.last_heartbeat_interval,
+                        "last_group_linkage": state.last_group_linkage,
+                        "last_linkage_mode": state.last_linkage_mode,
+                        "last_microwave_setting": state.last_microwave_setting,
+                        "last_linkage_group_state": state.last_linkage_group_state,
+                        "last_scene_id": state.last_scene_id,
+                        "last_energy_kwh": state.last_energy_kwh,
+                        "last_power_w": state.last_power_w,
+                        "last_a_light_total": state.last_a_light_total,
+                        "last_a_light_preview": state.last_a_light_preview,
+                        "last_group_info": state.last_group_info,
+                        "last_scene_summary": state.last_scene_summary,
+                        "last_motion_event": state.last_motion_event,
+                        "last_mac_addr": state.last_mac_addr,
+                        "last_partition_addr": state.last_partition_addr,
+                        "last_lane_group_addr": state.last_lane_group_addr,
+                        "last_adjacent_group_addr": state.last_adjacent_group_addr,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let pending = self
+            .pending_requests
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "device_name": request.device_name,
+                    "device_id": request.device_id,
+                    "topic": request.topic,
+                    "opcode": format!("0x{:02X}", request.opcode),
+                    "expected_opcode": format!("0x{:02X}", request.expected_opcode),
+                    "time_stamp": request.time_stamp,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let transfers = self
+            .active_transfers
+            .iter()
+            .map(|transfer| {
+                serde_json::json!({
+                    "device_name": transfer.device_name,
+                    "device_id": transfer.device_id,
+                    "kind": transfer.kind.label(),
+                    "progress": format!("{}/{}", transfer.next_index, transfer.packets.len()),
+                    "waiting_ack_opcode": transfer.waiting_ack_opcode.map(|opcode| format!("0x{:02X}", opcode)),
+                    "retry_count": transfer.retry_count,
+                    "max_retries": transfer.max_retries,
+                    "terminal": transfer.terminal,
+                    "succeeded": transfer.succeeded,
+                    "paused": transfer.paused,
+                    "failure_packet_index": transfer.failure_packet_index,
+                    "last_failure_reason": transfer.last_failure_reason,
+                    "status": transfer.status,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let logs = self
+            .logs
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "timestamp": entry.timestamp,
+                    "direction": entry.direction.as_str(),
+                    "device_name": entry.device_name,
+                    "device_id": entry.device_id,
+                    "topic": entry.topic,
+                    "opcode": entry.opcode,
+                    "status": entry.status,
+                    "summary": entry.summary,
+                    "payload": entry.payload,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let operations = self
+            .recent_operations
+            .iter()
+            .map(|op| {
+                serde_json::json!({
+                    "timestamp": op.timestamp,
+                    "device_name": op.device_name,
+                    "opcode": op.opcode,
+                    "status": op.status,
+                    "detail": op.detail,
+                    "rtt_ms": op.rtt_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let evidence = serde_json::json!({
+            "generated_at": now_display(),
+            "connection_status": self.connection_status,
+            "broker": {
+                "name": self.broker_editor.name,
+                "host": self.broker_editor.host,
+                "port": self.broker_editor.port,
+                "username": self.broker_editor.username,
+                "client_id": self.broker_editor.client_id,
+                "keepalive_secs": self.broker_editor.keepalive_secs,
+                "use_tls": self.broker_editor.use_tls,
+            },
+            "transfer_settings": {
+                "packet_delay_ms": self.transfer_packet_delay_ms,
+                "ack_timeout_secs": self.transfer_ack_timeout_secs,
+                "max_retries": self.transfer_max_retries,
+            },
+            "device_states": device_states,
+            "pending_requests": pending,
+            "active_transfers": transfers,
+            "recent_operations": operations,
+            "logs": logs,
+        });
+
+        match serde_json::to_string_pretty(&evidence) {
+            Ok(text) => match fs::write(&path, text) {
+                Ok(()) => {
+                    self.system_notice = format!("已导出测试证据: {}", path.display());
+                }
+                Err(err) => {
+                    self.system_notice = format!("导出失败: {err}");
+                }
+            },
+            Err(err) => {
+                self.system_notice = format!("序列化导出内容失败: {err}");
+            }
+        }
+    }
+
+    fn retry_or_fail_transfer(&mut self, index: usize, retry_packet_index: usize, reason: String) {
+        let transfer = &mut self.active_transfers[index];
+        apply_transfer_retry_state(
+            transfer,
+            retry_packet_index,
+            reason,
+            self.transfer_packet_delay_ms,
+        );
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self {
+            config: AppConfig::default(),
+            broker_editor: BrokerProfile::default(),
+            device_editor: DeviceEditor {
+                mesh_dev_type: 1,
+                default_dest_addr: 1,
+                subscribe_enabled: true,
+                ..Default::default()
+            },
+            selected_devices: BTreeSet::new(),
+            selected_log_index: None,
+            command_key: "query_bc_info".into(),
+            command_form: BTreeMap::new(),
+            raw_json_text: "{}".into(),
+            raw_expected_opcode: String::new(),
+            connection_status: "未连接".into(),
+            mqtt: MqttRuntime::default(),
+            runtime_states: HashMap::new(),
+            logs: Vec::new(),
+            recent_operations: Vec::new(),
+            show_selected_logs_only: false,
+            log_filter_text: String::new(),
+            transfer_kind: TransferKind::BcOta,
+            transfer_file: String::new(),
+            transfer_version: 1,
+            transfer_voice_name: "voice.adpcm".into(),
+            transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
+            transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
+            transfer_max_retries: TRANSFER_MAX_RETRIES,
+            system_notice: String::new(),
+            pending_confirmation: None,
+            pending_requests: Vec::new(),
+            active_transfers: Vec::new(),
+            device_last_seen_at: HashMap::new(),
+        }
+    }
+}
+
+fn apply_transfer_retry_state(
+    transfer: &mut ActiveTransfer,
+    retry_packet_index: usize,
+    reason: String,
+    packet_delay_ms: u64,
+) {
+    transfer.failure_packet_index = Some(retry_packet_index);
+    transfer.last_failure_reason = reason.clone();
+    if transfer.retry_count < transfer.max_retries {
+        transfer.retry_count += 1;
+        transfer.next_index = retry_packet_index;
+        transfer.waiting_ack_opcode = None;
+        transfer.waiting_since = None;
+        transfer.paused = false;
+        transfer.next_send_at = Instant::now()
+            + Duration::from_millis(packet_delay_ms * u64::from(transfer.retry_count + 1));
+        transfer.status = format!(
+            "{}，从第{}包准备重试 {}/{}",
+            reason,
+            retry_packet_index + 1,
+            transfer.retry_count,
+            transfer.max_retries
+        );
+    } else {
+        transfer.status = reason;
+        transfer.next_index = transfer.packets.len();
+        transfer.waiting_ack_opcode = None;
+        transfer.waiting_since = None;
+        transfer.paused = false;
+    }
+}
+
+fn match_pending_request_index(
+    pending_requests: &[PendingRequest],
+    device_local_id: u64,
+    opcode: u32,
+    response_time_stamp: Option<u64>,
+) -> Option<usize> {
+    let matching = pending_requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request.device_local_id == device_local_id && request.expected_opcode == opcode
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(response_time_stamp) = response_time_stamp {
+        return matching.into_iter().find_map(|(index, request)| {
+            (request.time_stamp == Some(response_time_stamp)).then_some(index)
+        });
+    }
+
+    if response_can_omit_timestamp(opcode) && matching.len() == 1 {
+        return Some(matching[0].0);
+    }
+
+    None
 }
 
 impl eframe::App for MeshBcTesterApp {
@@ -826,12 +1874,37 @@ impl eframe::App for MeshBcTesterApp {
                     if Self::secondary_button(ui, "断开").clicked() {
                         self.mqtt.disconnect();
                     }
+                    if Self::secondary_button(ui, "导出结果").clicked() {
+                        self.export_evidence();
+                    }
                     ui.label(format!("状态: {}", self.connection_status));
                 });
                 if !self.system_notice.is_empty() {
                     ui.colored_label(egui::Color32::YELLOW, &self.system_notice);
                 }
             });
+
+        if let Some((title, detail)) = self
+            .pending_confirmation
+            .as_ref()
+            .map(|pending| (pending.title.clone(), pending.detail.clone()))
+        {
+            egui::Panel::top("confirm_bar")
+                .frame(Self::top_bottom_panel_frame(panel_style))
+                .show_inside(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(egui::Color32::YELLOW, format!("待确认: {}", title));
+                        ui.separator();
+                        ui.label(detail);
+                        if Self::primary_button(ui, "确认执行").clicked() {
+                            self.execute_pending_confirmation();
+                        }
+                        if Self::secondary_button(ui, "取消").clicked() {
+                            self.pending_confirmation = None;
+                        }
+                    });
+                });
+        }
 
         egui::Panel::bottom("status_bar")
             .frame(Self::top_bottom_panel_frame(panel_style))
@@ -892,8 +1965,183 @@ impl eframe::App for MeshBcTesterApp {
                                             state.pending_count
                                         ));
                                         ui.small(format!("上行: {}", device.up_topic));
+                                        if !state.last_rtt_ms.is_empty() {
+                                            ui.small(format!("RTT: {} ms", state.last_rtt_ms));
+                                        }
+                                        if !state.last_version.is_empty()
+                                            || !state.last_mesh_addr.is_empty()
+                                            || !state.last_device_model.is_empty()
+                                        {
+                                            ui.small(format!(
+                                                "版本:{} 型号:{} Mesh:{}",
+                                                if state.last_version.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_version
+                                                },
+                                                if state.last_device_model.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_device_model
+                                                },
+                                                if state.last_mesh_addr.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_mesh_addr
+                                                }
+                                            ));
+                                        }
+                                        if !state.last_switch_state.is_empty()
+                                            || !state.last_run_mode.is_empty()
+                                            || !state.last_heartbeat_interval.is_empty()
+                                            || !state.last_remote_network_enable.is_empty()
+                                            || !state.last_group_linkage.is_empty()
+                                            || !state.last_linkage_mode.is_empty()
+                                            || !state.last_microwave_setting.is_empty()
+                                            || !state.last_linkage_group_state.is_empty()
+                                        {
+                                            ui.small(format!(
+                                                "开关:{} 模式:{} 心跳:{} 遥控组网:{} 组内联动:{} 联动模式:{} 微波:{} 联动组:{}",
+                                                if state.last_switch_state.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_switch_state
+                                                },
+                                                if state.last_run_mode.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_run_mode
+                                                }
+                                                ,
+                                                if state.last_heartbeat_interval.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_heartbeat_interval
+                                                },
+                                                if state.last_remote_network_enable.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_remote_network_enable
+                                                },
+                                                if state.last_group_linkage.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_group_linkage
+                                                },
+                                                if state.last_linkage_mode.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_linkage_mode
+                                                },
+                                                if state.last_microwave_setting.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_microwave_setting
+                                                },
+                                                if state.last_linkage_group_state.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_linkage_group_state
+                                                }
+                                            ));
+                                        }
+                                        if !state.last_scene_id.is_empty()
+                                            || !state.last_energy_kwh.is_empty()
+                                            || !state.last_a_light_total.is_empty()
+                                            || !state.last_power_w.is_empty()
+                                        {
+                                            ui.small(format!(
+                                                "场景:{} 功率:{}W 能耗:{}kWh A灯:{}",
+                                                if state.last_scene_id.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_scene_id
+                                                },
+                                                if state.last_power_w.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_power_w
+                                                },
+                                                if state.last_energy_kwh.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_energy_kwh
+                                                },
+                                                if state.last_a_light_total.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_a_light_total
+                                                }
+                                            ));
+                                        }
+                                        if !state.last_a_light_preview.is_empty() {
+                                            ui.small(format!(
+                                                "A灯样本: {}",
+                                                state.last_a_light_preview
+                                            ));
+                                        }
+                                        if !state.last_group_info.is_empty()
+                                            || !state.last_motion_event.is_empty()
+                                        {
+                                            ui.small(format!(
+                                                "组网:{} 事件:{}",
+                                                if state.last_group_info.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_group_info
+                                                },
+                                                if state.last_motion_event.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_motion_event
+                                                }
+                                            ));
+                                        }
+                                        if !state.last_mac_addr.is_empty()
+                                            || !state.last_partition_addr.is_empty()
+                                            || !state.last_lane_group_addr.is_empty()
+                                            || !state.last_adjacent_group_addr.is_empty()
+                                        {
+                                            ui.small(format!(
+                                                "MAC:{} 分区:{} 车道组:{} 相邻组:{}",
+                                                if state.last_mac_addr.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_mac_addr
+                                                },
+                                                if state.last_partition_addr.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_partition_addr
+                                                },
+                                                if state.last_lane_group_addr.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_lane_group_addr
+                                                },
+                                                if state.last_adjacent_group_addr.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_adjacent_group_addr
+                                                },
+                                            ));
+                                        }
+                                        if !state.last_scene_summary.is_empty() {
+                                            ui.small(format!(
+                                                "场景摘要: {}",
+                                                state.last_scene_summary
+                                            ));
+                                        }
                                         if !state.last_result.is_empty() {
-                                            ui.small(format!("结果: {}", state.last_result));
+                                            ui.small(format!(
+                                                "结果[{}]: {}",
+                                                if state.last_result_label.is_empty() {
+                                                    "--"
+                                                } else {
+                                                    &state.last_result_label
+                                                },
+                                                state.last_result
+                                            ));
                                         }
                                     });
                                     if ui.button("编辑").clicked() {
@@ -1036,19 +2284,25 @@ impl eframe::App for MeshBcTesterApp {
                             let Some(devices) = self.ensure_selected_devices() else {
                                 return;
                             };
+                            let mut items = Vec::new();
                             for device in devices {
                                 match build_command_payload(spec, &device, &self.command_form) {
-                                    Ok(payload) => match self
-                                        .send_payload_to_device(&device, &payload, "preset", None)
-                                    {
-                                        Ok(()) => {}
-                                        Err(err) => {
-                                            self.system_notice = err;
-                                            return;
-                                        }
-                                    },
+                                    Ok(payload) => items.push((device, payload)),
                                     Err(err) => self.system_notice = err,
                                 }
+                            }
+                            if self.should_confirm_preset_send(spec.key, items.len()) {
+                                self.pending_confirmation = Some(PendingConfirmation {
+                                    title: "确认发送预置命令".into(),
+                                    detail: format!(
+                                        "命令：{}，目标设备：{} 台",
+                                        spec.label,
+                                        items.len()
+                                    ),
+                                    action: PendingAction::PresetSend { items },
+                                });
+                            } else {
+                                self.execute_preset_send(items);
                             }
                         }
                     }
@@ -1094,27 +2348,36 @@ impl eframe::App for MeshBcTesterApp {
                                         let Some(devices) = self.ensure_selected_devices() else {
                                             return;
                                         };
+                                        let opcode_num = parse_opcode(&opcode_text).unwrap_or(0);
+                                        let mut items = Vec::new();
                                         for device in devices {
                                             match self.normalize_raw_payload_for_device(
                                                 payload.clone(),
                                                 &device,
                                             ) {
-                                                Ok(normalized) => {
-                                                    if let Err(err) = self.send_payload_to_device(
-                                                        &device,
-                                                        &normalized,
-                                                        "raw",
-                                                        expected_override,
-                                                    ) {
-                                                        self.system_notice = err;
-                                                        return;
-                                                    }
-                                                }
+                                                Ok(normalized) => items.push((
+                                                    device,
+                                                    normalized,
+                                                    expected_override,
+                                                )),
                                                 Err(err) => {
                                                     self.system_notice = err;
                                                     return;
                                                 }
                                             }
+                                        }
+                                        if self.should_confirm_raw_send(opcode_num, items.len()) {
+                                            self.pending_confirmation = Some(PendingConfirmation {
+                                                title: "确认发送原始 JSON".into(),
+                                                detail: format!(
+                                                    "操作码：0x{:02X}，目标设备：{} 台",
+                                                    opcode_num,
+                                                    items.len()
+                                                ),
+                                                action: PendingAction::RawSend { items },
+                                            });
+                                        } else {
+                                            self.execute_raw_send(items);
                                         }
                                     }
                                 } else {
@@ -1148,6 +2411,20 @@ impl eframe::App for MeshBcTesterApp {
                         ui.label("语音文件名");
                         ui.text_edit_singleline(&mut self.transfer_voice_name);
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("包间隔(ms)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.transfer_packet_delay_ms)
+                                .range(1..=5_000),
+                        );
+                        ui.label("ACK超时(s)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
+                                .range(1..=300),
+                        );
+                        ui.label("最大重试");
+                        ui.add(egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10));
+                    });
                     if Self::primary_button(ui, "发送传输预览").clicked() {
                         self.send_transfer_preview();
                     }
@@ -1173,8 +2450,334 @@ impl eframe::App for MeshBcTesterApp {
                         .sum();
                     Self::stat_chip(ui, "总接收", total_rx.to_string());
                     Self::stat_chip(ui, "总发送", total_tx.to_string());
+                    Self::stat_chip(ui, "待应答", self.pending_requests.len().to_string());
+                    Self::stat_chip(ui, "传输中", self.active_transfers.len().to_string());
                     ui.checkbox(&mut self.show_selected_logs_only, "仅显示已选设备日志");
                 });
+            });
+
+            Self::panel_card_frame(ui).show(ui, |ui| {
+                ui.label(RichText::new("请求状态").heading());
+                ui.separator();
+                if self.pending_requests.is_empty() {
+                    ui.label("当前没有待应答请求。");
+                } else {
+                    let now = Instant::now();
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::initial(120.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::remainder())
+                        .min_scrolled_height(110.0)
+                        .header(24.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("设备");
+                            });
+                            header.col(|ui| {
+                                ui.strong("请求");
+                            });
+                            header.col(|ui| {
+                                ui.strong("等待");
+                            });
+                            header.col(|ui| {
+                                ui.strong("时间戳");
+                            });
+                            header.col(|ui| {
+                                ui.strong("主题");
+                            });
+                        })
+                        .body(|mut body| {
+                            for request in &self.pending_requests {
+                                body.row(24.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(&request.device_name);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "0x{:02X} -> 0x{:02X}",
+                                            request.opcode, request.expected_opcode
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "{}ms",
+                                            now.duration_since(request.sent_at).as_millis()
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            request
+                                                .time_stamp
+                                                .map(|value| value.to_string())
+                                                .unwrap_or_else(|| "-".into()),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&request.topic);
+                                    });
+                                });
+                            }
+                        });
+                }
+            });
+
+            Self::panel_card_frame(ui).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("传输状态").heading());
+                    if self
+                        .active_transfers
+                        .iter()
+                        .any(|transfer| transfer.paused && !transfer.terminal)
+                        && Self::secondary_button(ui, "继续待传输").clicked()
+                    {
+                        let ids = self
+                            .active_transfers
+                            .iter()
+                            .filter(|transfer| transfer.paused && !transfer.terminal)
+                            .map(|transfer| transfer.device_local_id)
+                            .collect::<Vec<_>>();
+                        self.resume_transfers_for_devices(&ids);
+                    }
+                    if self
+                        .active_transfers
+                        .iter()
+                        .any(|transfer| transfer.terminal && !transfer.succeeded)
+                        && Self::secondary_button(ui, "重试失败").clicked()
+                    {
+                        let ids = self
+                            .active_transfers
+                            .iter()
+                            .filter(|transfer| transfer.terminal && !transfer.succeeded)
+                            .map(|transfer| transfer.device_local_id)
+                            .collect::<Vec<_>>();
+                        self.retry_failed_transfers_for_devices(&ids);
+                    }
+                    if self
+                        .active_transfers
+                        .iter()
+                        .any(|transfer| transfer.terminal)
+                        && Self::secondary_button(ui, "清除终态").clicked()
+                    {
+                        self.clear_terminal_transfers();
+                    }
+                    if !self.active_transfers.is_empty()
+                        && Self::secondary_button(ui, "取消全部").clicked()
+                    {
+                        let ids = self
+                            .active_transfers
+                            .iter()
+                            .map(|transfer| transfer.device_local_id)
+                            .collect::<Vec<_>>();
+                        self.cancel_transfers_for_devices(&ids);
+                    }
+                });
+                ui.separator();
+                if self.active_transfers.is_empty() {
+                    ui.label("当前没有活跃传输。");
+                } else {
+                    let mut cancel_ids = Vec::new();
+                    let mut resume_ids = Vec::new();
+                    let mut retry_ids = Vec::new();
+                    let mut clear_ids = Vec::new();
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::initial(120.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(90.0))
+                        .column(Column::initial(180.0))
+                        .column(Column::initial(70.0))
+                        .column(Column::initial(70.0))
+                        .column(Column::remainder())
+                        .min_scrolled_height(110.0)
+                        .header(24.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("设备");
+                            });
+                            header.col(|ui| {
+                                ui.strong("类型");
+                            });
+                            header.col(|ui| {
+                                ui.strong("进度");
+                            });
+                            header.col(|ui| {
+                                ui.strong("等待ACK");
+                            });
+                            header.col(|ui| {
+                                ui.strong("失败点");
+                            });
+                            header.col(|ui| {
+                                ui.strong("失败原因");
+                            });
+                            header.col(|ui| {
+                                ui.strong("重试");
+                            });
+                            header.col(|ui| {
+                                ui.strong("操作");
+                            });
+                            header.col(|ui| {
+                                ui.strong("状态");
+                            });
+                        })
+                        .body(|mut body| {
+                            for transfer in &self.active_transfers {
+                                body.row(24.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(&transfer.device_name);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(transfer.kind.label());
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "{}/{}",
+                                            transfer.next_index,
+                                            transfer.packets.len()
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            transfer
+                                                .waiting_ack_opcode
+                                                .map(|opcode| format!("0x{:02X}", opcode))
+                                                .unwrap_or_else(|| "-".into()),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            transfer
+                                                .failure_packet_index
+                                                .map(|index| format!("#{}", index + 1))
+                                                .unwrap_or_else(|| "-".into()),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        if transfer.last_failure_reason.is_empty() {
+                                            ui.label("-");
+                                        } else {
+                                            ui.label(&transfer.last_failure_reason);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "{}/{}",
+                                            transfer.retry_count, transfer.max_retries
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        if transfer.paused && !transfer.terminal {
+                                            if Self::secondary_button(ui, "继续").clicked() {
+                                                resume_ids.push(transfer.device_local_id);
+                                            }
+                                        } else if transfer.terminal && !transfer.succeeded {
+                                            if Self::secondary_button(ui, "重试").clicked() {
+                                                retry_ids.push(transfer.device_local_id);
+                                            }
+                                        } else if transfer.terminal {
+                                            if Self::secondary_button(ui, "清理").clicked() {
+                                                clear_ids.push(transfer.device_local_id);
+                                            }
+                                        } else if Self::secondary_button(ui, "取消").clicked() {
+                                            cancel_ids.push(transfer.device_local_id);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&transfer.status);
+                                    });
+                                });
+                            }
+                        });
+                    if !cancel_ids.is_empty() {
+                        self.cancel_transfers_for_devices(&cancel_ids);
+                    }
+                    if !resume_ids.is_empty() {
+                        self.resume_transfers_for_devices(&resume_ids);
+                    }
+                    if !retry_ids.is_empty() {
+                        self.retry_failed_transfers_for_devices(&retry_ids);
+                    }
+                    if !clear_ids.is_empty() {
+                        self.active_transfers
+                            .retain(|transfer| !clear_ids.contains(&transfer.device_local_id));
+                    }
+                }
+            });
+
+            Self::panel_card_frame(ui).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("最近操作").heading());
+                    if !self.recent_operations.is_empty()
+                        && Self::secondary_button(ui, "清空操作").clicked()
+                    {
+                        self.recent_operations.clear();
+                    }
+                });
+                ui.separator();
+                if self.recent_operations.is_empty() {
+                    ui.label("当前没有最近操作记录。");
+                } else {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::initial(140.0))
+                        .column(Column::initial(120.0))
+                        .column(Column::initial(110.0))
+                        .column(Column::initial(80.0))
+                        .column(Column::initial(80.0))
+                        .column(Column::remainder())
+                        .min_scrolled_height(120.0)
+                        .header(24.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("时间");
+                            });
+                            header.col(|ui| {
+                                ui.strong("设备");
+                            });
+                            header.col(|ui| {
+                                ui.strong("操作");
+                            });
+                            header.col(|ui| {
+                                ui.strong("状态");
+                            });
+                            header.col(|ui| {
+                                ui.strong("RTT");
+                            });
+                            header.col(|ui| {
+                                ui.strong("详情");
+                            });
+                        })
+                        .body(|mut body| {
+                            for op in self.recent_operations.iter().rev().take(20) {
+                                body.row(24.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(&op.timestamp);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&op.device_name);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&op.opcode);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&op.status);
+                                    });
+                                    row.col(|ui| {
+                                        let value = if op.rtt_ms.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            op.rtt_ms.clone()
+                                        };
+                                        ui.label(value);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&op.detail);
+                                    });
+                                });
+                            }
+                        });
+                }
             });
 
             let filtered_logs: Vec<(usize, LogEntry)> = self
@@ -1185,6 +2788,19 @@ impl eframe::App for MeshBcTesterApp {
 
             Self::panel_card_frame(ui).show(ui, |ui| {
                 ui.label(RichText::new("消息日志").heading());
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("筛选");
+                    ui.add(
+                        TextEdit::singleline(&mut self.log_filter_text)
+                            .desired_width(220.0)
+                            .hint_text("设备 / opcode / 状态 / 主题"),
+                    );
+                    if Self::secondary_button(ui, "清空日志").clicked() {
+                        self.logs.clear();
+                        self.selected_log_index = None;
+                    }
+                });
                 ui.separator();
                 TableBuilder::new(ui)
                     .striped(true)
@@ -1257,6 +2873,45 @@ impl eframe::App for MeshBcTesterApp {
             });
 
             Self::panel_card_frame(ui).show(ui, |ui| {
+                ui.label(RichText::new("解析详情").heading());
+                ui.separator();
+                if let Some(index) = self.selected_log_index {
+                    if let Some(entry) = self.logs.get(index) {
+                        if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
+                            let details = decode_payload_details(&payload);
+                            if details.is_empty() {
+                                ui.label("当前负载暂无结构化解析。");
+                            } else {
+                                TableBuilder::new(ui)
+                                    .striped(true)
+                                    .column(Column::initial(160.0))
+                                    .column(Column::remainder())
+                                    .min_scrolled_height(120.0)
+                                    .body(|mut body| {
+                                        for (key, value) in details {
+                                            body.row(24.0, |mut row| {
+                                                row.col(|ui| {
+                                                    ui.strong(key);
+                                                });
+                                                row.col(|ui| {
+                                                    ui.label(value);
+                                                });
+                                            });
+                                        }
+                                    });
+                            }
+                        } else {
+                            ui.label("当前负载不是可解析的 JSON。");
+                        }
+                    } else {
+                        ui.label("未选择日志。");
+                    }
+                } else {
+                    ui.label("未选择日志。");
+                }
+            });
+
+            Self::panel_card_frame(ui).show(ui, |ui| {
                 ui.label(RichText::new("当前负载").heading());
                 ui.separator();
                 if let Some(index) = self.selected_log_index {
@@ -1281,8 +2936,60 @@ impl eframe::App for MeshBcTesterApp {
 
     fn on_exit(&mut self) {
         self.config.broker = self.broker_editor.clone();
+        self.config.transfer_packet_delay_ms = self.transfer_packet_delay_ms;
+        self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
+        self.config.transfer_max_retries = self.transfer_max_retries;
         let _ = save_config(&self.config);
         self.mqtt.disconnect();
+    }
+}
+
+fn compact_transfer_payload_log(payload: &Value) -> String {
+    let mut redacted = redact_json(payload);
+    if let Some(object) = redacted.as_object_mut() {
+        if let Some(value) = object.get_mut("value") {
+            if let Some(text) = value.as_str() {
+                let abbreviated = if text.len() > 32 {
+                    format!("{}...(len={})", &text[..32], text.len())
+                } else {
+                    text.to_string()
+                };
+                *value = Value::String(abbreviated);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
+}
+
+fn transfer_expected_ack_opcode(
+    kind: TransferKind,
+    opcode: u32,
+    next_index: usize,
+    packet_count: usize,
+) -> Option<u32> {
+    match kind {
+        TransferKind::BcOta => (opcode == 0x40).then_some(0x41),
+        TransferKind::AOta => (opcode == 0x43).then_some(0x44),
+        TransferKind::VoiceFile => {
+            if opcode == 0x54 {
+                Some(0x55)
+            } else if opcode == 0x56 {
+                Some(0x57)
+            } else if opcode == 0x58 && next_index == packet_count {
+                Some(0x59)
+            } else {
+                None
+            }
+        }
+        TransferKind::RealtimeVoice => {
+            if opcode == 0x5C {
+                Some(0x5D)
+            } else if opcode == 0x60 && next_index == packet_count {
+                Some(0x61)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -1588,4 +3295,315 @@ fn load_chinese_font() -> Option<(String, FontData)> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(
+        device_local_id: u64,
+        expected_opcode: u32,
+        time_stamp: Option<u64>,
+    ) -> PendingRequest {
+        PendingRequest {
+            device_local_id,
+            device_name: "设备A".into(),
+            device_id: "dev-a".into(),
+            topic: "topic/down".into(),
+            opcode: 0x46,
+            expected_opcode,
+            sent_at: Instant::now(),
+            time_stamp,
+        }
+    }
+
+    #[test]
+    fn pending_match_prefers_exact_timestamp() {
+        let requests = vec![pending(1, 0x47, Some(100)), pending(1, 0x47, Some(200))];
+        let index = match_pending_request_index(&requests, 1, 0x47, Some(200));
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn pending_match_allows_single_unique_candidate_when_reply_lacks_timestamp() {
+        let requests = vec![pending(1, 0x41, None)];
+        let index = match_pending_request_index(&requests, 1, 0x41, None);
+        assert_eq!(index, Some(0));
+    }
+
+    #[test]
+    fn pending_match_rejects_ambiguous_candidates_without_timestamp() {
+        let requests = vec![pending(1, 0x47, Some(100)), pending(1, 0x47, Some(200))];
+        let index = match_pending_request_index(&requests, 1, 0x47, None);
+        assert_eq!(index, None);
+    }
+
+    #[test]
+    fn pending_match_rejects_missing_timestamp_for_timestamped_response() {
+        let requests = vec![pending(1, 0x47, Some(100))];
+        let index = match_pending_request_index(&requests, 1, 0x47, None);
+        assert_eq!(index, None);
+    }
+
+    fn sample_transfer() -> ActiveTransfer {
+        ActiveTransfer {
+            device_local_id: 1,
+            device_name: "设备A".into(),
+            device_id: "dev-a".into(),
+            down_topic: "topic/down".into(),
+            kind: TransferKind::BcOta,
+            packets: vec![
+                serde_json::json!({"opcode": 0x40}),
+                serde_json::json!({"opcode": 0x42}),
+            ],
+            next_index: 1,
+            next_send_at: Instant::now(),
+            waiting_ack_opcode: Some(0x41),
+            waiting_since: Some(Instant::now()),
+            last_sent_index: Some(0),
+            last_sent_time_stamp: Some(123),
+            retry_count: 0,
+            max_retries: 2,
+            status: "等待ACK 0x41".into(),
+            terminal: false,
+            succeeded: false,
+            paused: false,
+            failure_packet_index: None,
+            last_failure_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn transfer_retry_state_requeues_when_retries_remain() {
+        let mut transfer = sample_transfer();
+        apply_transfer_retry_state(&mut transfer, 0, "ACK超时 0x41".into(), 15);
+        assert_eq!(transfer.retry_count, 1);
+        assert_eq!(transfer.next_index, 0);
+        assert!(transfer.status.contains("准备重试"));
+        assert!(transfer.waiting_ack_opcode.is_none());
+        assert_eq!(transfer.failure_packet_index, Some(0));
+        assert_eq!(transfer.last_failure_reason, "ACK超时 0x41");
+    }
+
+    #[test]
+    fn transfer_retry_state_finishes_when_retry_budget_exhausted() {
+        let mut transfer = sample_transfer();
+        transfer.retry_count = transfer.max_retries;
+        let total_packets = transfer.packets.len();
+        apply_transfer_retry_state(&mut transfer, 0, "ACK超时 0x41".into(), 15);
+        assert_eq!(transfer.next_index, total_packets);
+        assert_eq!(transfer.status, "ACK超时 0x41");
+    }
+
+    #[test]
+    fn retry_failed_transfer_resets_terminal_state() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![{
+                let mut transfer = sample_transfer();
+                transfer.terminal = true;
+                transfer.succeeded = false;
+                transfer.status = "ACK超时 0x41".into();
+                transfer.next_index = transfer.packets.len();
+                transfer
+            }],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.retry_failed_transfers_for_devices(&[1]);
+        let transfer = &app.active_transfers[0];
+        assert!(!transfer.terminal);
+        assert_eq!(transfer.status, "重新排队");
+        assert_eq!(transfer.retry_count, 0);
+    }
+
+    #[test]
+    fn clear_terminal_transfers_removes_finished_rows() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![{
+                let mut transfer = sample_transfer();
+                transfer.terminal = true;
+                transfer.succeeded = true;
+                transfer
+            }],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.clear_terminal_transfers();
+        assert!(app.active_transfers.is_empty());
+    }
+
+    #[test]
+    fn resume_paused_transfer_clears_pause_and_sets_status() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![{
+                let mut transfer = sample_transfer();
+                transfer.paused = true;
+                transfer.status = "已获同意，等待继续".into();
+                transfer.waiting_ack_opcode = None;
+                transfer
+            }],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.resume_transfers_for_devices(&[1]);
+        let transfer = &app.active_transfers[0];
+        assert!(!transfer.paused);
+        assert_eq!(transfer.status, "继续传输");
+    }
+
+    #[test]
+    fn cancel_transfer_marks_terminal_and_logs_entry() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.cancel_transfers_for_devices(&[1]);
+        assert_eq!(app.active_transfers.len(), 1);
+        let transfer = &app.active_transfers[0];
+        assert!(transfer.terminal);
+        assert!(!transfer.succeeded);
+        assert_eq!(transfer.status, "已取消");
+        assert_eq!(
+            app.logs.last().map(|entry| entry.status.as_str()),
+            Some("取消")
+        );
+    }
+
+    #[test]
+    fn raw_send_confirmation_required_for_dangerous_opcode() {
+        let app = MeshBcTesterApp::new_for_test();
+        assert!(app.should_confirm_raw_send(0x4A, 1));
+    }
+
+    #[test]
+    fn raw_send_confirmation_required_for_multi_device_send() {
+        let app = MeshBcTesterApp::new_for_test();
+        assert!(app.should_confirm_raw_send(0x46, 2));
+        assert!(!app.should_confirm_raw_send(0x46, 1));
+    }
+
+    #[test]
+    fn voice_file_chunk_requires_ack_0x57() {
+        let ack = transfer_expected_ack_opcode(TransferKind::VoiceFile, 0x56, 2, 5);
+        assert_eq!(ack, Some(0x57));
+    }
+
+    #[test]
+    fn device_state_updates_from_energy_reply() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x29,
+            "power": 40,
+            "energy_consumption": 12
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_power_w, "40");
+        assert_eq!(state.last_energy_kwh, "12");
+    }
+
+    #[test]
+    fn device_state_updates_from_a_light_list_reply() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x51,
+            "array_total_size": 88,
+            "value_array": ["E001112233445566"]
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_a_light_total, "88");
+        assert_eq!(state.last_a_light_preview, "0xE001/11:22:33:44:55:66");
+    }
+
+    #[test]
+    fn device_state_updates_from_mesh_management_reply() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x1F,
+            "value": "00E000F000E100000000"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_group_info, "00E000F000E100000000");
+        assert_eq!(state.last_partition_addr, "0xE000");
+        assert_eq!(state.last_lane_group_addr, "0xF000");
+        assert_eq!(state.last_adjacent_group_addr, "0xE100");
+    }
+
+    #[test]
+    fn device_state_updates_from_bc_info_reply() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x47,
+            "version": "10",
+            "dev_model": "BC-01"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_version, "10");
+        assert_eq!(state.last_device_model, "BC-01");
+    }
+
+    #[test]
+    fn device_state_updates_from_status_query_mac() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "08112233445566"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_mac_addr, "11:22:33:44:55:66");
+    }
+
+    #[test]
+    fn device_state_updates_from_status_query_operational_fields() {
+        let mut state = DeviceRuntimeState::default();
+        let payload_remote = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "0401"
+        });
+        let payload_heartbeat = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "051E"
+        });
+        let payload_linkage = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "0601"
+        });
+        let payload_mode = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "0902"
+        });
+        let payload_microwave = serde_json::json!({
+            "opcode": 0x1D,
+            "value": "0C05"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload_remote);
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload_heartbeat);
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload_linkage);
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload_mode);
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload_microwave);
+        assert_eq!(state.last_remote_network_enable, "1");
+        assert_eq!(state.last_heartbeat_interval, "30");
+        assert_eq!(state.last_group_linkage, "1");
+        assert_eq!(state.last_linkage_mode, "2");
+        assert_eq!(state.last_microwave_setting, "5");
+    }
+
+    #[test]
+    fn device_state_updates_from_linkage_group_reply() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x32,
+            "value": "01"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_linkage_group_state, "01");
+    }
+
+    #[test]
+    fn device_state_updates_from_motion_event() {
+        let mut state = DeviceRuntimeState::default();
+        let payload = serde_json::json!({
+            "opcode": 0x10,
+            "value": "FF"
+        });
+        MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
+        assert_eq!(state.last_motion_event, "检测到有人");
+    }
 }

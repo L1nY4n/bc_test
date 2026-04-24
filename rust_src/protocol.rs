@@ -127,6 +127,17 @@ const DHCP_CHOICES: &[Choice] = &[
     },
 ];
 
+const START_STOP_CHOICES: &[Choice] = &[
+    Choice {
+        value: "0",
+        label: "停止",
+    },
+    Choice {
+        value: "1",
+        label: "开始",
+    },
+];
+
 const BINARY_ENABLE_CHOICES: &[Choice] = &[
     Choice {
         value: "0",
@@ -816,6 +827,35 @@ pub const COMMANDS: &[CommandSpec] = &[
         }],
         build_mode: BuildMode::Generic,
     },
+    CommandSpec {
+        key: "play_voice_file",
+        label: "播放声音文件 (0x5A)",
+        opcode: 0x5A,
+        response_opcode: 0x5B,
+        include_dest_addr: false,
+        include_mesh_dev_type: false,
+        fields: &[
+            FieldSpec {
+                key: "voice_name",
+                label: "声音文件名",
+                kind: FieldKind::Text,
+                default: "voice.adpcm",
+            },
+            FieldSpec {
+                key: "value",
+                label: "播放控制",
+                kind: FieldKind::Choice(START_STOP_CHOICES),
+                default: "1",
+            },
+            FieldSpec {
+                key: "time_stamp",
+                label: "时间戳",
+                kind: FieldKind::Integer,
+                default: "",
+            },
+        ],
+        build_mode: BuildMode::Generic,
+    },
 ];
 
 pub fn command_by_key(key: &str) -> Option<&'static CommandSpec> {
@@ -828,6 +868,10 @@ pub fn command_by_opcode(opcode: u32) -> Option<&'static CommandSpec> {
 
 pub fn expected_response_opcode(opcode: u32) -> Option<u32> {
     command_by_opcode(opcode).map(|spec| spec.response_opcode)
+}
+
+pub fn response_can_omit_timestamp(opcode: u32) -> bool {
+    matches!(opcode, 0x41 | 0x44)
 }
 
 pub fn current_time_stamp() -> u64 {
@@ -1187,6 +1231,213 @@ pub fn summarize_payload(payload: &Value) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".into())
 }
 
+pub fn decode_payload_details(payload: &Value) -> Vec<(String, String)> {
+    let mut details = Vec::new();
+    let Some(opcode) = payload
+        .get("opcode")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+    else {
+        return details;
+    };
+    details.push(("操作码".into(), format!("0x{opcode:02X}")));
+
+    match opcode {
+        0x10 => {
+            let value = payload.get("value").and_then(Value::as_str).unwrap_or("--");
+            let event = match value {
+                "FF" => "检测到有人",
+                "00" => "检测到离开",
+                _ => "未知事件",
+            };
+            details.push(("人体微波事件".into(), event.into()));
+        }
+        0x1B => {
+            if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                if let Ok(bytes) = hex_to_bytes(value) {
+                    if bytes.len() >= 4 {
+                        details.push(("开关状态".into(), bytes[0].to_string()));
+                        details.push(("运行模式".into(), bytes[1].to_string()));
+                        details.push(("固件版本".into(), format!("0x{:02X}", bytes[2])));
+                        details.push(("设备类型".into(), bytes[3].to_string()));
+                    }
+                }
+            }
+        }
+        0x1D => {
+            if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                if let Ok(bytes) = hex_to_bytes(value) {
+                    if bytes.len() >= 2 {
+                        let query_code = bytes[0];
+                        details.push(("查询码".into(), query_code.to_string()));
+                        match query_code {
+                            0 | 1 | 3 | 4 | 5 | 6 | 7 | 9 | 11 | 12 => {
+                                details.push(("返回值".into(), bytes[1].to_string()));
+                            }
+                            8 | 255 => {
+                                if bytes.len() >= 7 {
+                                    details.push(("MAC地址".into(), format_mac(&bytes[1..7])));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        0x1F => {
+            if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                if let Ok(bytes) = hex_to_bytes(value) {
+                    if !bytes.is_empty() {
+                        let query_code = bytes[0];
+                        details.push(("查询码".into(), query_code.to_string()));
+                        let addresses = decode_be_u16_addresses(&bytes[1..]);
+                        if !addresses.is_empty() {
+                            details.push(("地址列表".into(), addresses.join(", ")));
+                        }
+                    }
+                }
+            }
+        }
+        0x22 | 0x26 => {
+            if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                if let Ok(bytes) = hex_to_bytes(value) {
+                    if bytes.len() >= 6 {
+                        details.push(("场景编号".into(), bytes[0].to_string()));
+                        details.push(("有人亮度".into(), bytes[1].to_string()));
+                        details.push(("无人亮度".into(), bytes[2].to_string()));
+                        details.push(("无人关灯延时".into(), bytes[3].to_string()));
+                        details.push(("运行模式".into(), bytes[4].to_string()));
+                        details.push(("开关状态".into(), bytes[5].to_string()));
+                    }
+                }
+            }
+        }
+        0x29 => {
+            for (key, label) in [
+                ("running_duration", "通电时长(秒)"),
+                ("light_on_duration", "亮灯时长(秒)"),
+                ("power", "最大功率(W)"),
+                ("energy_consumption", "能耗(kWh)"),
+            ] {
+                if let Some(value) = payload.get(key) {
+                    details.push((label.into(), json_value_to_string(value)));
+                }
+            }
+        }
+        0x47 => {
+            for (key, label) in [
+                ("version", "设备版本"),
+                ("dev_model", "产品型号"),
+                ("dev_id", "设备ID"),
+            ] {
+                if let Some(value) = payload.get(key) {
+                    details.push((label.into(), json_value_to_string(value)));
+                }
+            }
+        }
+        0x4F => {
+            if let Some(value) = payload.get("value") {
+                details.push(("Mesh地址".into(), json_value_to_string(value)));
+            }
+        }
+        0x51 => {
+            for (key, label) in [
+                ("value", "列表类型"),
+                ("array_total_size", "总数量"),
+                ("index_from", "起始索引"),
+                ("index_to", "结束索引"),
+            ] {
+                if let Some(value) = payload.get(key) {
+                    details.push((label.into(), json_value_to_string(value)));
+                }
+            }
+            if let Some(values) = payload.get("value_array").and_then(Value::as_array) {
+                let mut rendered = Vec::new();
+                for item in values.iter().take(5) {
+                    if let Some(text) = item.as_str() {
+                        rendered.push(decode_a_light_entry(text));
+                    }
+                }
+                if !rendered.is_empty() {
+                    details.push(("前5项".into(), rendered.join(" | ")));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    details
+}
+
+pub fn classify_execution_result(payload: &Value) -> Option<(&'static str, String)> {
+    let value = payload.get("value").and_then(Value::as_str)?;
+    let normalized = value.trim().to_lowercase();
+
+    if normalized.contains("execute error") || normalized == "error" || normalized.contains("失败")
+    {
+        return Some(("错误", value.to_string()));
+    }
+    if normalized.contains("forward ok and execute ok") {
+        return Some(("成功", "转发成功，执行成功".into()));
+    }
+    if normalized.contains("forward ok and execute error") {
+        return Some(("错误", "转发成功，执行失败".into()));
+    }
+    if normalized.contains("execute ok") {
+        return Some(("成功", "执行成功".into()));
+    }
+    if normalized.contains("forward ok") {
+        return Some(("成功", "转发成功".into()));
+    }
+    None
+}
+
+fn json_value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn format_mac(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn decode_be_u16_addresses(bytes: &[u8]) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for chunk in bytes.chunks(2) {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let address = u16::from_be_bytes([chunk[0], chunk[1]]);
+        if address == 0 || address == 0xFFFF {
+            continue;
+        }
+        addresses.push(format!("0x{address:04X}"));
+    }
+    addresses
+}
+
+fn decode_a_light_entry(text: &str) -> String {
+    match hex_to_bytes(text) {
+        Ok(bytes) if bytes.len() >= 8 => {
+            let address = u16::from_be_bytes([bytes[0], bytes[1]]);
+            let mac = format_mac(&bytes[2..8]);
+            format!("0x{address:04X}/{mac}")
+        }
+        _ => text.chars().take(24).collect(),
+    }
+}
+
+pub fn decode_a_light_entry_public(text: &str) -> String {
+    decode_a_light_entry(text)
+}
+
 pub fn chunk_count(data: &[u8], chunk_size: usize) -> usize {
     if data.is_empty() {
         0
@@ -1433,6 +1684,39 @@ mod tests {
     }
 
     #[test]
+    fn auto_off_delay_rejects_out_of_range_value() {
+        let spec = command_by_key("auto_off_delay").unwrap();
+        let device = sample_device();
+        let mut form = BTreeMap::new();
+        form.insert("dest_addr".into(), "4097".into());
+        form.insert("value".into(), "5".into());
+        let error = build_command_payload(spec, &device, &form).unwrap_err();
+        assert!(error.contains("10..255"));
+    }
+
+    #[test]
+    fn microwave_sensor_accepts_special_value_255() {
+        let spec = command_by_key("microwave_sensor").unwrap();
+        let device = sample_device();
+        let mut form = BTreeMap::new();
+        form.insert("dest_addr".into(), "4097".into());
+        form.insert("value".into(), "255".into());
+        let payload = build_command_payload(spec, &device, &form).unwrap();
+        assert_eq!(payload["value"], 255);
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_invalid_short_period() {
+        let spec = command_by_key("heartbeat_interval").unwrap();
+        let device = sample_device();
+        let mut form = BTreeMap::new();
+        form.insert("dest_addr".into(), "4097".into());
+        form.insert("value".into(), "10".into());
+        let error = build_command_payload(spec, &device, &form).unwrap_err();
+        assert!(error.contains("30..180"));
+    }
+
+    #[test]
     fn build_bc_ota_packets() {
         let packets =
             build_transfer_packets(TransferKind::BcOta, b"0123456789ABCDEF", 7, "").unwrap();
@@ -1451,5 +1735,71 @@ mod tests {
         assert_eq!(packets[1]["opcode"], 0x56);
         assert_eq!(packets[2]["opcode"], 0x58);
         assert_eq!(packets[2]["check_sum"], crc16_xmodem(data));
+    }
+
+    #[test]
+    fn decode_bc_info_reply_details() {
+        let payload = json!({
+            "opcode": 0x47,
+            "version": "10",
+            "dev_model": "BC-01",
+            "dev_id": "11112345"
+        });
+        let details = decode_payload_details(&payload);
+        assert!(details.iter().any(|(k, v)| k == "产品型号" && v == "BC-01"));
+        assert!(
+            details
+                .iter()
+                .any(|(k, v)| k == "设备ID" && v == "11112345")
+        );
+    }
+
+    #[test]
+    fn decode_status_query_mac_details() {
+        let payload = json!({
+            "opcode": 0x1D,
+            "value": "08112233445566"
+        });
+        let details = decode_payload_details(&payload);
+        assert!(details.iter().any(|(k, v)| k == "查询码" && v == "8"));
+        assert!(
+            details
+                .iter()
+                .any(|(k, v)| k == "MAC地址" && v == "11:22:33:44:55:66")
+        );
+    }
+
+    #[test]
+    fn classify_execute_ok_result() {
+        let payload = json!({
+            "opcode": 0x49,
+            "value": "Execute OK"
+        });
+        let classified = classify_execution_result(&payload).unwrap();
+        assert_eq!(classified.0, "成功");
+    }
+
+    #[test]
+    fn classify_forward_ok_execute_error_result() {
+        let payload = json!({
+            "opcode": 0x49,
+            "value": "Forward OK and Execute Error"
+        });
+        let classified = classify_execution_result(&payload).unwrap();
+        assert_eq!(classified.0, "错误");
+    }
+
+    #[test]
+    fn build_play_voice_file_payload() {
+        let spec = command_by_key("play_voice_file").unwrap();
+        let device = sample_device();
+        let mut form = BTreeMap::new();
+        form.insert("voice_name".into(), "demo.adpcm".into());
+        form.insert("value".into(), "1".into());
+        let payload = build_command_payload(spec, &device, &form).unwrap();
+        assert_eq!(payload["opcode"], 0x5A);
+        assert_eq!(payload["voice_name"], "demo.adpcm");
+        assert_eq!(payload["value"], 1);
+        assert!(payload.get("time_stamp").and_then(Value::as_u64).is_some());
     }
 }

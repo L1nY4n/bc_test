@@ -17,10 +17,16 @@ The Rust app currently provides:
 - broker configuration and connect/disconnect
 - multi-device profile management
 - per-device topic uniqueness validation
-- live MQTT RX/TX log view
-- preset protocol command forms
-- raw JSON sending
-- transfer-start preview for OTA / voice flows
+- live MQTT RX/TX log view with keyword filtering
+- preset protocol command forms covering the main documented configuration/query opcodes
+- raw JSON sending with opcode normalization and optional expected-response tracking
+- per-device pending request tracking, timeout handling, and RTT capture
+- OTA / A OTA / voice / realtime voice transfer packet generation and send queue management
+- configurable transfer pacing, ACK timeout, retry budget, and retry / continue / cancel controls
+- recent operation ledger and JSON evidence export
+- structured payload detail decoding for core uplink/query replies
+- richer per-device runtime state sinking for version, Mesh address, switch/run mode, scene, energy, A-light, group, and motion state
+- dangerous-operation confirmation for multi-device sends and high-risk opcodes
 - local config persistence with broker password omitted from disk
 - default Chinese UI text
 - automatic Chinese font loading from `assets/fonts` or common system fonts
@@ -33,7 +39,7 @@ The old Python prototype is still present in the repo as reference material, but
 cargo run
 ```
 
-If you want to bundle your own Chinese font for more stable rendering on minimal systems, place one of these files under [assets/fonts](/Users/l1ny4n/Documents/work/bc_test/assets/fonts):
+If you want to bundle your own Chinese font for more stable rendering on minimal systems, place one of these files under [assets/fonts](assets/fonts):
 
 - `NotoSansSC-Regular.otf`
 - `SourceHanSansCN-Regular.otf`
@@ -84,7 +90,7 @@ target/x86_64-pc-windows-gnu/release/mesh-bc-tester-rs.exe
 
 ## GitHub Actions Packaging
 
-The repo now includes [release-packages.yml](/Users/l1ny4n/Documents/work/bc_test/.github/workflows/release-packages.yml).
+The repo now includes [release-packages.yml](.github/workflows/release-packages.yml).
 
 Triggers:
 
@@ -102,7 +108,7 @@ Behavior:
 
 - branch pushes run cross-platform `cargo check`
 - manual workflow runs upload the generated installers as workflow artifacts
-- tag pushes such as `v0.1.0` also create or update a GitHub Release and attach the installers
+- tag pushes such as `v.0.1.0` also create or update a GitHub Release and attach the installers
 
 Important:
 
@@ -125,9 +131,9 @@ scripts/
   build-windows-gnu-cross.sh
 ```
 
-## Next Recommended Steps
+## Remaining Gaps
 
-1. Port the remaining protocol opcodes from the Python prototype into the Rust command catalog.
-2. Replace transfer preview with full chunked transfer state machines.
-3. Add request/response timeout tracking and richer status decoding.
-4. Add CI matrix builds for macOS, Linux, and Windows.
+1. Transfer ACK correlation is still device-scoped and timestamp-based, not packet-identity scoped.
+2. Transfer retry/continue is available, but there is no durable breakpoint resume across app restarts.
+3. Some transfer-related opcodes are operationally implemented through the transfer subsystem rather than exposed as standalone preset command forms.
+4. The app has local verification coverage, but broker/device integration still needs real hardware validation.
