@@ -1446,6 +1446,9 @@ pub fn chunk_count(data: &[u8], chunk_size: usize) -> usize {
     }
 }
 
+const OTA_TRANSFER_CHUNK_SIZE: usize = 200;
+const MEDIA_TRANSFER_CHUNK_SIZE: usize = 400;
+
 pub fn build_transfer_packets(
     kind: TransferKind,
     data: &[u8],
@@ -1456,8 +1459,10 @@ pub fn build_transfer_packets(
         return Err("传输数据不能为空".into());
     }
     let total_packets = match kind {
-        TransferKind::BcOta | TransferKind::AOta => 1 + chunk_count(data, 400),
-        TransferKind::VoiceFile | TransferKind::RealtimeVoice => 2 + chunk_count(data, 400),
+        TransferKind::BcOta | TransferKind::AOta => 1 + chunk_count(data, OTA_TRANSFER_CHUNK_SIZE),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => {
+            2 + chunk_count(data, MEDIA_TRANSFER_CHUNK_SIZE)
+        }
     };
     let mut packets = Vec::with_capacity(total_packets);
     for packet_index in 0..total_packets {
@@ -1482,11 +1487,10 @@ pub fn build_transfer_packet(
     if data.is_empty() {
         return Err("传输数据不能为空".into());
     }
-    let chunk_size = 400usize;
-    let chunk_total = chunk_count(data, chunk_size);
 
     match kind {
         TransferKind::BcOta => {
+            let chunk_total = chunk_count(data, OTA_TRANSFER_CHUNK_SIZE);
             if packet_index == 0 {
                 return Ok(json!({
                     "opcode": 0x40,
@@ -1496,7 +1500,8 @@ pub fn build_transfer_packet(
                 }));
             }
             let chunk_id = packet_index - 1;
-            let chunk = &data[chunk_id * chunk_size..data.len().min((chunk_id + 1) * chunk_size)];
+            let chunk = &data[chunk_id * OTA_TRANSFER_CHUNK_SIZE
+                ..data.len().min((chunk_id + 1) * OTA_TRANSFER_CHUNK_SIZE)];
             Ok(json!({
                 "opcode": 0x42,
                 "version": version,
@@ -1506,6 +1511,7 @@ pub fn build_transfer_packet(
             }))
         }
         TransferKind::AOta => {
+            let chunk_total = chunk_count(data, OTA_TRANSFER_CHUNK_SIZE);
             if packet_index == 0 {
                 return Ok(json!({
                     "opcode": 0x43,
@@ -1515,7 +1521,8 @@ pub fn build_transfer_packet(
                 }));
             }
             let chunk_id = packet_index - 1;
-            let chunk = &data[chunk_id * chunk_size..data.len().min((chunk_id + 1) * chunk_size)];
+            let chunk = &data[chunk_id * OTA_TRANSFER_CHUNK_SIZE
+                ..data.len().min((chunk_id + 1) * OTA_TRANSFER_CHUNK_SIZE)];
             Ok(json!({
                 "opcode": 0x45,
                 "version": version,
@@ -1525,6 +1532,7 @@ pub fn build_transfer_packet(
             }))
         }
         TransferKind::VoiceFile | TransferKind::RealtimeVoice => {
+            let chunk_total = chunk_count(data, MEDIA_TRANSFER_CHUNK_SIZE);
             let (start_opcode, chunk_opcode, end_opcode) = match kind {
                 TransferKind::VoiceFile => (0x54, 0x56, 0x58),
                 TransferKind::RealtimeVoice => (0x5C, 0x5E, 0x60),
@@ -1550,7 +1558,8 @@ pub fn build_transfer_packet(
                 }));
             }
             let chunk_id = packet_index - 1;
-            let chunk = &data[chunk_id * chunk_size..data.len().min((chunk_id + 1) * chunk_size)];
+            let chunk = &data[chunk_id * MEDIA_TRANSFER_CHUNK_SIZE
+                ..data.len().min((chunk_id + 1) * MEDIA_TRANSFER_CHUNK_SIZE)];
             Ok(json!({
                 "opcode": chunk_opcode,
                 "voice_name": voice_name,
@@ -1568,13 +1577,13 @@ pub fn transfer_preview(kind: TransferKind, data: &[u8], version: u8, voice_name
         TransferKind::BcOta => json!({
             "opcode": 0x40,
             "version": version,
-            "ota_pack_count": data.len().div_ceil(400),
+            "ota_pack_count": data.len().div_ceil(OTA_TRANSFER_CHUNK_SIZE),
             "ota_total_size": data.len(),
         }),
         TransferKind::AOta => json!({
             "opcode": 0x43,
             "version": version,
-            "ota_pack_count": data.len().div_ceil(400),
+            "ota_pack_count": data.len().div_ceil(OTA_TRANSFER_CHUNK_SIZE),
             "ota_total_size": data.len(),
         }),
         TransferKind::VoiceFile => json!({
@@ -1724,6 +1733,16 @@ mod tests {
         assert_eq!(packets[0]["opcode"], 0x40);
         assert_eq!(packets[1]["opcode"], 0x42);
         assert_eq!(packets[1]["ota_data_index"], 0);
+    }
+
+    #[test]
+    fn build_bc_ota_packets_split_at_200_bytes() {
+        let data = vec![0x5A; 201];
+        let packets = build_transfer_packets(TransferKind::BcOta, &data, 7, "").unwrap();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0]["ota_pack_count"], 2);
+        assert_eq!(packets[1]["ota_byte_size"], 200);
+        assert_eq!(packets[2]["ota_byte_size"], 1);
     }
 
     #[test]

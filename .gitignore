@@ -1,3 +1,4 @@
+.DS_Store
 target/
 .cargo-home/
 .venv/
@@ -5,4 +6,3 @@ __pycache__/
 .pytest_cache/
 .omx/
 tmp/
-pysidedeploy.spec

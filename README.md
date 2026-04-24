@@ -1,14 +1,12 @@
-# Mesh BC Tester (Rust)
+# Mesh BC Tester
 
 `mesh-bc-tester-rs` is a Rust desktop MQTT test client for the Bluetooth Mesh BC light northbound protocol.
 
-The current implementation uses:
+The application uses:
 
 - `eframe/egui` for the desktop GUI
 - `rumqttc` for MQTT 3.1.1 client communication
 - `serde_json` for JSON payload building and inspection
-
-This direction replaced the previous PySide6 packaging path because the Rust stack is a better fit for cross-platform builds and cross-target compilation workflows.
 
 ## Current Status
 
@@ -30,8 +28,6 @@ The Rust app currently provides:
 - local config persistence with broker password omitted from disk
 - default Chinese UI text
 - automatic Chinese font loading from `assets/fonts` or common system fonts
-
-The old Python prototype is still present in the repo as reference material, but the active path is now the Rust app.
 
 ## Run
 
