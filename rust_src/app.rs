@@ -31,6 +31,7 @@ pub struct MeshBcTesterApp {
     raw_json_text: String,
     raw_expected_opcode: String,
     connection_status: String,
+    broker_connected: bool,
     mqtt: MqttRuntime,
     runtime_states: HashMap<u64, DeviceRuntimeState>,
     logs: Vec<LogEntry>,
@@ -98,6 +99,13 @@ struct PendingConfirmation {
     title: String,
     detail: String,
     action: PendingAction,
+}
+
+#[derive(Clone, Copy)]
+enum ChipTone {
+    Neutral,
+    Success,
+    Warning,
 }
 
 enum PendingAction {
@@ -180,6 +188,7 @@ impl MeshBcTesterApp {
             .unwrap(),
             raw_expected_opcode: String::new(),
             connection_status: "未连接".into(),
+            broker_connected: false,
             mqtt: MqttRuntime::default(),
             runtime_states,
             logs: Vec::new(),
@@ -237,7 +246,7 @@ impl MeshBcTesterApp {
         self.config
             .devices
             .iter()
-            .find(|device| topic == device.up_topic)
+            .find(|device| topic_matches_device_up_topic(&device.up_topic, topic))
     }
 
     fn process_mqtt_events(&mut self) {
@@ -246,9 +255,10 @@ impl MeshBcTesterApp {
         self.collect_device_offline_timeouts();
         while let Ok(event) = self.mqtt.events_rx.try_recv() {
             match event {
-                MqttEvent::Connection { message } => {
+                MqttEvent::Connection { connected, message } => {
+                    self.broker_connected = connected;
                     self.connection_status = message.clone();
-                    if message != "已连接" {
+                    if !connected {
                         for state in self.runtime_states.values_mut() {
                             state.online = false;
                             state.pending_count = 0;
@@ -505,6 +515,7 @@ impl MeshBcTesterApp {
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.connection_status = "连接中...".into();
+        self.broker_connected = false;
         self.mqtt.connect(&self.config.broker);
         self.sync_subscriptions();
         let _ = save_config(&self.config);
@@ -516,7 +527,9 @@ impl MeshBcTesterApp {
             .devices
             .iter()
             .filter(|device| device.subscribe_enabled)
-            .map(|device| device.up_topic.clone())
+            .flat_map(|device| compatible_up_topic_filters(&device.up_topic))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         self.mqtt.sync_subscriptions(topics);
     }
@@ -1752,6 +1765,7 @@ impl MeshBcTesterApp {
             raw_json_text: "{}".into(),
             raw_expected_opcode: String::new(),
             connection_status: "未连接".into(),
+            broker_connected: false,
             mqtt: MqttRuntime::default(),
             runtime_states: HashMap::new(),
             logs: Vec::new(),
@@ -1846,28 +1860,42 @@ impl eframe::App for MeshBcTesterApp {
         egui::Panel::top("top_bar")
             .frame(Self::top_bottom_panel_frame(panel_style))
             .show_inside(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("蓝牙Mesh BC灯测试工具").heading().strong());
-                    ui.separator();
-                    ui.label("代理");
-                    ui.text_edit_singleline(&mut self.broker_editor.name);
-                    ui.label("地址");
-                    ui.text_edit_singleline(&mut self.broker_editor.host);
-                    ui.add(egui::DragValue::new(&mut self.broker_editor.port).range(1..=65535));
-                    ui.label("用户");
-                    ui.text_edit_singleline(&mut self.broker_editor.username);
-                    ui.add(
+                    ui.label(RichText::new("Mesh BC").strong().color(rgb(142, 226, 255)));
+                    Self::compact_text_edit_hint(ui, 110.0, &mut self.broker_editor.name, "代理");
+                    Self::compact_text_edit_hint(ui, 160.0, &mut self.broker_editor.host, "地址");
+                    Self::compact_widget(
+                        ui,
+                        54.0,
+                        egui::DragValue::new(&mut self.broker_editor.port).range(1..=65535),
+                    );
+                    Self::compact_text_edit_hint(
+                        ui,
+                        100.0,
+                        &mut self.broker_editor.username,
+                        "用户",
+                    );
+                    Self::compact_widget(
+                        ui,
+                        120.0,
                         TextEdit::singleline(&mut self.broker_editor.password)
                             .password(true)
                             .hint_text("密码"),
                     );
-                    ui.label("客户端ID");
-                    ui.text_edit_singleline(&mut self.broker_editor.client_id);
-                    ui.add(
+                    Self::compact_text_edit_hint(
+                        ui,
+                        110.0,
+                        &mut self.broker_editor.client_id,
+                        "客户端ID",
+                    );
+                    Self::compact_widget(
+                        ui,
+                        46.0,
                         egui::DragValue::new(&mut self.broker_editor.keepalive_secs)
                             .range(5..=3600),
                     );
-                    ui.checkbox(&mut self.broker_editor.use_tls, "启用 TLS");
+                    ui.checkbox(&mut self.broker_editor.use_tls, "TLS");
                     if Self::primary_button(ui, "连接").clicked() {
                         self.connect();
                     }
@@ -1877,10 +1905,15 @@ impl eframe::App for MeshBcTesterApp {
                     if Self::secondary_button(ui, "导出结果").clicked() {
                         self.export_evidence();
                     }
-                    ui.label(format!("状态: {}", self.connection_status));
+                    let connection_tone = if self.broker_connected {
+                        ChipTone::Success
+                    } else {
+                        ChipTone::Neutral
+                    };
+                    Self::status_chip(ui, "状态", &self.connection_status, connection_tone);
                 });
                 if !self.system_notice.is_empty() {
-                    ui.colored_label(egui::Color32::YELLOW, &self.system_notice);
+                    Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
                 }
             });
 
@@ -1931,15 +1964,15 @@ impl eframe::App for MeshBcTesterApp {
 
         egui::Panel::left("devices_panel")
             .resizable(true)
-            .default_size(340.0)
-            .min_size(280.0)
+            .default_size(280.0)
+            .min_size(220.0)
             .frame(Self::side_panel_frame(panel_style))
             .show_inside(ui, |ui| {
                 Self::panel_card_collapsible(ui, "devices_card", "设备工作台", |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(320.0)
+                        .max_height(280.0)
                         .show(ui, |ui| {
-                            for device in &self.config.devices {
+                            for (index, device) in self.config.devices.iter().enumerate() {
                                 let selected = self.selected_devices.contains(&device.local_id);
                                 ui.horizontal(|ui| {
                                     let mut checked = selected;
@@ -1957,198 +1990,42 @@ impl eframe::App for MeshBcTesterApp {
                                         .unwrap_or_default();
                                     ui.vertical(|ui| {
                                         ui.label(RichText::new(&device.name).strong());
+                                        let online_label =
+                                            if state.online { "在线" } else { "离线" };
+                                        let rtt_text = if state.last_rtt_ms.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · {}ms", state.last_rtt_ms)
+                                        };
                                         ui.small(format!(
-                                            "{} | RX {} TX {} 待{}",
+                                            "{} · {} · RX {} TX {} 待{}{}",
+                                            online_label,
                                             device.device_id,
                                             state.rx_count,
                                             state.tx_count,
-                                            state.pending_count
+                                            state.pending_count,
+                                            rtt_text
                                         ));
-                                        ui.small(format!("上行: {}", device.up_topic));
-                                        if !state.last_rtt_ms.is_empty() {
-                                            ui.small(format!("RTT: {} ms", state.last_rtt_ms));
-                                        }
-                                        if !state.last_version.is_empty()
-                                            || !state.last_mesh_addr.is_empty()
-                                            || !state.last_device_model.is_empty()
+                                        if let Some(summary) =
+                                            Self::device_secondary_summary(&state)
                                         {
-                                            ui.small(format!(
-                                                "版本:{} 型号:{} Mesh:{}",
-                                                if state.last_version.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_version
-                                                },
-                                                if state.last_device_model.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_device_model
-                                                },
-                                                if state.last_mesh_addr.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_mesh_addr
-                                                }
-                                            ));
+                                            ui.small(summary);
                                         }
-                                        if !state.last_switch_state.is_empty()
-                                            || !state.last_run_mode.is_empty()
-                                            || !state.last_heartbeat_interval.is_empty()
-                                            || !state.last_remote_network_enable.is_empty()
-                                            || !state.last_group_linkage.is_empty()
-                                            || !state.last_linkage_mode.is_empty()
-                                            || !state.last_microwave_setting.is_empty()
-                                            || !state.last_linkage_group_state.is_empty()
-                                        {
-                                            ui.small(format!(
-                                                "开关:{} 模式:{} 心跳:{} 遥控组网:{} 组内联动:{} 联动模式:{} 微波:{} 联动组:{}",
-                                                if state.last_switch_state.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_switch_state
-                                                },
-                                                if state.last_run_mode.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_run_mode
-                                                }
-                                                ,
-                                                if state.last_heartbeat_interval.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_heartbeat_interval
-                                                },
-                                                if state.last_remote_network_enable.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_remote_network_enable
-                                                },
-                                                if state.last_group_linkage.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_group_linkage
-                                                },
-                                                if state.last_linkage_mode.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_linkage_mode
-                                                },
-                                                if state.last_microwave_setting.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_microwave_setting
-                                                },
-                                                if state.last_linkage_group_state.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_linkage_group_state
-                                                }
-                                            ));
-                                        }
-                                        if !state.last_scene_id.is_empty()
-                                            || !state.last_energy_kwh.is_empty()
-                                            || !state.last_a_light_total.is_empty()
-                                            || !state.last_power_w.is_empty()
-                                        {
-                                            ui.small(format!(
-                                                "场景:{} 功率:{}W 能耗:{}kWh A灯:{}",
-                                                if state.last_scene_id.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_scene_id
-                                                },
-                                                if state.last_power_w.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_power_w
-                                                },
-                                                if state.last_energy_kwh.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_energy_kwh
-                                                },
-                                                if state.last_a_light_total.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_a_light_total
-                                                }
-                                            ));
-                                        }
-                                        if !state.last_a_light_preview.is_empty() {
-                                            ui.small(format!(
-                                                "A灯样本: {}",
-                                                state.last_a_light_preview
-                                            ));
-                                        }
-                                        if !state.last_group_info.is_empty()
-                                            || !state.last_motion_event.is_empty()
-                                        {
-                                            ui.small(format!(
-                                                "组网:{} 事件:{}",
-                                                if state.last_group_info.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_group_info
-                                                },
-                                                if state.last_motion_event.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_motion_event
-                                                }
-                                            ));
-                                        }
-                                        if !state.last_mac_addr.is_empty()
-                                            || !state.last_partition_addr.is_empty()
-                                            || !state.last_lane_group_addr.is_empty()
-                                            || !state.last_adjacent_group_addr.is_empty()
-                                        {
-                                            ui.small(format!(
-                                                "MAC:{} 分区:{} 车道组:{} 相邻组:{}",
-                                                if state.last_mac_addr.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_mac_addr
-                                                },
-                                                if state.last_partition_addr.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_partition_addr
-                                                },
-                                                if state.last_lane_group_addr.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_lane_group_addr
-                                                },
-                                                if state.last_adjacent_group_addr.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_adjacent_group_addr
-                                                },
-                                            ));
-                                        }
-                                        if !state.last_scene_summary.is_empty() {
-                                            ui.small(format!(
-                                                "场景摘要: {}",
-                                                state.last_scene_summary
-                                            ));
-                                        }
-                                        if !state.last_result.is_empty() {
-                                            ui.small(format!(
-                                                "结果[{}]: {}",
-                                                if state.last_result_label.is_empty() {
-                                                    "--"
-                                                } else {
-                                                    &state.last_result_label
-                                                },
-                                                state.last_result
-                                            ));
+                                        if selected {
+                                            if let Some(extra) =
+                                                Self::device_selected_detail_summary(&state)
+                                            {
+                                                ui.small(extra);
+                                            }
                                         }
                                     });
                                     if ui.button("编辑").clicked() {
                                         self.device_editor = DeviceEditor::from_device(device);
                                     }
                                 });
-                                ui.separator();
+                                if index + 1 < self.config.devices.len() {
+                                    ui.add_space(2.0);
+                                }
                             }
                         });
                 });
@@ -2156,11 +2033,12 @@ impl eframe::App for MeshBcTesterApp {
                 Self::panel_card_collapsible(ui, "device_editor_card", "设备编辑", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("名称");
-                        ui.text_edit_singleline(&mut self.device_editor.name);
+                        Self::compact_text_edit(ui, 232.0, &mut self.device_editor.name);
                     });
                     ui.horizontal(|ui| {
                         ui.label("设备ID");
-                        let response = ui.text_edit_singleline(&mut self.device_editor.device_id);
+                        let response =
+                            Self::compact_text_edit(ui, 220.0, &mut self.device_editor.device_id);
                         if response.changed() && !self.device_editor.device_id.trim().is_empty() {
                             let (up, down) =
                                 DeviceProfile::default_topics(self.device_editor.device_id.trim());
@@ -2174,20 +2052,24 @@ impl eframe::App for MeshBcTesterApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("上行主题");
-                        ui.text_edit_singleline(&mut self.device_editor.up_topic);
+                        Self::compact_text_edit(ui, 220.0, &mut self.device_editor.up_topic);
                     });
                     ui.horizontal(|ui| {
                         ui.label("下行主题");
-                        ui.text_edit_singleline(&mut self.device_editor.down_topic);
+                        Self::compact_text_edit(ui, 220.0, &mut self.device_editor.down_topic);
                     });
                     ui.horizontal(|ui| {
                         ui.label("Mesh类型");
-                        ui.add(
+                        Self::compact_widget(
+                            ui,
+                            56.0,
                             egui::DragValue::new(&mut self.device_editor.mesh_dev_type)
                                 .range(0..=255),
                         );
                         ui.label("目标地址");
-                        ui.add(
+                        Self::compact_widget(
+                            ui,
+                            56.0,
                             egui::DragValue::new(&mut self.device_editor.default_dest_addr)
                                 .range(1..=65535),
                         );
@@ -2219,12 +2101,13 @@ impl eframe::App for MeshBcTesterApp {
 
         egui::Panel::right("actions_panel")
             .resizable(true)
-            .default_size(320.0)
-            .min_size(280.0)
+            .default_size(280.0)
+            .min_size(220.0)
             .frame(Self::side_panel_frame(panel_style))
             .show_inside(ui, |ui| {
                 Self::panel_card_collapsible(ui, "preset_commands", "预置命令", |ui| {
                     egui::ComboBox::from_label("命令")
+                        .width(180.0)
                         .selected_text(
                             command_by_key(&self.command_key)
                                 .map(|spec| spec.label)
@@ -2250,7 +2133,7 @@ impl eframe::App for MeshBcTesterApp {
                                     .command_form
                                     .entry("dest_addr".into())
                                     .or_insert_with(|| "1".into());
-                                ui.text_edit_singleline(entry);
+                                Self::compact_text_edit(ui, 90.0, entry);
                             });
                         }
                         for field in spec.fields {
@@ -2262,10 +2145,11 @@ impl eframe::App for MeshBcTesterApp {
                                     .or_insert_with(|| field.default.to_string());
                                 match field.kind {
                                     FieldKind::Text | FieldKind::Integer => {
-                                        ui.text_edit_singleline(value);
+                                        Self::compact_text_edit(ui, 190.0, value);
                                     }
                                     FieldKind::Choice(choices) => {
                                         egui::ComboBox::from_id_salt(field.key)
+                                            .width(190.0)
                                             .selected_text(value.clone())
                                             .show_ui(ui, |ui| {
                                                 for choice in choices {
@@ -2312,14 +2196,15 @@ impl eframe::App for MeshBcTesterApp {
                     ui.add(
                         TextEdit::multiline(&mut self.raw_json_text)
                             .font(egui::TextStyle::Monospace)
-                            .desired_rows(6)
+                            .desired_rows(7)
                             .desired_width(f32::INFINITY),
                     );
                     ui.horizontal(|ui| {
                         ui.label("期望应答");
-                        ui.add(
+                        Self::compact_widget(
+                            ui,
+                            86.0,
                             TextEdit::singleline(&mut self.raw_expected_opcode)
-                                .desired_width(90.0)
                                 .hint_text("如 0x47"),
                         );
                     });
@@ -2392,6 +2277,7 @@ impl eframe::App for MeshBcTesterApp {
 
                 Self::panel_card_collapsible(ui, "transfer_preview_card", "传输预览", |ui| {
                     egui::ComboBox::from_label("传输类型")
+                        .width(180.0)
                         .selected_text(self.transfer_kind.label())
                         .show_ui(ui, |ui| {
                             for kind in TransferKind::ALL {
@@ -2400,30 +2286,42 @@ impl eframe::App for MeshBcTesterApp {
                         });
                     ui.horizontal(|ui| {
                         ui.label("文件");
-                        ui.text_edit_singleline(&mut self.transfer_file);
+                        Self::compact_text_edit(ui, 170.0, &mut self.transfer_file);
                         if Self::secondary_button(ui, "浏览").clicked() {
                             self.pick_transfer_file();
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.label("版本");
-                        ui.add(egui::DragValue::new(&mut self.transfer_version).range(0..=255));
+                        Self::compact_widget(
+                            ui,
+                            52.0,
+                            egui::DragValue::new(&mut self.transfer_version).range(0..=255),
+                        );
                         ui.label("语音文件名");
-                        ui.text_edit_singleline(&mut self.transfer_voice_name);
+                        Self::compact_text_edit(ui, 120.0, &mut self.transfer_voice_name);
                     });
                     ui.horizontal(|ui| {
                         ui.label("包间隔(ms)");
-                        ui.add(
+                        Self::compact_widget(
+                            ui,
+                            60.0,
                             egui::DragValue::new(&mut self.transfer_packet_delay_ms)
                                 .range(1..=5_000),
                         );
                         ui.label("ACK超时(s)");
-                        ui.add(
+                        Self::compact_widget(
+                            ui,
+                            60.0,
                             egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
                                 .range(1..=300),
                         );
                         ui.label("最大重试");
-                        ui.add(egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10));
+                        Self::compact_widget(
+                            ui,
+                            48.0,
+                            egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
+                        );
                     });
                     if Self::primary_button(ui, "发送传输预览").clicked() {
                         self.send_transfer_preview();
@@ -2432,10 +2330,10 @@ impl eframe::App for MeshBcTesterApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            Self::paint_tech_background(ui);
             Self::panel_card_frame(ui).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.heading("实时工作区");
-                    ui.separator();
+                    ui.heading(RichText::new("实时工作区").color(rgb(142, 226, 255)));
                     Self::stat_chip(ui, "已配置设备", self.config.devices.len().to_string());
                     Self::stat_chip(ui, "已选设备", self.selected_devices.len().to_string());
                     let total_rx: u64 = self
@@ -2457,8 +2355,7 @@ impl eframe::App for MeshBcTesterApp {
             });
 
             Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.label(RichText::new("请求状态").heading());
-                ui.separator();
+                Self::section_heading(ui, "请求状态");
                 if self.pending_requests.is_empty() {
                     ui.label("当前没有待应答请求。");
                 } else {
@@ -2470,8 +2367,8 @@ impl eframe::App for MeshBcTesterApp {
                         .column(Column::initial(90.0))
                         .column(Column::initial(90.0))
                         .column(Column::remainder())
-                        .min_scrolled_height(110.0)
-                        .header(24.0, |mut header| {
+                        .min_scrolled_height(72.0)
+                        .header(18.0, |mut header| {
                             header.col(|ui| {
                                 ui.strong("设备");
                             });
@@ -2490,7 +2387,7 @@ impl eframe::App for MeshBcTesterApp {
                         })
                         .body(|mut body| {
                             for request in &self.pending_requests {
-                                body.row(24.0, |mut row| {
+                                body.row(18.0, |mut row| {
                                     row.col(|ui| {
                                         ui.label(&request.device_name);
                                     });
@@ -2525,7 +2422,7 @@ impl eframe::App for MeshBcTesterApp {
 
             Self::panel_card_frame(ui).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("传输状态").heading());
+                    Self::section_heading(ui, "传输状态");
                     if self
                         .active_transfers
                         .iter()
@@ -2573,7 +2470,6 @@ impl eframe::App for MeshBcTesterApp {
                         self.cancel_transfers_for_devices(&ids);
                     }
                 });
-                ui.separator();
                 if self.active_transfers.is_empty() {
                     ui.label("当前没有活跃传输。");
                 } else {
@@ -2592,8 +2488,8 @@ impl eframe::App for MeshBcTesterApp {
                         .column(Column::initial(70.0))
                         .column(Column::initial(70.0))
                         .column(Column::remainder())
-                        .min_scrolled_height(110.0)
-                        .header(24.0, |mut header| {
+                        .min_scrolled_height(72.0)
+                        .header(18.0, |mut header| {
                             header.col(|ui| {
                                 ui.strong("设备");
                             });
@@ -2624,7 +2520,7 @@ impl eframe::App for MeshBcTesterApp {
                         })
                         .body(|mut body| {
                             for transfer in &self.active_transfers {
-                                body.row(24.0, |mut row| {
+                                body.row(18.0, |mut row| {
                                     row.col(|ui| {
                                         ui.label(&transfer.device_name);
                                     });
@@ -2708,14 +2604,13 @@ impl eframe::App for MeshBcTesterApp {
 
             Self::panel_card_frame(ui).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("最近操作").heading());
+                    Self::section_heading(ui, "最近操作");
                     if !self.recent_operations.is_empty()
                         && Self::secondary_button(ui, "清空操作").clicked()
                     {
                         self.recent_operations.clear();
                     }
                 });
-                ui.separator();
                 if self.recent_operations.is_empty() {
                     ui.label("当前没有最近操作记录。");
                 } else {
@@ -2727,8 +2622,8 @@ impl eframe::App for MeshBcTesterApp {
                         .column(Column::initial(80.0))
                         .column(Column::initial(80.0))
                         .column(Column::remainder())
-                        .min_scrolled_height(120.0)
-                        .header(24.0, |mut header| {
+                        .min_scrolled_height(80.0)
+                        .header(18.0, |mut header| {
                             header.col(|ui| {
                                 ui.strong("时间");
                             });
@@ -2750,7 +2645,7 @@ impl eframe::App for MeshBcTesterApp {
                         })
                         .body(|mut body| {
                             for op in self.recent_operations.iter().rev().take(20) {
-                                body.row(24.0, |mut row| {
+                                body.row(18.0, |mut row| {
                                     row.col(|ui| {
                                         ui.label(&op.timestamp);
                                     });
@@ -2787,13 +2682,13 @@ impl eframe::App for MeshBcTesterApp {
                 .collect();
 
             Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.label(RichText::new("消息日志").heading());
-                ui.separator();
+                Self::section_heading(ui, "消息日志");
                 ui.horizontal(|ui| {
                     ui.label("筛选");
-                    ui.add(
+                    Self::compact_widget(
+                        ui,
+                        190.0,
                         TextEdit::singleline(&mut self.log_filter_text)
-                            .desired_width(220.0)
                             .hint_text("设备 / opcode / 状态 / 主题"),
                     );
                     if Self::secondary_button(ui, "清空日志").clicked() {
@@ -2801,7 +2696,6 @@ impl eframe::App for MeshBcTesterApp {
                         self.selected_log_index = None;
                     }
                 });
-                ui.separator();
                 TableBuilder::new(ui)
                     .striped(true)
                     .column(Column::initial(140.0))
@@ -2811,8 +2705,8 @@ impl eframe::App for MeshBcTesterApp {
                     .column(Column::initial(90.0))
                     .column(Column::initial(160.0))
                     .column(Column::remainder())
-                    .min_scrolled_height(320.0)
-                    .header(24.0, |mut header| {
+                    .min_scrolled_height(220.0)
+                    .header(18.0, |mut header| {
                         header.col(|ui| {
                             ui.strong("时间");
                         });
@@ -2837,7 +2731,7 @@ impl eframe::App for MeshBcTesterApp {
                     })
                     .body(|mut body| {
                         for (index, entry) in filtered_logs {
-                            body.row(24.0, |mut row| {
+                            body.row(18.0, |mut row| {
                                 row.col(|ui| {
                                     if ui
                                         .selectable_label(
@@ -2873,8 +2767,7 @@ impl eframe::App for MeshBcTesterApp {
             });
 
             Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.label(RichText::new("解析详情").heading());
-                ui.separator();
+                Self::section_heading(ui, "解析详情");
                 if let Some(index) = self.selected_log_index {
                     if let Some(entry) = self.logs.get(index) {
                         if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
@@ -2886,10 +2779,10 @@ impl eframe::App for MeshBcTesterApp {
                                     .striped(true)
                                     .column(Column::initial(160.0))
                                     .column(Column::remainder())
-                                    .min_scrolled_height(120.0)
+                                    .min_scrolled_height(80.0)
                                     .body(|mut body| {
                                         for (key, value) in details {
-                                            body.row(24.0, |mut row| {
+                                            body.row(18.0, |mut row| {
                                                 row.col(|ui| {
                                                     ui.strong(key);
                                                 });
@@ -2912,15 +2805,14 @@ impl eframe::App for MeshBcTesterApp {
             });
 
             Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.label(RichText::new("当前负载").heading());
-                ui.separator();
+                Self::section_heading(ui, "当前负载");
                 if let Some(index) = self.selected_log_index {
                     if let Some(entry) = self.logs.get(index) {
                         let mut payload = entry.payload.clone();
                         ui.add(
                             TextEdit::multiline(&mut payload)
                                 .font(egui::TextStyle::Monospace)
-                                .desired_rows(12)
+                                .desired_rows(10)
                                 .desired_width(f32::INFINITY)
                                 .interactive(false),
                         );
@@ -3027,23 +2919,23 @@ struct VisualPalette {
 impl VisualPalette {
     fn dark() -> Self {
         Self {
-            panel_fill: rgb(14, 17, 22),
-            window_fill: rgb(17, 20, 26),
-            faint_bg_color: rgb(24, 30, 38),
-            extreme_bg_color: rgb(8, 11, 16),
-            code_bg_color: rgb(10, 20, 28),
-            window_stroke: rgb(52, 70, 85),
-            selection_bg_fill: rgb(22, 88, 120),
-            selection_stroke: rgb(152, 226, 255),
-            hyperlink_color: rgb(94, 204, 255),
-            inactive_bg_fill: rgb(28, 35, 44),
-            inactive_bg_stroke: rgb(52, 70, 85),
-            hovered_bg_fill: rgb(34, 49, 61),
-            hovered_bg_stroke: rgb(70, 113, 138),
-            active_bg_fill: rgb(27, 84, 108),
-            active_bg_stroke: rgb(86, 171, 211),
-            open_bg_fill: rgb(33, 57, 73),
-            open_bg_stroke: rgb(72, 122, 150),
+            panel_fill: rgb(9, 13, 20),
+            window_fill: rgb(6, 10, 16),
+            faint_bg_color: rgb(14, 22, 34),
+            extreme_bg_color: rgb(4, 7, 12),
+            code_bg_color: rgb(7, 18, 29),
+            window_stroke: rgb(35, 58, 78),
+            selection_bg_fill: rgb(14, 95, 133),
+            selection_stroke: rgb(142, 226, 255),
+            hyperlink_color: rgb(82, 205, 255),
+            inactive_bg_fill: rgb(13, 24, 38),
+            inactive_bg_stroke: rgb(41, 68, 91),
+            hovered_bg_fill: rgb(18, 39, 58),
+            hovered_bg_stroke: rgb(58, 142, 181),
+            active_bg_fill: rgb(13, 86, 122),
+            active_bg_stroke: rgb(80, 202, 255),
+            open_bg_fill: rgb(18, 48, 70),
+            open_bg_stroke: rgb(80, 178, 224),
         }
     }
 }
@@ -3071,50 +2963,55 @@ fn apply_visual_palette(visuals: &mut egui::Visuals, palette: VisualPalette) {
 impl MeshBcTesterApp {
     fn apply_visual_style(ctx: &egui::Context) {
         ctx.global_style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-            style.spacing.button_padding = egui::vec2(9.0, 3.0);
-            style.spacing.interact_size = egui::vec2(44.0, 26.0);
+            style.spacing.item_spacing = egui::vec2(4.0, 2.0);
+            style.spacing.button_padding = egui::vec2(6.0, 1.0);
+            style.spacing.interact_size = egui::vec2(32.0, 24.0);
             style.spacing.slider_width = 160.0;
-            style.spacing.combo_width = 180.0;
-            style.spacing.indent = 14.0;
+            style.spacing.combo_width = 150.0;
+            style.spacing.indent = 8.0;
 
             style.text_styles.insert(
                 egui::TextStyle::Heading,
-                egui::FontId::new(18.0, egui::FontFamily::Proportional),
+                egui::FontId::new(15.0, egui::FontFamily::Proportional),
             );
             style.text_styles.insert(
                 egui::TextStyle::Body,
-                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                egui::FontId::new(12.5, egui::FontFamily::Proportional),
             );
             style.text_styles.insert(
                 egui::TextStyle::Button,
-                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                egui::FontId::new(12.0, egui::FontFamily::Proportional),
             );
             style.text_styles.insert(
                 egui::TextStyle::Monospace,
-                egui::FontId::new(12.5, egui::FontFamily::Monospace),
+                egui::FontId::new(12.0, egui::FontFamily::Monospace),
             );
             style.text_styles.insert(
                 egui::TextStyle::Small,
-                egui::FontId::new(11.5, egui::FontFamily::Proportional),
+                egui::FontId::new(10.5, egui::FontFamily::Proportional),
             );
 
             let visuals = &mut style.visuals;
             *visuals = egui::Visuals::dark();
             let palette = VisualPalette::dark();
             apply_visual_palette(visuals, palette);
-            let radius = egui::CornerRadius::same(5);
+            let radius = egui::CornerRadius::same(6);
             visuals.widgets.noninteractive.corner_radius = radius;
             visuals.widgets.inactive.corner_radius = radius;
             visuals.widgets.hovered.corner_radius = radius;
             visuals.widgets.active.corner_radius = radius;
             visuals.widgets.open.corner_radius = radius;
+            visuals.widgets.noninteractive.fg_stroke.color = rgb(172, 194, 214);
+            visuals.widgets.inactive.fg_stroke.color = rgb(220, 236, 250);
+            visuals.widgets.hovered.fg_stroke.color = rgb(236, 247, 255);
+            visuals.widgets.active.fg_stroke.color = rgb(242, 250, 255);
+            visuals.widgets.open.fg_stroke.color = rgb(236, 247, 255);
         });
     }
 
     fn side_panel_frame(style: &egui::Style) -> egui::Frame {
         egui::Frame::side_top_panel(style)
-            .inner_margin(egui::Margin::symmetric(10, 10))
+            .inner_margin(egui::Margin::symmetric(5, 5))
             .fill(style.visuals.panel_fill)
             .stroke(egui::Stroke::new(
                 1.0_f32,
@@ -3124,7 +3021,7 @@ impl MeshBcTesterApp {
 
     fn top_bottom_panel_frame(style: &egui::Style) -> egui::Frame {
         egui::Frame::side_top_panel(style)
-            .inner_margin(egui::Margin::symmetric(10, 6))
+            .inner_margin(egui::Margin::symmetric(5, 4))
             .fill(style.visuals.panel_fill)
             .stroke(egui::Stroke::new(
                 1.0_f32,
@@ -3134,9 +3031,9 @@ impl MeshBcTesterApp {
 
     fn panel_card_frame(ui: &egui::Ui) -> egui::Frame {
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .outer_margin(egui::Margin::symmetric(0, 4))
-            .corner_radius(egui::CornerRadius::same(5))
+            .inner_margin(egui::Margin::symmetric(6, 5))
+            .outer_margin(egui::Margin::symmetric(0, 2))
+            .corner_radius(egui::CornerRadius::same(6))
             .fill(ui.visuals().faint_bg_color)
             .stroke(egui::Stroke::new(
                 1.0_f32,
@@ -3150,7 +3047,10 @@ impl MeshBcTesterApp {
         title: impl Into<egui::WidgetText>,
         add_body: impl FnOnce(&mut egui::Ui),
     ) {
-        let title = title.into().heading();
+        let title = RichText::new(title.into().text())
+            .size(13.0)
+            .strong()
+            .color(rgb(142, 226, 255));
         Self::panel_card_frame(ui).show(ui, |ui| {
             egui::CollapsingHeader::new(title)
                 .id_salt(id_salt)
@@ -3164,31 +3064,189 @@ impl MeshBcTesterApp {
     fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         ui.add(
             egui::Button::new(text)
-                .fill(rgb(20, 94, 128))
-                .stroke(stroke(rgb(98, 199, 232))),
+                .fill(rgb(9, 96, 138))
+                .stroke(stroke(rgb(102, 216, 255))),
         )
     }
 
     fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         ui.add(
             egui::Button::new(text)
-                .fill(rgb(28, 35, 44))
-                .stroke(stroke(rgb(52, 70, 85))),
+                .fill(rgb(14, 25, 39))
+                .stroke(stroke(rgb(45, 75, 100))),
         )
     }
 
     fn stat_chip(ui: &mut egui::Ui, label: &str, value: String) {
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 4))
+            .inner_margin(egui::Margin::symmetric(4, 2))
             .fill(ui.visuals().extreme_bg_color)
             .stroke(stroke(ui.visuals().widgets.noninteractive.bg_stroke.color))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.small(label);
+                    ui.small(RichText::new(label).color(rgb(113, 160, 194)));
                     ui.separator();
-                    ui.label(RichText::new(value).strong());
+                    ui.label(RichText::new(value).strong().color(rgb(234, 246, 255)));
                 });
             });
+    }
+
+    fn section_heading(ui: &mut egui::Ui, text: &str) {
+        ui.label(
+            RichText::new(text)
+                .size(13.0)
+                .strong()
+                .color(rgb(142, 226, 255)),
+        );
+    }
+
+    fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, tone: ChipTone) {
+        let (fill, border, text) = match tone {
+            ChipTone::Warning => (rgb(49, 34, 7), rgb(199, 153, 61), rgb(255, 225, 150)),
+            ChipTone::Success => (rgb(8, 53, 67), rgb(89, 210, 255), rgb(219, 246, 255)),
+            ChipTone::Neutral => (rgb(24, 23, 28), rgb(84, 96, 110), rgb(200, 210, 220)),
+        };
+
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .fill(fill)
+            .stroke(stroke(border))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.small(RichText::new(label).color(rgb(128, 163, 189)));
+                    ui.separator();
+                    ui.label(RichText::new(value).strong().color(text));
+                });
+            });
+    }
+
+    fn paint_tech_background(ui: &egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter_at(rect);
+        let minor = egui::Color32::from_rgba_unmultiplied(82, 205, 255, 4);
+        let major = egui::Color32::from_rgba_unmultiplied(82, 205, 255, 9);
+
+        let grid = 28.0;
+        let mut x = rect.left();
+        let mut index = 0;
+        while x <= rect.right() {
+            let color = if index % 4 == 0 { major } else { minor };
+            let width = if index % 4 == 0 { 1.0_f32 } else { 0.5_f32 };
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(width, color),
+            );
+            x += grid;
+            index += 1;
+        }
+
+        let mut y = rect.top();
+        let mut row = 0;
+        while y <= rect.bottom() {
+            let color = if row % 4 == 0 { major } else { minor };
+            let width = if row % 4 == 0 { 1.0_f32 } else { 0.5_f32 };
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(width, color),
+            );
+            y += grid;
+            row += 1;
+        }
+    }
+
+    fn compact_widget<W: egui::Widget>(ui: &mut egui::Ui, width: f32, widget: W) -> egui::Response {
+        ui.add_sized([width, 24.0], widget)
+    }
+
+    fn compact_text_edit(ui: &mut egui::Ui, width: f32, value: &mut String) -> egui::Response {
+        Self::compact_widget(ui, width, TextEdit::singleline(value))
+    }
+
+    fn compact_text_edit_hint(
+        ui: &mut egui::Ui,
+        width: f32,
+        value: &mut String,
+        hint: &str,
+    ) -> egui::Response {
+        Self::compact_widget(ui, width, TextEdit::singleline(value).hint_text(hint))
+    }
+
+    fn device_secondary_summary(state: &DeviceRuntimeState) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if !state.last_result.is_empty() {
+            let label = if state.last_result_label.is_empty() {
+                "结果"
+            } else {
+                state.last_result_label.as_str()
+            };
+            parts.push(format!(
+                "{}:{}",
+                label,
+                Self::truncate_for_row(&state.last_result, 24)
+            ));
+        }
+
+        for (label, value) in [
+            ("版本", state.last_version.as_str()),
+            ("型号", state.last_device_model.as_str()),
+            ("Mesh", state.last_mesh_addr.as_str()),
+            ("场景", state.last_scene_id.as_str()),
+            ("功率", state.last_power_w.as_str()),
+            ("组网", state.last_group_info.as_str()),
+            ("事件", state.last_motion_event.as_str()),
+            ("MAC", state.last_mac_addr.as_str()),
+        ] {
+            if !value.is_empty() {
+                parts.push(format!("{label}:{value}"));
+            }
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.into_iter().take(4).collect::<Vec<_>>().join(" · "))
+        }
+    }
+
+    fn device_selected_detail_summary(state: &DeviceRuntimeState) -> Option<String> {
+        let mut parts = Vec::new();
+
+        for (label, value) in [
+            ("模式", state.last_run_mode.as_str()),
+            ("心跳", state.last_heartbeat_interval.as_str()),
+            ("遥控组网", state.last_remote_network_enable.as_str()),
+            ("联动", state.last_group_linkage.as_str()),
+            ("联动模式", state.last_linkage_mode.as_str()),
+            ("微波", state.last_microwave_setting.as_str()),
+            ("联动组", state.last_linkage_group_state.as_str()),
+            ("能耗", state.last_energy_kwh.as_str()),
+            ("A灯", state.last_a_light_total.as_str()),
+            ("分区", state.last_partition_addr.as_str()),
+            ("车道组", state.last_lane_group_addr.as_str()),
+            ("相邻组", state.last_adjacent_group_addr.as_str()),
+            ("场景摘要", state.last_scene_summary.as_str()),
+        ] {
+            if !value.is_empty() {
+                parts.push(format!("{label}:{value}"));
+            }
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.into_iter().take(6).collect::<Vec<_>>().join(" · "))
+        }
+    }
+
+    fn truncate_for_row(text: &str, max_chars: usize) -> String {
+        let mut iter = text.chars();
+        let shortened: String = iter.by_ref().take(max_chars).collect();
+        if iter.next().is_some() {
+            format!("{shortened}…")
+        } else {
+            shortened
+        }
     }
 }
 
@@ -3217,6 +3275,30 @@ fn apply_editor(device: &mut DeviceProfile, editor: &DeviceEditor) {
     device.mesh_dev_type = editor.mesh_dev_type;
     device.default_dest_addr = editor.default_dest_addr;
     device.subscribe_enabled = editor.subscribe_enabled;
+}
+
+fn normalized_topic_prefix(topic: &str) -> &str {
+    topic.trim_end_matches('/')
+}
+
+fn topic_matches_device_up_topic(device_up_topic: &str, incoming_topic: &str) -> bool {
+    let prefix = normalized_topic_prefix(device_up_topic);
+    if prefix.is_empty() {
+        return false;
+    }
+    incoming_topic == prefix
+        || incoming_topic
+            .strip_prefix(prefix)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
+fn compatible_up_topic_filters(topic: &str) -> Vec<String> {
+    let prefix = normalized_topic_prefix(topic);
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    vec![prefix.to_string(), format!("{prefix}/#")]
 }
 
 fn configure_chinese_fonts(ctx: &egui::Context) {
@@ -3510,6 +3592,54 @@ mod tests {
         MeshBcTesterApp::update_device_state_from_payload(&mut state, &payload);
         assert_eq!(state.last_a_light_total, "88");
         assert_eq!(state.last_a_light_preview, "0xE001/11:22:33:44:55:66");
+    }
+
+    #[test]
+    fn device_by_topic_matches_nested_gen_subtopic() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+
+        let device = app.device_by_topic("/application/AP-C-BM/device/34B7DA848802/up/gen/0");
+        assert_eq!(device.map(|item| item.local_id), Some(1));
+    }
+
+    #[test]
+    fn device_by_topic_rejects_similar_but_unrelated_topic() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+
+        let device = app.device_by_topic("/application/AP-C-BM/device/34B7DA848802/upstream/gen/0");
+        assert!(device.is_none());
+    }
+
+    #[test]
+    fn compatible_up_topic_filters_cover_exact_and_nested_topics() {
+        let topics = compatible_up_topic_filters("/application/AP-C-BM/device/34B7DA848802/up");
+        assert_eq!(
+            topics,
+            vec![
+                "/application/AP-C-BM/device/34B7DA848802/up".to_string(),
+                "/application/AP-C-BM/device/34B7DA848802/up/#".to_string(),
+            ]
+        );
     }
 
     #[test]

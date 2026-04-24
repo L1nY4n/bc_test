@@ -108,7 +108,7 @@ Behavior:
 
 - branch pushes run cross-platform `cargo check`
 - manual workflow runs upload the generated installers as workflow artifacts
-- tag pushes such as `v.0.1.0` also create or update a GitHub Release and attach the installers
+- tag pushes such as `v0.1.1` also create or update a GitHub Release and attach the installers
 
 Important:
 

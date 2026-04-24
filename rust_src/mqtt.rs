@@ -11,7 +11,7 @@ use crate::models::BrokerProfile;
 
 #[derive(Debug)]
 pub enum MqttEvent {
-    Connection { message: String },
+    Connection { connected: bool, message: String },
     Message { topic: String, payload: String },
 }
 
@@ -67,6 +67,7 @@ impl MqttRuntime {
             match notification {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     let _ = sender.send(MqttEvent::Connection {
+                        connected: true,
                         message: "已连接".into(),
                     });
                 }
@@ -89,6 +90,7 @@ impl MqttRuntime {
                 Ok(_) => {}
                 Err(err) => {
                     let _ = sender.send(MqttEvent::Connection {
+                        connected: false,
                         message: format!("连接断开: {err}"),
                     });
                     break;
@@ -106,6 +108,7 @@ impl MqttRuntime {
             let _ = worker.join();
         }
         let _ = self.events_tx.send(MqttEvent::Connection {
+            connected: false,
             message: "已断开".into(),
         });
     }
