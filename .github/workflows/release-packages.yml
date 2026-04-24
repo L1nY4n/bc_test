@@ -142,13 +142,14 @@ jobs:
       - name: Publish release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --verify-tag --generate-notes
+          gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1 || gh release create "$TAG_NAME" --repo "$GH_REPO" --verify-tag --generate-notes
           shopt -s nullglob globstar
           assets=(release-assets/**/*)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found." >&2
             exit 1
           fi
-          gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          gh release upload "$TAG_NAME" "${assets[@]}" --repo "$GH_REPO" --clobber
