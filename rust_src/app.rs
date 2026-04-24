@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontTweak, RichText, TextEdit};
@@ -25,6 +27,9 @@ pub struct MeshBcTesterApp {
     broker_editor: BrokerProfile,
     device_editor: DeviceEditor,
     selected_devices: BTreeSet<u64>,
+    auto_discovery_enabled: bool,
+    auto_import_discovered: bool,
+    discovered_devices: Vec<DiscoveredDevice>,
     selected_log_index: Option<usize>,
     command_key: String,
     command_form: BTreeMap<String, String>,
@@ -38,8 +43,10 @@ pub struct MeshBcTesterApp {
     recent_operations: Vec<OperationRecord>,
     show_selected_logs_only: bool,
     log_filter_text: String,
-    transfer_kind: TransferKind,
-    transfer_file: String,
+    ota_transfer_kind: TransferKind,
+    ota_transfer_file: String,
+    voice_transfer_kind: TransferKind,
+    voice_transfer_file: String,
     transfer_version: u8,
     transfer_voice_name: String,
     transfer_packet_delay_ms: u64,
@@ -47,6 +54,7 @@ pub struct MeshBcTesterApp {
     transfer_max_retries: u8,
     system_notice: String,
     pending_confirmation: Option<PendingConfirmation>,
+    pending_file_dialog: Option<PendingFileDialog>,
     pending_requests: Vec<PendingRequest>,
     active_transfers: Vec<ActiveTransfer>,
     device_last_seen_at: HashMap<u64, Instant>,
@@ -70,6 +78,24 @@ struct OperationRecord {
     status: String,
     detail: String,
     rtt_ms: String,
+}
+
+struct DiscoveredDevice {
+    device_id: String,
+    up_topic: String,
+    down_topic: String,
+    suggested_name: String,
+    dev_model: String,
+    version: String,
+    mesh_dev_type: u8,
+    default_dest_addr: Option<u16>,
+    last_opcode: String,
+    last_summary: String,
+    discovery_reason: String,
+    first_seen: String,
+    last_seen: String,
+    last_topic: String,
+    seen_count: u32,
 }
 
 struct ActiveTransfer {
@@ -124,6 +150,17 @@ enum PendingAction {
     },
 }
 
+struct PendingFileDialog {
+    kind: PendingFileDialogKind,
+    rx: Receiver<Option<PathBuf>>,
+}
+
+enum PendingFileDialogKind {
+    OtaTransferFile,
+    VoiceTransferFile,
+    EvidenceExport,
+}
+
 const TRANSFER_PACKET_DELAY_MS: u64 = 15;
 const TRANSFER_ACK_TIMEOUT_SECS: u64 = 10;
 const TRANSFER_MAX_RETRIES: u8 = 2;
@@ -132,6 +169,7 @@ const MAX_TRANSFER_PACKETS: usize = 6000;
 const MAX_TRANSFER_TOTAL_PUBLISHES: usize = 12000;
 const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
 const MAX_OPERATION_HISTORY: usize = 300;
+const MAX_DISCOVERED_DEVICES: usize = 128;
 
 impl MeshBcTesterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -177,6 +215,9 @@ impl MeshBcTesterApp {
                 ..Default::default()
             },
             selected_devices: BTreeSet::new(),
+            auto_discovery_enabled: true,
+            auto_import_discovered: false,
+            discovered_devices: Vec::new(),
             selected_log_index: None,
             command_key,
             command_form,
@@ -195,8 +236,10 @@ impl MeshBcTesterApp {
             recent_operations: Vec::new(),
             show_selected_logs_only: false,
             log_filter_text: String::new(),
-            transfer_kind: TransferKind::BcOta,
-            transfer_file: String::new(),
+            ota_transfer_kind: TransferKind::BcOta,
+            ota_transfer_file: String::new(),
+            voice_transfer_kind: TransferKind::VoiceFile,
+            voice_transfer_file: String::new(),
             transfer_version: 1,
             transfer_voice_name: "voice.adpcm".into(),
             transfer_packet_delay_ms,
@@ -204,6 +247,7 @@ impl MeshBcTesterApp {
             transfer_max_retries,
             system_notice: String::new(),
             pending_confirmation: None,
+            pending_file_dialog: None,
             pending_requests: Vec::new(),
             active_transfers: Vec::new(),
             device_last_seen_at: HashMap::new(),
@@ -281,6 +325,9 @@ impl MeshBcTesterApp {
                 MqttEvent::Message { topic, payload } => {
                     let device = self.device_by_topic(&topic).cloned();
                     let parsed: Option<Value> = serde_json::from_str(&payload).ok();
+                    if device.is_none() {
+                        self.observe_discovered_message(&topic, parsed.as_ref(), &payload);
+                    }
                     let mut rx_status = "接收".to_string();
                     if let (Some(device), Some(parsed)) = (&device, &parsed) {
                         self.resolve_transfer_ack(device, parsed);
@@ -686,6 +733,39 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn show_pending_confirmation_modal(&mut self, ctx: &egui::Context) {
+        let Some((title, detail)) = self
+            .pending_confirmation
+            .as_ref()
+            .map(|pending| (pending.title.clone(), pending.detail.clone()))
+        else {
+            return;
+        };
+
+        let response =
+            egui::Modal::new(egui::Id::new("pending-confirmation-modal")).show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.vertical(|ui| {
+                    ui.heading(title);
+                    ui.add_space(8.0);
+                    ui.label(detail);
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if Self::primary_button(ui, "确认执行").clicked() {
+                            self.execute_pending_confirmation();
+                        }
+                        if Self::secondary_button(ui, "取消").clicked() {
+                            self.pending_confirmation = None;
+                        }
+                    });
+                });
+            });
+
+        if response.should_close() {
+            self.pending_confirmation = None;
+        }
+    }
+
     fn normalize_raw_payload_for_device(
         &self,
         payload: Value,
@@ -833,6 +913,153 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn configured_device_exists(&self, device_id: &str, up_topic: &str, down_topic: &str) -> bool {
+        self.config.devices.iter().any(|device| {
+            device.device_id == device_id
+                || device.up_topic == up_topic
+                || device.down_topic == down_topic
+        })
+    }
+
+    fn observe_discovered_message(
+        &mut self,
+        topic: &str,
+        payload: Option<&Value>,
+        raw_payload: &str,
+    ) {
+        if !self.auto_discovery_enabled {
+            return;
+        }
+        let Some((device_id, up_topic, down_topic)) =
+            extract_device_topics_from_message_topic(topic)
+        else {
+            return;
+        };
+        let auto_import_device_id = device_id.clone();
+        if self.configured_device_exists(&device_id, &up_topic, &down_topic) {
+            self.discovered_devices
+                .retain(|candidate| candidate.device_id != device_id);
+            return;
+        }
+
+        let now = now_display();
+        let summary = payload
+            .map(summarize_payload)
+            .unwrap_or_else(|| raw_payload.chars().take(96).collect());
+        let opcode = payload
+            .and_then(|value| value.get("opcode"))
+            .and_then(Value::as_u64)
+            .map(|value| format!("0x{value:02X}"))
+            .unwrap_or_else(|| "-".into());
+        let discovery_reason = payload
+            .map(discovery_reason_from_payload)
+            .unwrap_or_else(|| "上行消息".into());
+
+        if let Some(candidate) = self
+            .discovered_devices
+            .iter_mut()
+            .find(|candidate| candidate.device_id == device_id)
+        {
+            candidate.last_seen = now.clone();
+            candidate.last_topic = topic.to_string();
+            candidate.last_opcode = opcode;
+            candidate.last_summary = summary;
+            candidate.discovery_reason = discovery_reason;
+            candidate.seen_count = candidate.seen_count.saturating_add(1);
+            if let Some(payload) = payload {
+                update_discovered_device_from_payload(candidate, payload);
+            }
+        } else {
+            let mut candidate = DiscoveredDevice {
+                suggested_name: suggested_discovered_name(&device_id, None),
+                device_id,
+                up_topic,
+                down_topic,
+                dev_model: String::new(),
+                version: String::new(),
+                mesh_dev_type: 1,
+                default_dest_addr: None,
+                last_opcode: opcode,
+                last_summary: summary,
+                discovery_reason,
+                first_seen: now.clone(),
+                last_seen: now,
+                last_topic: topic.to_string(),
+                seen_count: 1,
+            };
+            if let Some(payload) = payload {
+                update_discovered_device_from_payload(&mut candidate, payload);
+            }
+            self.discovered_devices.push(candidate);
+            self.discovered_devices
+                .sort_by(|left, right| right.last_seen.cmp(&left.last_seen));
+            if self.discovered_devices.len() > MAX_DISCOVERED_DEVICES {
+                self.discovered_devices.truncate(MAX_DISCOVERED_DEVICES);
+            }
+        }
+
+        if self.auto_import_discovered {
+            self.import_discovered_device_by_id(&auto_import_device_id);
+        }
+    }
+
+    fn import_discovered_device_by_id(&mut self, device_id: &str) {
+        let Some(position) = self
+            .discovered_devices
+            .iter()
+            .position(|candidate| candidate.device_id == device_id)
+        else {
+            return;
+        };
+        let candidate = self.discovered_devices.remove(position);
+        if self.configured_device_exists(
+            &candidate.device_id,
+            &candidate.up_topic,
+            &candidate.down_topic,
+        ) {
+            return;
+        }
+
+        let device = DeviceProfile {
+            local_id: self.config.next_device_id,
+            name: candidate.suggested_name.clone(),
+            device_id: candidate.device_id.clone(),
+            up_topic: candidate.up_topic.clone(),
+            down_topic: candidate.down_topic.clone(),
+            mesh_dev_type: candidate.mesh_dev_type,
+            default_dest_addr: candidate.default_dest_addr.unwrap_or(1),
+            subscribe_enabled: true,
+        };
+        self.config.next_device_id += 1;
+        self.runtime_states
+            .entry(device.local_id)
+            .or_insert_with(DeviceRuntimeState::default);
+        self.config.devices.push(device);
+        self.sync_subscriptions();
+        let _ = save_config(&self.config);
+        self.system_notice = format!("已从主动上报导入设备资源: {}", candidate.device_id);
+    }
+
+    fn load_discovered_device_into_editor(&mut self, device_id: &str) {
+        let Some(candidate) = self
+            .discovered_devices
+            .iter()
+            .find(|candidate| candidate.device_id == device_id)
+        else {
+            return;
+        };
+        self.device_editor = DeviceEditor {
+            editing_id: None,
+            name: candidate.suggested_name.clone(),
+            device_id: candidate.device_id.clone(),
+            up_topic: candidate.up_topic.clone(),
+            down_topic: candidate.down_topic.clone(),
+            mesh_dev_type: candidate.mesh_dev_type,
+            default_dest_addr: candidate.default_dest_addr.unwrap_or(1),
+            subscribe_enabled: true,
+        };
+    }
+
     fn save_device_editor(&mut self) {
         if let Err(err) = self.validate_device_editor() {
             self.system_notice = err;
@@ -937,18 +1164,30 @@ impl MeshBcTesterApp {
             .collect()
     }
 
-    fn pick_transfer_file(&mut self) {
-        if let Some(path) = FileDialog::new().pick_file() {
-            self.transfer_file = path.display().to_string();
-        }
+    fn pick_ota_transfer_file(&mut self) {
+        self.spawn_path_dialog(PendingFileDialogKind::OtaTransferFile, || {
+            FileDialog::new().pick_file()
+        });
     }
 
-    fn send_transfer_preview(&mut self) {
-        if self.transfer_file.trim().is_empty() {
+    fn pick_voice_transfer_file(&mut self) {
+        self.spawn_path_dialog(PendingFileDialogKind::VoiceTransferFile, || {
+            FileDialog::new().pick_file()
+        });
+    }
+
+    fn start_transfer(
+        &mut self,
+        kind: TransferKind,
+        file_path: String,
+        version: u8,
+        voice_name: String,
+    ) {
+        if file_path.trim().is_empty() {
             self.system_notice = "请先选择传输文件。".into();
             return;
         }
-        let path = PathBuf::from(&self.transfer_file);
+        let path = PathBuf::from(&file_path);
         let Ok(bytes) = fs::read(&path) else {
             self.system_notice = "读取传输文件失败。".into();
             return;
@@ -968,18 +1207,8 @@ impl MeshBcTesterApp {
         let Some(devices) = self.ensure_selected_devices() else {
             return;
         };
-        let preview = transfer_preview(
-            self.transfer_kind,
-            &bytes,
-            self.transfer_version,
-            &self.transfer_voice_name,
-        );
-        let packets = match build_transfer_packets(
-            self.transfer_kind,
-            &bytes,
-            self.transfer_version,
-            &self.transfer_voice_name,
-        ) {
+        let preview = transfer_preview(kind, &bytes, version, &voice_name);
+        let packets = match build_transfer_packets(kind, &bytes, version, &voice_name) {
             Ok(packets) => packets,
             Err(err) => {
                 self.system_notice = err;
@@ -999,7 +1228,7 @@ impl MeshBcTesterApp {
                 title: "确认发起传输".into(),
                 detail: format!(
                     "类型：{}，目标设备：{} 台，文件大小：{} 字节，分包：{}",
-                    self.transfer_kind.label(),
+                    kind.label(),
                     devices.len(),
                     bytes.len(),
                     packets.len()
@@ -1009,7 +1238,7 @@ impl MeshBcTesterApp {
                     packets,
                     preview,
                     byte_size: bytes.len(),
-                    kind: self.transfer_kind,
+                    kind,
                 },
             });
             return;
@@ -1022,7 +1251,7 @@ impl MeshBcTesterApp {
             );
             return;
         }
-        self.queue_transfer_action(devices, preview, packets, bytes.len(), self.transfer_kind);
+        self.queue_transfer_action(devices, preview, packets, bytes.len(), kind);
     }
 
     fn queue_transfer_action(
@@ -1077,11 +1306,7 @@ impl MeshBcTesterApp {
                 Self::set_device_result(
                     state,
                     "传输",
-                    format!(
-                        "{} 已排队，共{}包",
-                        self.transfer_kind.label(),
-                        packets.len()
-                    ),
+                    format!("{} 已排队，共{}包", kind.label(), packets.len()),
                 );
             }
             self.active_transfers.push(ActiveTransfer {
@@ -1089,7 +1314,7 @@ impl MeshBcTesterApp {
                 device_name: device.name.clone(),
                 device_id: device.device_id.clone(),
                 down_topic: device.down_topic.clone(),
-                kind: self.transfer_kind,
+                kind,
                 packets: packets.clone(),
                 next_index: 0,
                 next_send_at: Instant::now(),
@@ -1405,16 +1630,15 @@ impl MeshBcTesterApp {
         }
         transfer.waiting_ack_opcode = None;
         transfer.waiting_since = None;
+        transfer.paused = false;
+        transfer.next_send_at =
+            Instant::now() + Duration::from_millis(self.transfer_packet_delay_ms);
         if matches!(opcode, 0x41 | 0x44) {
-            transfer.paused = true;
-            transfer.status = "已获同意，等待继续".into();
+            transfer.status = "已获同意，继续发送".into();
             if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
-                Self::set_device_result(state, "待继续", "已获同意，等待继续".into());
+                Self::set_device_result(state, "传输", "已获同意，继续发送".into());
             }
         } else {
-            transfer.paused = false;
-            transfer.next_send_at =
-                Instant::now() + Duration::from_millis(TRANSFER_PACKET_DELAY_MS);
             transfer.status = "收到ACK".into();
             if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
                 Self::set_device_result(state, "成功", "收到传输ACK".into());
@@ -1564,13 +1788,55 @@ impl MeshBcTesterApp {
     }
 
     fn export_evidence(&mut self) {
-        let Some(path) = FileDialog::new()
-            .set_file_name("mesh-bc-test-evidence.json")
-            .save_file()
-        else {
+        self.spawn_path_dialog(PendingFileDialogKind::EvidenceExport, || {
+            FileDialog::new()
+                .set_file_name("mesh-bc-test-evidence.json")
+                .save_file()
+        });
+    }
+
+    fn spawn_path_dialog<F>(&mut self, kind: PendingFileDialogKind, open_dialog: F)
+    where
+        F: FnOnce() -> Option<PathBuf> + Send + 'static,
+    {
+        if self.pending_file_dialog.is_some() {
+            self.system_notice = "已有文件对话框正在等待结果。".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.pending_file_dialog = Some(PendingFileDialog { kind, rx });
+        thread::spawn(move || {
+            let _ = tx.send(open_dialog());
+        });
+    }
+
+    fn poll_pending_file_dialog(&mut self) {
+        let Some(pending) = self.pending_file_dialog.take() else {
             return;
         };
+        match pending.rx.try_recv() {
+            Ok(Some(path)) => match pending.kind {
+                PendingFileDialogKind::OtaTransferFile => {
+                    self.ota_transfer_file = path.display().to_string();
+                }
+                PendingFileDialogKind::VoiceTransferFile => {
+                    self.voice_transfer_file = path.display().to_string();
+                }
+                PendingFileDialogKind::EvidenceExport => {
+                    self.write_evidence_to_path(&path);
+                }
+            },
+            Ok(None) => {}
+            Err(TryRecvError::Empty) => {
+                self.pending_file_dialog = Some(pending);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.system_notice = "文件对话框已中断。".into();
+            }
+        }
+    }
 
+    fn write_evidence_to_path(&mut self, path: &Path) {
         let device_states = self
             .config
             .devices
@@ -1698,9 +1964,37 @@ impl MeshBcTesterApp {
             })
             .collect::<Vec<_>>();
 
+        let discovered = self
+            .discovered_devices
+            .iter()
+            .map(|device| {
+                serde_json::json!({
+                    "device_id": device.device_id,
+                    "suggested_name": device.suggested_name,
+                    "up_topic": device.up_topic,
+                    "down_topic": device.down_topic,
+                    "dev_model": device.dev_model,
+                    "version": device.version,
+                    "mesh_dev_type": device.mesh_dev_type,
+                    "default_dest_addr": device.default_dest_addr,
+                    "last_opcode": device.last_opcode,
+                    "last_summary": device.last_summary,
+                    "discovery_reason": device.discovery_reason,
+                    "first_seen": device.first_seen,
+                    "last_seen": device.last_seen,
+                    "last_topic": device.last_topic,
+                    "seen_count": device.seen_count,
+                })
+            })
+            .collect::<Vec<_>>();
+
         let evidence = serde_json::json!({
             "generated_at": now_display(),
             "connection_status": self.connection_status,
+            "auto_discovery": {
+                "enabled": self.auto_discovery_enabled,
+                "auto_import": self.auto_import_discovered,
+            },
             "broker": {
                 "name": self.broker_editor.name,
                 "host": self.broker_editor.host,
@@ -1718,12 +2012,13 @@ impl MeshBcTesterApp {
             "device_states": device_states,
             "pending_requests": pending,
             "active_transfers": transfers,
+            "discovered_devices": discovered,
             "recent_operations": operations,
             "logs": logs,
         });
 
         match serde_json::to_string_pretty(&evidence) {
-            Ok(text) => match fs::write(&path, text) {
+            Ok(text) => match fs::write(path, text) {
                 Ok(()) => {
                     self.system_notice = format!("已导出测试证据: {}", path.display());
                 }
@@ -1759,6 +2054,9 @@ impl MeshBcTesterApp {
                 ..Default::default()
             },
             selected_devices: BTreeSet::new(),
+            auto_discovery_enabled: true,
+            auto_import_discovered: false,
+            discovered_devices: Vec::new(),
             selected_log_index: None,
             command_key: "query_bc_info".into(),
             command_form: BTreeMap::new(),
@@ -1772,8 +2070,10 @@ impl MeshBcTesterApp {
             recent_operations: Vec::new(),
             show_selected_logs_only: false,
             log_filter_text: String::new(),
-            transfer_kind: TransferKind::BcOta,
-            transfer_file: String::new(),
+            ota_transfer_kind: TransferKind::BcOta,
+            ota_transfer_file: String::new(),
+            voice_transfer_kind: TransferKind::VoiceFile,
+            voice_transfer_file: String::new(),
             transfer_version: 1,
             transfer_voice_name: "voice.adpcm".into(),
             transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
@@ -1781,6 +2081,7 @@ impl MeshBcTesterApp {
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             system_notice: String::new(),
             pending_confirmation: None,
+            pending_file_dialog: None,
             pending_requests: Vec::new(),
             active_transfers: Vec::new(),
             device_last_seen_at: HashMap::new(),
@@ -1850,6 +2151,7 @@ fn match_pending_request_index(
 impl eframe::App for MeshBcTesterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_mqtt_events();
+        self.poll_pending_file_dialog();
         self.tick_active_transfers();
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -1916,28 +2218,6 @@ impl eframe::App for MeshBcTesterApp {
                     Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
                 }
             });
-
-        if let Some((title, detail)) = self
-            .pending_confirmation
-            .as_ref()
-            .map(|pending| (pending.title.clone(), pending.detail.clone()))
-        {
-            egui::Panel::top("confirm_bar")
-                .frame(Self::top_bottom_panel_frame(panel_style))
-                .show_inside(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::YELLOW, format!("待确认: {}", title));
-                        ui.separator();
-                        ui.label(detail);
-                        if Self::primary_button(ui, "确认执行").clicked() {
-                            self.execute_pending_confirmation();
-                        }
-                        if Self::secondary_button(ui, "取消").clicked() {
-                            self.pending_confirmation = None;
-                        }
-                    });
-                });
-        }
 
         egui::Panel::bottom("status_bar")
             .frame(Self::top_bottom_panel_frame(panel_style))
@@ -2028,6 +2308,97 @@ impl eframe::App for MeshBcTesterApp {
                                 }
                             }
                         });
+                });
+
+                Self::panel_card_collapsible(ui, "discovery_card", "自动发现", |ui| {
+                    ui.checkbox(&mut self.auto_discovery_enabled, "从主动上报生成候选设备");
+                    ui.checkbox(&mut self.auto_import_discovered, "发现后自动导入设备资源");
+                    ui.horizontal(|ui| {
+                        ui.label(format!("候选设备: {}", self.discovered_devices.len()));
+                        if !self.discovered_devices.is_empty()
+                            && Self::secondary_button(ui, "导入全部").clicked()
+                        {
+                            let ids = self
+                                .discovered_devices
+                                .iter()
+                                .map(|candidate| candidate.device_id.clone())
+                                .collect::<Vec<_>>();
+                            for device_id in ids {
+                                self.import_discovered_device_by_id(&device_id);
+                            }
+                        }
+                        if !self.discovered_devices.is_empty()
+                            && Self::secondary_button(ui, "清空候选").clicked()
+                        {
+                            self.discovered_devices.clear();
+                        }
+                    });
+                    ui.small("依据 MQTT 主题中的设备ID以及心跳/事件/设备信息上报生成候选资源。");
+
+                    if self.discovered_devices.is_empty() {
+                        ui.label("当前没有待导入的发现设备。");
+                    } else {
+                        let mut import_ids = Vec::new();
+                        let mut edit_ids = Vec::new();
+                        let mut remove_ids = Vec::new();
+                        egui::ScrollArea::vertical()
+                            .max_height(240.0)
+                            .id_salt("discovered-devices-scroll")
+                            .show(ui, |ui| {
+                                for candidate in &self.discovered_devices {
+                                    Self::panel_card_frame(ui).show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(&candidate.suggested_name).strong(),
+                                            );
+                                            ui.label(format!("· {}", candidate.device_id));
+                                        });
+                                        ui.small(format!(
+                                            "{} · {} · 次数 {}",
+                                            if candidate.dev_model.is_empty() {
+                                                candidate.discovery_reason.as_str()
+                                            } else {
+                                                candidate.dev_model.as_str()
+                                            },
+                                            candidate.last_opcode,
+                                            candidate.seen_count
+                                        ));
+                                        ui.small(format!(
+                                            "上次: {} · addr {}",
+                                            candidate.last_seen,
+                                            candidate
+                                                .default_dest_addr
+                                                .map(|addr| format!("0x{addr:04X}"))
+                                                .unwrap_or_else(|| "-".into())
+                                        ));
+                                        ui.small(&candidate.last_summary);
+                                        ui.horizontal(|ui| {
+                                            if Self::primary_button(ui, "导入").clicked() {
+                                                import_ids.push(candidate.device_id.clone());
+                                            }
+                                            if Self::secondary_button(ui, "填入编辑").clicked()
+                                            {
+                                                edit_ids.push(candidate.device_id.clone());
+                                            }
+                                            if Self::secondary_button(ui, "移除").clicked() {
+                                                remove_ids.push(candidate.device_id.clone());
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+
+                        for device_id in import_ids {
+                            self.import_discovered_device_by_id(&device_id);
+                        }
+                        for device_id in edit_ids {
+                            self.load_discovered_device_into_editor(&device_id);
+                        }
+                        if !remove_ids.is_empty() {
+                            self.discovered_devices
+                                .retain(|candidate| !remove_ids.contains(&candidate.device_id));
+                        }
+                    }
                 });
 
                 Self::panel_card_collapsible(ui, "device_editor_card", "设备编辑", |ui| {
@@ -2275,20 +2646,24 @@ impl eframe::App for MeshBcTesterApp {
                     }
                 });
 
-                Self::panel_card_collapsible(ui, "transfer_preview_card", "传输预览", |ui| {
-                    egui::ComboBox::from_label("传输类型")
+                Self::panel_card_collapsible(ui, "ota_transfer_card", "OTA升级", |ui| {
+                    egui::ComboBox::from_label("升级类型")
                         .width(180.0)
-                        .selected_text(self.transfer_kind.label())
+                        .selected_text(self.ota_transfer_kind.label())
                         .show_ui(ui, |ui| {
-                            for kind in TransferKind::ALL {
-                                ui.selectable_value(&mut self.transfer_kind, kind, kind.label());
+                            for kind in [TransferKind::BcOta, TransferKind::AOta] {
+                                ui.selectable_value(
+                                    &mut self.ota_transfer_kind,
+                                    kind,
+                                    kind.label(),
+                                );
                             }
                         });
                     ui.horizontal(|ui| {
-                        ui.label("文件");
-                        Self::compact_text_edit(ui, 170.0, &mut self.transfer_file);
+                        ui.label("固件文件");
+                        Self::compact_text_edit(ui, 170.0, &mut self.ota_transfer_file);
                         if Self::secondary_button(ui, "浏览").clicked() {
-                            self.pick_transfer_file();
+                            self.pick_ota_transfer_file();
                         }
                     });
                     ui.horizontal(|ui| {
@@ -2298,8 +2673,6 @@ impl eframe::App for MeshBcTesterApp {
                             52.0,
                             egui::DragValue::new(&mut self.transfer_version).range(0..=255),
                         );
-                        ui.label("语音文件名");
-                        Self::compact_text_edit(ui, 120.0, &mut self.transfer_voice_name);
                     });
                     ui.horizontal(|ui| {
                         ui.label("包间隔(ms)");
@@ -2323,8 +2696,70 @@ impl eframe::App for MeshBcTesterApp {
                             egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
                         );
                     });
-                    if Self::primary_button(ui, "发送传输预览").clicked() {
-                        self.send_transfer_preview();
+                    if Self::primary_button(ui, "发起 OTA 升级").clicked() {
+                        self.start_transfer(
+                            self.ota_transfer_kind,
+                            self.ota_transfer_file.clone(),
+                            self.transfer_version,
+                            String::new(),
+                        );
+                    }
+                });
+
+                Self::panel_card_collapsible(ui, "voice_transfer_card", "声音传输", |ui| {
+                    ui.small("声音播放控制请使用上方预置命令中的“播放声音文件 (0x5A)”。");
+                    egui::ComboBox::from_label("传输类型")
+                        .width(180.0)
+                        .selected_text(self.voice_transfer_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in [TransferKind::VoiceFile, TransferKind::RealtimeVoice] {
+                                ui.selectable_value(
+                                    &mut self.voice_transfer_kind,
+                                    kind,
+                                    kind.label(),
+                                );
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("声音文件");
+                        Self::compact_text_edit(ui, 170.0, &mut self.voice_transfer_file);
+                        if Self::secondary_button(ui, "浏览").clicked() {
+                            self.pick_voice_transfer_file();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("声音文件名");
+                        Self::compact_text_edit(ui, 170.0, &mut self.transfer_voice_name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("包间隔(ms)");
+                        Self::compact_widget(
+                            ui,
+                            60.0,
+                            egui::DragValue::new(&mut self.transfer_packet_delay_ms)
+                                .range(1..=5_000),
+                        );
+                        ui.label("ACK超时(s)");
+                        Self::compact_widget(
+                            ui,
+                            60.0,
+                            egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
+                                .range(1..=300),
+                        );
+                        ui.label("最大重试");
+                        Self::compact_widget(
+                            ui,
+                            48.0,
+                            egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
+                        );
+                    });
+                    if Self::primary_button(ui, "发起声音传输").clicked() {
+                        self.start_transfer(
+                            self.voice_transfer_kind,
+                            self.voice_transfer_file.clone(),
+                            self.transfer_version,
+                            self.transfer_voice_name.clone(),
+                        );
                     }
                 });
             });
@@ -2361,6 +2796,7 @@ impl eframe::App for MeshBcTesterApp {
                 } else {
                     let now = Instant::now();
                     TableBuilder::new(ui)
+                        .id_salt("request-status-table")
                         .striped(true)
                         .column(Column::initial(120.0))
                         .column(Column::initial(90.0))
@@ -2478,6 +2914,7 @@ impl eframe::App for MeshBcTesterApp {
                     let mut retry_ids = Vec::new();
                     let mut clear_ids = Vec::new();
                     TableBuilder::new(ui)
+                        .id_salt("transfer-status-table")
                         .striped(true)
                         .column(Column::initial(120.0))
                         .column(Column::initial(90.0))
@@ -2615,6 +3052,7 @@ impl eframe::App for MeshBcTesterApp {
                     ui.label("当前没有最近操作记录。");
                 } else {
                     TableBuilder::new(ui)
+                        .id_salt("recent-operations-table")
                         .striped(true)
                         .column(Column::initial(140.0))
                         .column(Column::initial(120.0))
@@ -2681,149 +3119,188 @@ impl eframe::App for MeshBcTesterApp {
                 .map(|(index, entry)| (index, entry.clone()))
                 .collect();
 
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                Self::section_heading(ui, "消息日志");
-                ui.horizontal(|ui| {
-                    ui.label("筛选");
-                    Self::compact_widget(
-                        ui,
-                        190.0,
-                        TextEdit::singleline(&mut self.log_filter_text)
-                            .hint_text("设备 / opcode / 状态 / 主题"),
-                    );
-                    if Self::secondary_button(ui, "清空日志").clicked() {
-                        self.logs.clear();
-                        self.selected_log_index = None;
-                    }
-                });
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .column(Column::initial(140.0))
-                    .column(Column::initial(70.0))
-                    .column(Column::initial(120.0))
-                    .column(Column::initial(90.0))
-                    .column(Column::initial(90.0))
-                    .column(Column::initial(160.0))
-                    .column(Column::remainder())
-                    .min_scrolled_height(220.0)
-                    .header(18.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("时间");
-                        });
-                        header.col(|ui| {
-                            ui.strong("方向");
-                        });
-                        header.col(|ui| {
-                            ui.strong("设备");
-                        });
-                        header.col(|ui| {
-                            ui.strong("操作码");
-                        });
-                        header.col(|ui| {
-                            ui.strong("状态");
-                        });
-                        header.col(|ui| {
-                            ui.strong("主题");
-                        });
-                        header.col(|ui| {
-                            ui.strong("摘要");
-                        });
-                    })
-                    .body(|mut body| {
-                        for (index, entry) in filtered_logs {
-                            body.row(18.0, |mut row| {
-                                row.col(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            self.selected_log_index == Some(index),
-                                            &entry.timestamp,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_log_index = Some(index);
+            let detail_area_height = ui.available_height().max(260.0);
+            let detail_card_spacing = ui.spacing().item_spacing.y;
+            let side_detail_height = (detail_area_height * 0.34).clamp(140.0, 240.0);
+            let payload_height =
+                (detail_area_height - side_detail_height - detail_card_spacing).max(180.0);
+
+            ui.horizontal_top(|ui| {
+                let total_width = ui.available_width();
+                let gutter = ui.spacing().item_spacing.x;
+                let max_left_width = (total_width - gutter - 260.0).max(320.0);
+                let left_width = (total_width * 0.62).clamp(320.0, max_left_width);
+                let right_width = (total_width - left_width - gutter).max(260.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, detail_area_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        Self::panel_card_frame(ui).show(ui, |ui| {
+                            Self::section_heading(ui, "消息日志");
+                            ui.horizontal(|ui| {
+                                ui.label("筛选");
+                                Self::compact_widget(
+                                    ui,
+                                    190.0,
+                                    TextEdit::singleline(&mut self.log_filter_text)
+                                        .hint_text("设备 / opcode / 状态 / 主题"),
+                                );
+                                if Self::secondary_button(ui, "清空日志").clicked() {
+                                    self.logs.clear();
+                                    self.selected_log_index = None;
+                                }
+                            });
+                            let log_table_height = (detail_area_height - 76.0).max(180.0);
+                            TableBuilder::new(ui)
+                                .id_salt("message-log-table")
+                                .striped(true)
+                                .column(Column::initial(140.0))
+                                .column(Column::initial(70.0))
+                                .column(Column::initial(120.0))
+                                .column(Column::initial(90.0))
+                                .column(Column::initial(90.0))
+                                .column(Column::initial(160.0))
+                                .column(Column::remainder())
+                                .min_scrolled_height(log_table_height)
+                                .max_scroll_height(log_table_height)
+                                .header(18.0, |mut header| {
+                                    header.col(|ui| {
+                                        ui.strong("时间");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("方向");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("设备");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("操作码");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("状态");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("主题");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("摘要");
+                                    });
+                                })
+                                .body(|mut body| {
+                                    for (index, entry) in &filtered_logs {
+                                        body.row(18.0, |mut row| {
+                                            row.col(|ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.selected_log_index == Some(*index),
+                                                        &entry.timestamp,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.selected_log_index = Some(*index);
+                                                }
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(entry.direction.as_str());
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(&entry.device_name);
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(&entry.opcode);
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(&entry.status);
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(&entry.topic);
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(&entry.summary);
+                                            });
+                                        });
                                     }
                                 });
-                                row.col(|ui| {
-                                    ui.label(entry.direction.as_str());
-                                });
-                                row.col(|ui| {
-                                    ui.label(&entry.device_name);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&entry.opcode);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&entry.status);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&entry.topic);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&entry.summary);
-                                });
-                            });
-                        }
-                    });
-            });
+                        });
+                    },
+                );
 
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                Self::section_heading(ui, "解析详情");
-                if let Some(index) = self.selected_log_index {
-                    if let Some(entry) = self.logs.get(index) {
-                        if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
-                            let details = decode_payload_details(&payload);
-                            if details.is_empty() {
-                                ui.label("当前负载暂无结构化解析。");
-                            } else {
-                                TableBuilder::new(ui)
-                                    .striped(true)
-                                    .column(Column::initial(160.0))
-                                    .column(Column::remainder())
-                                    .min_scrolled_height(80.0)
-                                    .body(|mut body| {
-                                        for (key, value) in details {
-                                            body.row(18.0, |mut row| {
-                                                row.col(|ui| {
-                                                    ui.strong(key);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, detail_area_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        Self::panel_card_frame(ui).show(ui, |ui| {
+                            Self::section_heading(ui, "解析详情");
+                            if let Some(index) = self.selected_log_index {
+                                if let Some(entry) = self.logs.get(index) {
+                                    if let Ok(payload) =
+                                        serde_json::from_str::<Value>(&entry.payload)
+                                    {
+                                        let details = decode_payload_details(&payload);
+                                        if details.is_empty() {
+                                            ui.label("当前负载暂无结构化解析。");
+                                        } else {
+                                            TableBuilder::new(ui)
+                                                .id_salt("payload-details-table")
+                                                .striped(true)
+                                                .column(Column::initial(160.0))
+                                                .column(Column::remainder())
+                                                .min_scrolled_height(side_detail_height)
+                                                .max_scroll_height(side_detail_height)
+                                                .body(|mut body| {
+                                                    for (key, value) in details {
+                                                        body.row(18.0, |mut row| {
+                                                            row.col(|ui| {
+                                                                ui.strong(key);
+                                                            });
+                                                            row.col(|ui| {
+                                                                ui.label(value);
+                                                            });
+                                                        });
+                                                    }
                                                 });
-                                                row.col(|ui| {
-                                                    ui.label(value);
-                                                });
-                                            });
                                         }
-                                    });
+                                    } else {
+                                        ui.label("当前负载不是可解析的 JSON。");
+                                    }
+                                } else {
+                                    ui.label("未选择日志。");
+                                }
+                            } else {
+                                ui.label("未选择日志。");
                             }
-                        } else {
-                            ui.label("当前负载不是可解析的 JSON。");
-                        }
-                    } else {
-                        ui.label("未选择日志。");
-                    }
-                } else {
-                    ui.label("未选择日志。");
-                }
-            });
+                        });
 
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                Self::section_heading(ui, "当前负载");
-                if let Some(index) = self.selected_log_index {
-                    if let Some(entry) = self.logs.get(index) {
-                        let mut payload = entry.payload.clone();
-                        ui.add(
-                            TextEdit::multiline(&mut payload)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_rows(10)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
-                    } else {
-                        ui.label("未选择日志。");
-                    }
-                } else {
-                    ui.label("未选择日志。");
-                }
+                        Self::panel_card_frame(ui).show(ui, |ui| {
+                            Self::section_heading(ui, "当前负载");
+                            if let Some(index) = self.selected_log_index {
+                                if let Some(entry) = self.logs.get(index) {
+                                    let mut payload = entry.payload.clone();
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("current-payload-scroll")
+                                        .max_height(payload_height)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                TextEdit::multiline(&mut payload)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .interactive(false),
+                                            );
+                                        });
+                                } else {
+                                    ui.label("未选择日志。");
+                                }
+                            } else {
+                                ui.label("未选择日志。");
+                            }
+                        });
+                    },
+                );
             });
         });
+
+        self.show_pending_confirmation_modal(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -3277,6 +3754,141 @@ fn apply_editor(device: &mut DeviceProfile, editor: &DeviceEditor) {
     device.subscribe_enabled = editor.subscribe_enabled;
 }
 
+fn extract_device_id_from_discovered_topic(topic: &str) -> Option<String> {
+    let mut segments = topic.split('/').filter(|segment| !segment.is_empty());
+    while let Some(segment) = segments.next() {
+        if segment != "device" {
+            continue;
+        }
+        let device_id = segments.next()?;
+        let direction = segments.next()?;
+        if direction == "up" && !device_id.is_empty() {
+            return Some(device_id.to_string());
+        }
+    }
+    None
+}
+
+fn extract_device_topics_from_message_topic(topic: &str) -> Option<(String, String, String)> {
+    let device_id = extract_device_id_from_discovered_topic(topic)?;
+    let (up_topic, down_topic) = DeviceProfile::default_topics(&device_id);
+    Some((device_id, up_topic, down_topic))
+}
+
+fn discovery_reason_from_payload(payload: &Value) -> String {
+    match payload
+        .get("opcode")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+    {
+        Some(0x47) => "设备信息回复".into(),
+        Some(0x1B) => "心跳上报".into(),
+        Some(0x10) => "人体微波事件".into(),
+        Some(0x1D) => "运行状态回复".into(),
+        Some(opcode) => format!("上行消息 0x{opcode:02X}"),
+        None => "上行消息".into(),
+    }
+}
+
+fn suggested_discovered_name(device_id: &str, dev_model: Option<&str>) -> String {
+    if let Some(model) = dev_model.filter(|model| !model.trim().is_empty()) {
+        return model.to_string();
+    }
+    let suffix_len = device_id.chars().count().min(6);
+    let suffix = device_id
+        .chars()
+        .rev()
+        .take(suffix_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("发现设备 {suffix}")
+}
+
+fn update_discovered_device_from_payload(candidate: &mut DiscoveredDevice, payload: &Value) {
+    let Some(opcode) = payload
+        .get("opcode")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+    else {
+        return;
+    };
+
+    if let Some(src_addr) = payload.get("src_addr").and_then(Value::as_u64) {
+        if let Ok(src_addr) = u16::try_from(src_addr) {
+            if src_addr != 0 {
+                candidate.default_dest_addr = Some(src_addr);
+            }
+        }
+    }
+
+    match opcode {
+        0x47 => {
+            if let Some(model) = payload.get("dev_model").and_then(Value::as_str) {
+                candidate.dev_model = model.to_string();
+                candidate.suggested_name =
+                    suggested_discovered_name(&candidate.device_id, Some(model));
+            }
+            if let Some(version) = payload.get("version").and_then(Value::as_str) {
+                candidate.version = version.to_string();
+            }
+            if let Some(device_id) = payload.get("dev_id").and_then(Value::as_str) {
+                if !device_id.is_empty() {
+                    candidate.device_id = device_id.to_string();
+                    let (up_topic, down_topic) = DeviceProfile::default_topics(device_id);
+                    candidate.up_topic = up_topic;
+                    candidate.down_topic = down_topic;
+                }
+            }
+        }
+        0x1B => {
+            if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                    if bytes.len() >= 3 {
+                        candidate.version = format!("0x{:02X}", bytes[2]);
+                    }
+                    if bytes.len() >= 4 {
+                        candidate.mesh_dev_type = bytes[3];
+                        if candidate.dev_model.is_empty() {
+                            candidate.suggested_name = suggested_discovered_name(
+                                &candidate.device_id,
+                                Some(match bytes[3] {
+                                    0 => "A灯",
+                                    1 => "B/C灯",
+                                    2 => "节能灯",
+                                    _ => "发现设备",
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        0x10 => {}
+        0x1D => {
+            if candidate.default_dest_addr.is_none() {
+                if let Some(value) = payload.get("value").and_then(Value::as_str) {
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
+                        if bytes.len() >= 7 && matches!(bytes[0], 8 | 255) {
+                            candidate.last_summary = format!(
+                                "{} | MAC {}",
+                                candidate.last_summary,
+                                bytes[1..7]
+                                    .iter()
+                                    .map(|byte| format!("{byte:02X}"))
+                                    .collect::<Vec<_>>()
+                                    .join(":")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalized_topic_prefix(topic: &str) -> &str {
     topic.trim_end_matches('/')
 }
@@ -3613,6 +4225,47 @@ mod tests {
     }
 
     #[test]
+    fn bc_ota_ack_on_nested_gen_topic_without_timestamp_is_accepted() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.config.devices = vec![DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+
+        let device = app
+            .device_by_topic("/application/AP-C-BM/device/34B7DA848802/up/gen/0")
+            .cloned()
+            .expect("nested gen topic should resolve to device");
+        let payload = serde_json::json!({
+            "opcode": 0x41,
+            "value": 1
+        });
+
+        app.resolve_transfer_ack(&device, &payload);
+
+        let transfer = &app.active_transfers[0];
+        assert!(!transfer.paused);
+        assert_eq!(transfer.status, "已获同意，继续发送");
+        assert!(transfer.waiting_ack_opcode.is_none());
+        assert_eq!(
+            app.runtime_states
+                .get(&1)
+                .map(|state| state.last_result.as_str()),
+            Some("已获同意，继续发送")
+        );
+    }
+
+    #[test]
     fn device_by_topic_rejects_similar_but_unrelated_topic() {
         let mut app = MeshBcTesterApp::new_for_test();
         app.config.devices = vec![DeviceProfile {
@@ -3640,6 +4293,95 @@ mod tests {
                 "/application/AP-C-BM/device/34B7DA848802/up/#".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn extract_device_id_from_discovered_topic_supports_nested_up_topics() {
+        let topic = "/application/AP-C-BM/device/34B7DA848802/up/gen/0";
+        assert_eq!(
+            extract_device_id_from_discovered_topic(topic).as_deref(),
+            Some("34B7DA848802")
+        );
+    }
+
+    #[test]
+    fn observe_discovered_message_creates_candidate_from_heartbeat() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        let payload = serde_json::json!({
+            "opcode": 0x1B,
+            "value": "01030D01",
+            "src_addr": 0x1234
+        });
+
+        app.observe_discovered_message(
+            "/application/AP-C-BM/device/34B7DA848802/up/gen/0",
+            Some(&payload),
+            &payload.to_string(),
+        );
+
+        assert_eq!(app.discovered_devices.len(), 1);
+        let candidate = &app.discovered_devices[0];
+        assert_eq!(candidate.device_id, "34B7DA848802");
+        assert_eq!(
+            candidate.up_topic,
+            "/application/AP-C-BM/device/34B7DA848802/up"
+        );
+        assert_eq!(
+            candidate.down_topic,
+            "/application/AP-C-BM/device/34B7DA848802/down"
+        );
+        assert_eq!(candidate.discovery_reason, "心跳上报");
+        assert_eq!(candidate.mesh_dev_type, 1);
+        assert_eq!(candidate.default_dest_addr, Some(0x1234));
+        assert_eq!(candidate.version, "0x0D");
+    }
+
+    #[test]
+    fn import_discovered_device_creates_device_profile() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        let payload = serde_json::json!({
+            "opcode": 0x47,
+            "version": "13",
+            "dev_model": "Turbo AP-C-BM-1",
+            "dev_id": "34B7DA848802"
+        });
+
+        app.observe_discovered_message(
+            "/application/AP-C-BM/device/34B7DA848802/up",
+            Some(&payload),
+            &payload.to_string(),
+        );
+        app.import_discovered_device_by_id("34B7DA848802");
+
+        assert_eq!(app.config.devices.len(), 1);
+        let device = &app.config.devices[0];
+        assert_eq!(device.device_id, "34B7DA848802");
+        assert_eq!(
+            device.up_topic,
+            "/application/AP-C-BM/device/34B7DA848802/up"
+        );
+        assert_eq!(
+            device.down_topic,
+            "/application/AP-C-BM/device/34B7DA848802/down"
+        );
+        assert_eq!(device.name, "Turbo AP-C-BM-1");
+        assert!(app.discovered_devices.is_empty());
+    }
+
+    #[test]
+    fn pending_transfer_file_dialog_applies_selected_path() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.pending_file_dialog = Some(PendingFileDialog {
+            kind: PendingFileDialogKind::OtaTransferFile,
+            rx,
+        });
+        tx.send(Some(PathBuf::from("/tmp/firmware.bin"))).unwrap();
+
+        app.poll_pending_file_dialog();
+
+        assert_eq!(app.ota_transfer_file, "/tmp/firmware.bin");
+        assert!(app.pending_file_dialog.is_none());
     }
 
     #[test]

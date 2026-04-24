@@ -150,13 +150,6 @@ pub enum TransferKind {
 }
 
 impl TransferKind {
-    pub const ALL: [Self; 4] = [
-        Self::BcOta,
-        Self::AOta,
-        Self::VoiceFile,
-        Self::RealtimeVoice,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::BcOta => "BC灯 OTA",
