@@ -165,7 +165,6 @@ const TRANSFER_PACKET_DELAY_MS: u64 = 15;
 const TRANSFER_ACK_TIMEOUT_SECS: u64 = 10;
 const TRANSFER_MAX_RETRIES: u8 = 2;
 const MAX_TRANSFER_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TRANSFER_PACKETS: usize = 6000;
 const MAX_TRANSFER_TOTAL_PUBLISHES: usize = 12000;
 const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
 const MAX_OPERATION_HISTORY: usize = 300;
@@ -1215,14 +1214,6 @@ impl MeshBcTesterApp {
                 return;
             }
         };
-        if packets.len() > MAX_TRANSFER_PACKETS {
-            self.system_notice = format!(
-                "传输分包过多：{}，当前上限 {}。",
-                packets.len(),
-                MAX_TRANSFER_PACKETS
-            );
-            return;
-        }
         if self.should_confirm_transfer(devices.len(), packets.len()) {
             self.pending_confirmation = Some(PendingConfirmation {
                 title: "确认发起传输".into(),
