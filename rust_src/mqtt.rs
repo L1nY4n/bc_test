@@ -11,8 +11,15 @@ use crate::models::BrokerProfile;
 
 #[derive(Debug)]
 pub enum MqttEvent {
-    Connection { connected: bool, message: String },
-    Message { topic: String, payload: String },
+    Connection {
+        connected: bool,
+        reconnecting: bool,
+        message: String,
+    },
+    Message {
+        topic: String,
+        payload: String,
+    },
 }
 
 pub struct MqttRuntime {
@@ -24,6 +31,7 @@ pub struct MqttRuntime {
 }
 
 const MAX_INBOUND_PAYLOAD_BYTES: usize = 64 * 1024;
+const AUTO_RECONNECT_DELAY_SECS: u64 = 1;
 
 impl Default for MqttRuntime {
     fn default() -> Self {
@@ -63,12 +71,24 @@ impl MqttRuntime {
     }
 
     fn pump_connection(connection: &mut Connection, sender: Sender<MqttEvent>) {
+        let mut recovering_after_disconnect = false;
+        let mut announced_loss = false;
+        let mut had_connected_once = false;
         for notification in connection.iter() {
             match notification {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                    let message = if recovering_after_disconnect {
+                        "已重连"
+                    } else {
+                        "已连接"
+                    };
+                    recovering_after_disconnect = false;
+                    announced_loss = false;
+                    had_connected_once = true;
                     let _ = sender.send(MqttEvent::Connection {
                         connected: true,
-                        message: "已连接".into(),
+                        reconnecting: false,
+                        message: message.into(),
                     });
                 }
                 Ok(Event::Incoming(Incoming::Publish(publish))) => {
@@ -89,17 +109,30 @@ impl MqttRuntime {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    let _ = sender.send(MqttEvent::Connection {
-                        connected: false,
-                        message: format!("连接断开: {err}"),
-                    });
-                    break;
+                    if !announced_loss {
+                        let message = if had_connected_once {
+                            format!("连接断开，自动重连中: {err}")
+                        } else {
+                            format!("连接失败，自动重连中: {err}")
+                        };
+                        let _ = sender.send(MqttEvent::Connection {
+                            connected: false,
+                            reconnecting: true,
+                            message,
+                        });
+                        announced_loss = true;
+                    }
+                    if had_connected_once {
+                        recovering_after_disconnect = true;
+                    }
+                    thread::sleep(Duration::from_secs(AUTO_RECONNECT_DELAY_SECS));
                 }
             }
         }
     }
 
     pub fn disconnect(&mut self) {
+        let had_connection = self.client.is_some() || self.worker.is_some();
         if let Some(client) = &self.client {
             let _ = client.disconnect();
         }
@@ -107,10 +140,13 @@ impl MqttRuntime {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        let _ = self.events_tx.send(MqttEvent::Connection {
-            connected: false,
-            message: "已断开".into(),
-        });
+        if had_connection {
+            let _ = self.events_tx.send(MqttEvent::Connection {
+                connected: false,
+                reconnecting: false,
+                message: "已断开".into(),
+            });
+        }
     }
 
     pub fn sync_subscriptions(&mut self, topics: impl IntoIterator<Item = String>) {
@@ -127,6 +163,15 @@ impl MqttRuntime {
             }
         }
         self.subscriptions = desired;
+    }
+
+    pub fn reapply_subscriptions(&mut self) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        for topic in &self.subscriptions {
+            let _ = client.subscribe(topic, QoS::AtMostOnce);
+        }
     }
 
     pub fn publish_json(&mut self, topic: &str, payload: &str) -> Result<(), String> {

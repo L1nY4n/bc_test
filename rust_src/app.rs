@@ -53,6 +53,7 @@ pub struct MeshBcTesterApp {
     transfer_ack_timeout_secs: u64,
     transfer_max_retries: u8,
     system_notice: String,
+    needs_connection_recovery: bool,
     pending_confirmation: Option<PendingConfirmation>,
     pending_file_dialog: Option<PendingFileDialog>,
     pending_requests: Vec<PendingRequest>,
@@ -245,6 +246,7 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs,
             transfer_max_retries,
             system_notice: String::new(),
+            needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
             pending_requests: Vec::new(),
@@ -298,17 +300,12 @@ impl MeshBcTesterApp {
         self.collect_device_offline_timeouts();
         while let Ok(event) = self.mqtt.events_rx.try_recv() {
             match event {
-                MqttEvent::Connection { connected, message } => {
-                    self.broker_connected = connected;
-                    self.connection_status = message.clone();
-                    if !connected {
-                        for state in self.runtime_states.values_mut() {
-                            state.online = false;
-                            state.pending_count = 0;
-                        }
-                        self.pending_requests.clear();
-                        self.active_transfers.clear();
-                    }
+                MqttEvent::Connection {
+                    connected,
+                    reconnecting,
+                    message,
+                } => {
+                    self.handle_mqtt_connection_state(connected, reconnecting, &message);
                     self.append_log(LogEntry {
                         timestamp: now_display(),
                         direction: LogDirection::System,
@@ -399,6 +396,66 @@ impl MeshBcTesterApp {
                         payload: display_payload,
                     });
                 }
+            }
+        }
+    }
+
+    fn handle_mqtt_connection_state(&mut self, connected: bool, reconnecting: bool, message: &str) {
+        self.broker_connected = connected;
+        self.connection_status = message.to_string();
+        if connected {
+            if self.needs_connection_recovery {
+                self.mqtt.reapply_subscriptions();
+                self.resume_transfers_after_reconnect();
+                self.needs_connection_recovery = false;
+            }
+            return;
+        }
+
+        for state in self.runtime_states.values_mut() {
+            state.online = false;
+            state.pending_count = 0;
+        }
+        self.pending_requests.clear();
+        self.pause_transfers_for_connection_loss(reconnecting);
+        self.needs_connection_recovery = true;
+    }
+
+    fn pause_transfers_for_connection_loss(&mut self, reconnecting: bool) {
+        for transfer in &mut self.active_transfers {
+            if transfer.terminal {
+                continue;
+            }
+            let resume_index = transfer_resume_index_after_disconnect(transfer);
+            transfer.next_index = resume_index;
+            transfer.waiting_ack_opcode = None;
+            transfer.waiting_since = None;
+            transfer.paused = true;
+            transfer.next_send_at = Instant::now();
+            transfer.status = if reconnecting {
+                format!("连接断开，自动重连后从第{}包继续", resume_index + 1)
+            } else {
+                format!("连接已断开，待重连后从第{}包继续", resume_index + 1)
+            };
+            if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                Self::set_device_result(state, "断线", transfer.status.clone());
+            }
+        }
+    }
+
+    fn resume_transfers_after_reconnect(&mut self) {
+        let resume_at = Instant::now() + Duration::from_millis(self.transfer_packet_delay_ms);
+        for transfer in &mut self.active_transfers {
+            if transfer.terminal {
+                continue;
+            }
+            transfer.paused = false;
+            transfer.waiting_ack_opcode = None;
+            transfer.waiting_since = None;
+            transfer.next_send_at = resume_at;
+            transfer.status = format!("连接已恢复，从第{}包继续", transfer.next_index + 1);
+            if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                Self::set_device_result(state, "恢复", transfer.status.clone());
             }
         }
     }
@@ -1538,6 +1595,100 @@ impl MeshBcTesterApp {
         let Some(position) = position else {
             return;
         };
+        if matches!(self.active_transfers[position].kind, TransferKind::BcOta) && opcode == 0x41 {
+            let ack_value = payload.get("value").and_then(Value::as_u64).unwrap_or(0);
+            let last_packet_sent = transfer_sent_last_packet(&self.active_transfers[position]);
+            let retry_from = self.active_transfers[position]
+                .last_sent_index
+                .unwrap_or(self.active_transfers[position].next_index.saturating_sub(1));
+            let now = Instant::now();
+
+            match ack_value {
+                2 => {
+                    let reason = format!("BC OTA ACK失败，重发第{}包", retry_from + 1);
+                    self.retry_or_fail_transfer(position, retry_from, reason);
+                    let transfer = &self.active_transfers[position];
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(
+                            state,
+                            if transfer.next_index >= transfer.packets.len() {
+                                "失败"
+                            } else {
+                                "重试"
+                            },
+                            transfer.status.clone(),
+                        );
+                    }
+                    return;
+                }
+                1 | 3 if last_packet_sent => {
+                    let transfer = &mut self.active_transfers[position];
+                    transfer.paused = false;
+                    transfer.waiting_since = Some(now);
+                    transfer.status = "最后包已确认，等待升级结果".into();
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(state, "传输", "最后包已确认，等待升级结果".into());
+                    }
+                    return;
+                }
+                1 | 3 => {
+                    let transfer = &mut self.active_transfers[position];
+                    transfer.waiting_ack_opcode = None;
+                    transfer.waiting_since = None;
+                    transfer.paused = false;
+                    transfer.next_send_at =
+                        now + Duration::from_millis(self.transfer_packet_delay_ms);
+                    transfer.status = "BC OTA ACK成功，继续发送".into();
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(state, "传输", "BC OTA ACK成功，继续发送".into());
+                    }
+                    return;
+                }
+                5 if last_packet_sent => {
+                    let transfer = &mut self.active_transfers[position];
+                    transfer.waiting_ack_opcode = None;
+                    transfer.waiting_since = None;
+                    transfer.paused = false;
+                    transfer.next_send_at = now;
+                    transfer.status = "BC OTA升级成功".into();
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(state, "成功", "BC OTA升级成功".into());
+                    }
+                    return;
+                }
+                4 if last_packet_sent => {
+                    let transfer = &mut self.active_transfers[position];
+                    transfer.waiting_ack_opcode = None;
+                    transfer.waiting_since = None;
+                    transfer.paused = false;
+                    transfer.next_send_at = now;
+                    transfer.status = "BC OTA升级失败".into();
+                    transfer.failure_packet_index = transfer.last_sent_index;
+                    transfer.last_failure_reason = "BC OTA升级失败".into();
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(state, "失败", "BC OTA升级失败".into());
+                    }
+                    return;
+                }
+                _ => {
+                    let reason = format!("BC OTA ACK失败，异常值 {}", ack_value);
+                    self.retry_or_fail_transfer(position, retry_from, reason);
+                    let transfer = &self.active_transfers[position];
+                    if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+                        Self::set_device_result(
+                            state,
+                            if transfer.next_index >= transfer.packets.len() {
+                                "失败"
+                            } else {
+                                "重试"
+                            },
+                            transfer.status.clone(),
+                        );
+                    }
+                    return;
+                }
+            }
+        }
         let transfer = &mut self.active_transfers[position];
         if let Some((status, summary)) = classify_execution_result(payload) {
             if status == "错误" {
@@ -2071,6 +2222,7 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             system_notice: String::new(),
+            needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
             pending_requests: Vec::new(),
@@ -3328,7 +3480,7 @@ fn transfer_expected_ack_opcode(
     packet_count: usize,
 ) -> Option<u32> {
     match kind {
-        TransferKind::BcOta => (opcode == 0x40).then_some(0x41),
+        TransferKind::BcOta => matches!(opcode, 0x40 | 0x42).then_some(0x41),
         TransferKind::AOta => (opcode == 0x43).then_some(0x44),
         TransferKind::VoiceFile => {
             if opcode == 0x54 {
@@ -3348,6 +3500,29 @@ fn transfer_expected_ack_opcode(
                 Some(0x61)
             } else {
                 None
+            }
+        }
+    }
+}
+
+fn transfer_sent_last_packet(transfer: &ActiveTransfer) -> bool {
+    transfer
+        .last_sent_index
+        .map(|index| index + 1 == transfer.packets.len())
+        .unwrap_or(false)
+}
+
+fn transfer_resume_index_after_disconnect(transfer: &ActiveTransfer) -> usize {
+    let packet_count = transfer.packets.len();
+    let fallback = transfer.next_index.min(packet_count.saturating_sub(1));
+
+    match transfer.kind {
+        TransferKind::BcOta | TransferKind::AOta => transfer.last_sent_index.unwrap_or(fallback),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => {
+            if transfer.waiting_ack_opcode.is_some() {
+                transfer.last_sent_index.unwrap_or(fallback)
+            } else {
+                transfer.next_index.min(packet_count.saturating_sub(1))
             }
         }
     }
@@ -4059,6 +4234,45 @@ mod tests {
         }
     }
 
+    fn sample_final_packet_transfer() -> ActiveTransfer {
+        let mut transfer = sample_transfer();
+        transfer.next_index = transfer.packets.len();
+        transfer.waiting_ack_opcode = Some(0x41);
+        transfer.waiting_since = Some(Instant::now());
+        transfer.last_sent_index = Some(transfer.packets.len() - 1);
+        transfer.last_sent_time_stamp = Some(456);
+        transfer
+    }
+
+    fn sample_a_ota_mid_transfer() -> ActiveTransfer {
+        ActiveTransfer {
+            device_local_id: 1,
+            device_name: "设备A".into(),
+            device_id: "dev-a".into(),
+            down_topic: "topic/down".into(),
+            kind: TransferKind::AOta,
+            packets: vec![
+                serde_json::json!({"opcode": 0x43}),
+                serde_json::json!({"opcode": 0x45}),
+                serde_json::json!({"opcode": 0x45}),
+            ],
+            next_index: 2,
+            next_send_at: Instant::now(),
+            waiting_ack_opcode: None,
+            waiting_since: None,
+            last_sent_index: Some(1),
+            last_sent_time_stamp: Some(234),
+            retry_count: 0,
+            max_retries: 2,
+            status: "发送中 2/3".into(),
+            terminal: false,
+            succeeded: false,
+            paused: false,
+            failure_packet_index: None,
+            last_failure_reason: String::new(),
+        }
+    }
+
     #[test]
     fn transfer_retry_state_requeues_when_retries_remain() {
         let mut transfer = sample_transfer();
@@ -4153,6 +4367,62 @@ mod tests {
     }
 
     #[test]
+    fn connection_loss_pauses_active_ota_transfer_for_recovery() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_transfer()],
+            pending_requests: vec![pending(1, 0x41, None)],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+
+        app.handle_mqtt_connection_state(false, true, "连接断开，自动重连中");
+
+        let transfer = &app.active_transfers[0];
+        assert!(transfer.paused);
+        assert_eq!(transfer.next_index, 0);
+        assert!(transfer.waiting_ack_opcode.is_none());
+        assert!(app.pending_requests.is_empty());
+        assert!(app.needs_connection_recovery);
+        assert_eq!(
+            app.runtime_states
+                .get(&1)
+                .map(|state| state.last_result.as_str()),
+            Some("连接断开，自动重连后从第1包继续")
+        );
+    }
+
+    #[test]
+    fn connection_recovery_resumes_paused_ota_transfer() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+
+        app.handle_mqtt_connection_state(false, true, "连接断开，自动重连中");
+        app.handle_mqtt_connection_state(true, false, "已重连");
+
+        let transfer = &app.active_transfers[0];
+        assert!(!transfer.paused);
+        assert_eq!(transfer.next_index, 0);
+        assert_eq!(transfer.status, "连接已恢复，从第1包继续");
+        assert!(app.broker_connected);
+        assert!(!app.needs_connection_recovery);
+        assert_eq!(
+            app.runtime_states
+                .get(&1)
+                .map(|state| state.last_result.as_str()),
+            Some("连接已恢复，从第1包继续")
+        );
+    }
+
+    #[test]
+    fn a_ota_connection_loss_rewinds_to_last_sent_packet() {
+        let transfer = sample_a_ota_mid_transfer();
+        assert_eq!(transfer_resume_index_after_disconnect(&transfer), 1);
+    }
+
+    #[test]
     fn raw_send_confirmation_required_for_dangerous_opcode() {
         let app = MeshBcTesterApp::new_for_test();
         assert!(app.should_confirm_raw_send(0x4A, 1));
@@ -4169,6 +4439,12 @@ mod tests {
     fn voice_file_chunk_requires_ack_0x57() {
         let ack = transfer_expected_ack_opcode(TransferKind::VoiceFile, 0x56, 2, 5);
         assert_eq!(ack, Some(0x57));
+    }
+
+    #[test]
+    fn bc_ota_data_packet_requires_ack_0x41() {
+        let ack = transfer_expected_ack_opcode(TransferKind::BcOta, 0x42, 2, 3);
+        assert_eq!(ack, Some(0x41));
     }
 
     #[test]
@@ -4239,21 +4515,154 @@ mod tests {
             .expect("nested gen topic should resolve to device");
         let payload = serde_json::json!({
             "opcode": 0x41,
-            "value": 1
+            "value": 3
         });
 
         app.resolve_transfer_ack(&device, &payload);
 
         let transfer = &app.active_transfers[0];
         assert!(!transfer.paused);
-        assert_eq!(transfer.status, "已获同意，继续发送");
+        assert_eq!(transfer.status, "BC OTA ACK成功，继续发送");
         assert!(transfer.waiting_ack_opcode.is_none());
         assert_eq!(
             app.runtime_states
                 .get(&1)
                 .map(|state| state.last_result.as_str()),
-            Some("已获同意，继续发送")
+            Some("BC OTA ACK成功，继续发送")
         );
+    }
+
+    #[test]
+    fn bc_ota_ack_value_2_requeues_current_packet() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+        let device = DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        };
+
+        app.resolve_transfer_ack(
+            &device,
+            &serde_json::json!({
+                "opcode": 0x41,
+                "value": 2
+            }),
+        );
+
+        let transfer = &app.active_transfers[0];
+        assert_eq!(transfer.next_index, 0);
+        assert_eq!(transfer.retry_count, 1);
+        assert!(transfer.status.contains("准备重试"));
+        assert!(transfer.waiting_ack_opcode.is_none());
+        assert_eq!(transfer.failure_packet_index, Some(0));
+    }
+
+    #[test]
+    fn bc_ota_last_packet_ack_value_3_keeps_waiting_for_upgrade_result() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_final_packet_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+        let device = DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        };
+
+        app.resolve_transfer_ack(
+            &device,
+            &serde_json::json!({
+                "opcode": 0x41,
+                "value": 3
+            }),
+        );
+
+        let transfer = &app.active_transfers[0];
+        assert_eq!(transfer.status, "最后包已确认，等待升级结果");
+        assert_eq!(transfer.waiting_ack_opcode, Some(0x41));
+        assert!(transfer.waiting_since.is_some());
+    }
+
+    #[test]
+    fn bc_ota_final_ack_value_5_marks_transfer_success() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_final_packet_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+        let device = DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        };
+
+        app.resolve_transfer_ack(
+            &device,
+            &serde_json::json!({
+                "opcode": 0x41,
+                "value": 5
+            }),
+        );
+        app.tick_active_transfers();
+
+        let transfer = &app.active_transfers[0];
+        assert!(transfer.terminal);
+        assert!(transfer.succeeded);
+        assert_eq!(transfer.status, "BC OTA升级成功");
+    }
+
+    #[test]
+    fn bc_ota_final_ack_value_4_marks_transfer_failed() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![sample_final_packet_transfer()],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+        let device = DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        };
+
+        app.resolve_transfer_ack(
+            &device,
+            &serde_json::json!({
+                "opcode": 0x41,
+                "value": 4
+            }),
+        );
+        app.tick_active_transfers();
+
+        let transfer = &app.active_transfers[0];
+        assert!(transfer.terminal);
+        assert!(!transfer.succeeded);
+        assert_eq!(transfer.status, "BC OTA升级失败");
+        assert_eq!(transfer.failure_packet_index, Some(1));
     }
 
     #[test]

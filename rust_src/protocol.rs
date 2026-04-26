@@ -882,6 +882,12 @@ pub fn bytes_to_hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02X}")).collect()
 }
 
+fn padded_ota_chunk_bytes(chunk: &[u8]) -> Vec<u8> {
+    let mut padded = chunk.to_vec();
+    padded.resize(OTA_TRANSFER_CHUNK_SIZE, 0);
+    padded
+}
+
 pub fn hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = value
         .chars()
@@ -1502,12 +1508,13 @@ pub fn build_transfer_packet(
             let chunk_id = packet_index - 1;
             let chunk = &data[chunk_id * OTA_TRANSFER_CHUNK_SIZE
                 ..data.len().min((chunk_id + 1) * OTA_TRANSFER_CHUNK_SIZE)];
+            let padded_chunk = padded_ota_chunk_bytes(chunk);
             Ok(json!({
                 "opcode": 0x42,
                 "version": version,
                 "ota_data_index": chunk_id,
                 "ota_byte_size": chunk.len(),
-                "value": bytes_to_hex(chunk),
+                "value": bytes_to_hex(&padded_chunk),
             }))
         }
         TransferKind::AOta => {
@@ -1523,12 +1530,13 @@ pub fn build_transfer_packet(
             let chunk_id = packet_index - 1;
             let chunk = &data[chunk_id * OTA_TRANSFER_CHUNK_SIZE
                 ..data.len().min((chunk_id + 1) * OTA_TRANSFER_CHUNK_SIZE)];
+            let padded_chunk = padded_ota_chunk_bytes(chunk);
             Ok(json!({
                 "opcode": 0x45,
                 "version": version,
                 "ota_data_index": chunk_id,
                 "ota_byte_size": chunk.len(),
-                "value": bytes_to_hex(chunk),
+                "value": bytes_to_hex(&padded_chunk),
             }))
         }
         TransferKind::VoiceFile | TransferKind::RealtimeVoice => {
@@ -1743,6 +1751,24 @@ mod tests {
         assert_eq!(packets[0]["ota_pack_count"], 2);
         assert_eq!(packets[1]["ota_byte_size"], 200);
         assert_eq!(packets[2]["ota_byte_size"], 1);
+        let value = packets[2]["value"].as_str().unwrap();
+        assert_eq!(value.len(), OTA_TRANSFER_CHUNK_SIZE * 2);
+        assert!(value.starts_with("5A"));
+        assert!(value[2..].chars().all(|ch| ch == '0'));
+    }
+
+    #[test]
+    fn build_a_ota_packets_pad_last_chunk_but_keep_real_size() {
+        let data = vec![0x6B; 201];
+        let packets = build_transfer_packets(TransferKind::AOta, &data, 7, "").unwrap();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0]["ota_pack_count"], 2);
+        assert_eq!(packets[2]["opcode"], 0x45);
+        assert_eq!(packets[2]["ota_byte_size"], 1);
+        let value = packets[2]["value"].as_str().unwrap();
+        assert_eq!(value.len(), OTA_TRANSFER_CHUNK_SIZE * 2);
+        assert!(value.starts_with("6B"));
+        assert!(value[2..].chars().all(|ch| ch == '0'));
     }
 
     #[test]
