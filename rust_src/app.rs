@@ -51,6 +51,7 @@ pub struct MeshBcTesterApp {
     transfer_voice_name: String,
     transfer_packet_delay_ms: u64,
     transfer_ack_timeout_secs: u64,
+    bc_ota_start_ack_timeout_secs: u64,
     transfer_max_retries: u8,
     system_notice: String,
     needs_connection_recovery: bool,
@@ -164,9 +165,9 @@ enum PendingFileDialogKind {
 
 const TRANSFER_PACKET_DELAY_MS: u64 = 15;
 const TRANSFER_ACK_TIMEOUT_SECS: u64 = 10;
+const BC_OTA_START_ACK_TIMEOUT_SECS: u64 = 20;
 const TRANSFER_MAX_RETRIES: u8 = 2;
-const MAX_TRANSFER_BYTES: usize = 2 * 1024 * 1024;
-const MAX_TRANSFER_TOTAL_PUBLISHES: usize = 12000;
+const MAX_TRANSFER_BYTES: usize = 10 * 1024 * 1024;
 const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
 const MAX_OPERATION_HISTORY: usize = 300;
 const MAX_DISCOVERED_DEVICES: usize = 128;
@@ -188,6 +189,11 @@ impl MeshBcTesterApp {
             TRANSFER_ACK_TIMEOUT_SECS
         } else {
             config.transfer_ack_timeout_secs
+        };
+        let bc_ota_start_ack_timeout_secs = if config.bc_ota_start_ack_timeout_secs == 0 {
+            BC_OTA_START_ACK_TIMEOUT_SECS
+        } else {
+            config.bc_ota_start_ack_timeout_secs
         };
         let transfer_max_retries = if config.transfer_max_retries == 0 {
             TRANSFER_MAX_RETRIES
@@ -244,6 +250,7 @@ impl MeshBcTesterApp {
             transfer_voice_name: "voice.adpcm".into(),
             transfer_packet_delay_ms,
             transfer_ack_timeout_secs,
+            bc_ota_start_ack_timeout_secs,
             transfer_max_retries,
             system_notice: String::new(),
             needs_connection_recovery: false,
@@ -433,9 +440,15 @@ impl MeshBcTesterApp {
             transfer.paused = true;
             transfer.next_send_at = Instant::now();
             transfer.status = if reconnecting {
-                format!("连接断开，自动重连后从第{}包继续", resume_index + 1)
+                format!(
+                    "连接断开，自动重连后从第{}包继续",
+                    transfer_display_packet_number(transfer.kind, resume_index)
+                )
             } else {
-                format!("连接已断开，待重连后从第{}包继续", resume_index + 1)
+                format!(
+                    "连接已断开，待重连后从第{}包继续",
+                    transfer_display_packet_number(transfer.kind, resume_index)
+                )
             };
             if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
                 Self::set_device_result(state, "断线", transfer.status.clone());
@@ -453,7 +466,10 @@ impl MeshBcTesterApp {
             transfer.waiting_ack_opcode = None;
             transfer.waiting_since = None;
             transfer.next_send_at = resume_at;
-            transfer.status = format!("连接已恢复，从第{}包继续", transfer.next_index + 1);
+            transfer.status = format!(
+                "连接已恢复，从第{}包继续",
+                transfer_display_packet_number(transfer.kind, transfer.next_index)
+            );
             if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
                 Self::set_device_result(state, "恢复", transfer.status.clone());
             }
@@ -616,6 +632,7 @@ impl MeshBcTesterApp {
         self.config.broker = self.broker_editor.clone();
         self.config.transfer_packet_delay_ms = self.transfer_packet_delay_ms;
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
+        self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.connection_status = "连接中...".into();
         self.broker_connected = false;
@@ -1279,7 +1296,7 @@ impl MeshBcTesterApp {
                     kind.label(),
                     devices.len(),
                     bytes.len(),
-                    packets.len()
+                    transfer_display_total_packets(kind, packets.len())
                 ),
                 action: PendingAction::TransferQueue {
                     devices,
@@ -1289,14 +1306,6 @@ impl MeshBcTesterApp {
                     kind,
                 },
             });
-            return;
-        }
-        let total_publishes = packets.len().saturating_mul(devices.len());
-        if total_publishes > MAX_TRANSFER_TOTAL_PUBLISHES {
-            self.system_notice = format!(
-                "本次传输总发送量过大：{}，当前上限 {}。请减少设备数量或文件大小。",
-                total_publishes, MAX_TRANSFER_TOTAL_PUBLISHES
-            );
             return;
         }
         self.queue_transfer_action(devices, preview, packets, bytes.len(), kind);
@@ -1326,7 +1335,7 @@ impl MeshBcTesterApp {
                 "{} | 文件={} | 分包={}",
                 kind.label(),
                 byte_size,
-                packets.len()
+                transfer_display_total_packets(kind, packets.len())
             ),
             payload: serde_json::to_string_pretty(&redact_json(&preview))
                 .unwrap_or_else(|_| preview.to_string()),
@@ -1354,7 +1363,11 @@ impl MeshBcTesterApp {
                 Self::set_device_result(
                     state,
                     "传输",
-                    format!("{} 已排队，共{}包", kind.label(), packets.len()),
+                    format!(
+                        "{} 已排队，共{}包",
+                        kind.label(),
+                        transfer_display_total_packets(kind, packets.len())
+                    ),
                 );
             }
             self.active_transfers.push(ActiveTransfer {
@@ -1436,11 +1449,14 @@ impl MeshBcTesterApp {
                     self.active_transfers[index].last_sent_time_stamp =
                         packet.get("time_stamp").and_then(Value::as_u64);
                     self.active_transfers[index].next_index += 1;
-                    self.active_transfers[index].status = format!(
-                        "发送中 {}/{}",
-                        self.active_transfers[index].next_index,
-                        self.active_transfers[index].packets.len()
+                    let display_completed =
+                        transfer_display_completed_packets(&self.active_transfers[index]);
+                    let display_total = transfer_display_total_packets(
+                        self.active_transfers[index].kind,
+                        self.active_transfers[index].packets.len(),
                     );
+                    self.active_transfers[index].status =
+                        format!("发送中 {}/{}", display_completed, display_total);
                     if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
                         Self::set_device_result(
                             state,
@@ -1448,8 +1464,8 @@ impl MeshBcTesterApp {
                             format!(
                                 "{} 发送中 {}/{}",
                                 self.active_transfers[index].kind.label(),
-                                self.active_transfers[index].next_index,
-                                self.active_transfers[index].packets.len()
+                                display_completed,
+                                display_total
                             ),
                         );
                     }
@@ -1605,7 +1621,10 @@ impl MeshBcTesterApp {
 
             match ack_value {
                 2 => {
-                    let reason = format!("BC OTA ACK失败，重发第{}包", retry_from + 1);
+                    let reason = format!(
+                        "BC OTA ACK失败，重发第{}包",
+                        transfer_display_packet_number(TransferKind::BcOta, retry_from)
+                    );
                     self.retry_or_fail_transfer(position, retry_from, reason);
                     let transfer = &self.active_transfers[position];
                     if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
@@ -1788,14 +1807,26 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn transfer_ack_timeout_for(&self, transfer: &ActiveTransfer) -> Duration {
+        let timeout_secs = if transfer.kind == TransferKind::BcOta
+            && transfer.waiting_ack_opcode == Some(0x41)
+            && transfer.last_sent_index == Some(0)
+        {
+            self.bc_ota_start_ack_timeout_secs
+        } else {
+            self.transfer_ack_timeout_secs
+        };
+        Duration::from_secs(timeout_secs)
+    }
+
     fn collect_transfer_timeouts(&mut self) {
-        let timeout = Duration::from_secs(self.transfer_ack_timeout_secs);
         let now = Instant::now();
         let mut timed_out = Vec::new();
         for (index, transfer) in self.active_transfers.iter().enumerate() {
             if let (Some(expected_ack), Some(waiting_since)) =
                 (transfer.waiting_ack_opcode, transfer.waiting_since)
             {
+                let timeout = self.transfer_ack_timeout_for(transfer);
                 if now.duration_since(waiting_since) >= timeout {
                     timed_out.push((index, expected_ack));
                 }
@@ -2059,7 +2090,7 @@ impl MeshBcTesterApp {
                     "device_name": transfer.device_name,
                     "device_id": transfer.device_id,
                     "kind": transfer.kind.label(),
-                    "progress": format!("{}/{}", transfer.next_index, transfer.packets.len()),
+                    "progress": transfer_display_progress(transfer),
                     "waiting_ack_opcode": transfer.waiting_ack_opcode.map(|opcode| format!("0x{:02X}", opcode)),
                     "retry_count": transfer.retry_count,
                     "max_retries": transfer.max_retries,
@@ -2146,11 +2177,12 @@ impl MeshBcTesterApp {
                 "keepalive_secs": self.broker_editor.keepalive_secs,
                 "use_tls": self.broker_editor.use_tls,
             },
-            "transfer_settings": {
-                "packet_delay_ms": self.transfer_packet_delay_ms,
-                "ack_timeout_secs": self.transfer_ack_timeout_secs,
-                "max_retries": self.transfer_max_retries,
-            },
+                "transfer_settings": {
+                    "packet_delay_ms": self.transfer_packet_delay_ms,
+                    "ack_timeout_secs": self.transfer_ack_timeout_secs,
+                    "bc_ota_start_ack_timeout_secs": self.bc_ota_start_ack_timeout_secs,
+                    "max_retries": self.transfer_max_retries,
+                },
             "device_states": device_states,
             "pending_requests": pending,
             "active_transfers": transfers,
@@ -2220,6 +2252,7 @@ impl MeshBcTesterApp {
             transfer_voice_name: "voice.adpcm".into(),
             transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
             transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
+            bc_ota_start_ack_timeout_secs: BC_OTA_START_ACK_TIMEOUT_SECS,
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             system_notice: String::new(),
             needs_connection_recovery: false,
@@ -2251,7 +2284,7 @@ fn apply_transfer_retry_state(
         transfer.status = format!(
             "{}，从第{}包准备重试 {}/{}",
             reason,
-            retry_packet_index + 1,
+            transfer_display_packet_number(transfer.kind, retry_packet_index),
             transfer.retry_count,
             transfer.max_retries
         );
@@ -2832,6 +2865,13 @@ impl eframe::App for MeshBcTesterApp {
                             egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
                                 .range(1..=300),
                         );
+                        ui.label("BC起始ACK(s)");
+                        Self::compact_widget(
+                            ui,
+                            60.0,
+                            egui::DragValue::new(&mut self.bc_ota_start_ack_timeout_secs)
+                                .range(1..=300),
+                        );
                         ui.label("最大重试");
                         Self::compact_widget(
                             ui,
@@ -3108,11 +3148,7 @@ impl eframe::App for MeshBcTesterApp {
                                         ui.label(transfer.kind.label());
                                     });
                                     row.col(|ui| {
-                                        ui.label(format!(
-                                            "{}/{}",
-                                            transfer.next_index,
-                                            transfer.packets.len()
-                                        ));
+                                        ui.label(transfer_display_progress(transfer));
                                     });
                                     row.col(|ui| {
                                         ui.label(
@@ -3126,7 +3162,15 @@ impl eframe::App for MeshBcTesterApp {
                                         ui.label(
                                             transfer
                                                 .failure_packet_index
-                                                .map(|index| format!("#{}", index + 1))
+                                                .map(|index| {
+                                                    format!(
+                                                        "#{}",
+                                                        transfer_display_packet_number(
+                                                            transfer.kind,
+                                                            index
+                                                        )
+                                                    )
+                                                })
                                                 .unwrap_or_else(|| "-".into()),
                                         );
                                     });
@@ -3450,6 +3494,7 @@ impl eframe::App for MeshBcTesterApp {
         self.config.broker = self.broker_editor.clone();
         self.config.transfer_packet_delay_ms = self.transfer_packet_delay_ms;
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
+        self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.transfer_max_retries = self.transfer_max_retries;
         let _ = save_config(&self.config);
         self.mqtt.disconnect();
@@ -3526,6 +3571,38 @@ fn transfer_resume_index_after_disconnect(transfer: &ActiveTransfer) -> usize {
             }
         }
     }
+}
+
+fn transfer_display_total_packets(kind: TransferKind, packet_count: usize) -> usize {
+    match kind {
+        TransferKind::BcOta | TransferKind::AOta => packet_count.saturating_sub(1),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => packet_count,
+    }
+}
+
+fn transfer_display_completed_packets(transfer: &ActiveTransfer) -> usize {
+    let total = transfer_display_total_packets(transfer.kind, transfer.packets.len());
+    match transfer.kind {
+        TransferKind::BcOta | TransferKind::AOta => {
+            transfer.next_index.saturating_sub(1).min(total)
+        }
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => transfer.next_index.min(total),
+    }
+}
+
+fn transfer_display_packet_number(kind: TransferKind, packet_index: usize) -> usize {
+    match kind {
+        TransferKind::BcOta | TransferKind::AOta => packet_index.max(1),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => packet_index + 1,
+    }
+}
+
+fn transfer_display_progress(transfer: &ActiveTransfer) -> String {
+    format!(
+        "{}/{}",
+        transfer_display_completed_packets(transfer),
+        transfer_display_total_packets(transfer.kind, transfer.packets.len())
+    )
 }
 
 #[inline]
@@ -4271,6 +4348,68 @@ mod tests {
             failure_packet_index: None,
             last_failure_reason: String::new(),
         }
+    }
+
+    #[test]
+    fn bc_ota_display_progress_hides_start_packet() {
+        let transfer = sample_transfer();
+        assert_eq!(transfer_display_progress(&transfer), "0/1");
+        assert_eq!(
+            transfer_display_total_packets(TransferKind::BcOta, transfer.packets.len()),
+            1
+        );
+    }
+
+    #[test]
+    fn bc_ota_display_packet_number_hides_start_packet_slot() {
+        assert_eq!(transfer_display_packet_number(TransferKind::BcOta, 0), 1);
+        assert_eq!(transfer_display_packet_number(TransferKind::BcOta, 1), 1);
+        assert_eq!(transfer_display_packet_number(TransferKind::BcOta, 2), 2);
+    }
+
+    #[test]
+    fn bc_ota_start_ack_uses_extended_timeout() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![{
+                let mut transfer = sample_transfer();
+                transfer.waiting_since = Some(Instant::now() - Duration::from_secs(12));
+                transfer
+            }],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.transfer_ack_timeout_secs = 10;
+        app.bc_ota_start_ack_timeout_secs = 20;
+
+        app.collect_transfer_timeouts();
+
+        let transfer = &app.active_transfers[0];
+        assert_eq!(transfer.status, "等待ACK 0x41");
+        assert_eq!(transfer.retry_count, 0);
+        assert_eq!(transfer.waiting_ack_opcode, Some(0x41));
+    }
+
+    #[test]
+    fn bc_ota_data_ack_keeps_using_normal_timeout() {
+        let mut app = MeshBcTesterApp {
+            active_transfers: vec![{
+                let mut transfer = sample_transfer();
+                transfer.last_sent_index = Some(1);
+                transfer.next_index = 2;
+                transfer.waiting_since = Some(Instant::now() - Duration::from_secs(12));
+                transfer
+            }],
+            ..MeshBcTesterApp::new_for_test()
+        };
+        app.transfer_ack_timeout_secs = 10;
+        app.bc_ota_start_ack_timeout_secs = 20;
+
+        app.collect_transfer_timeouts();
+
+        let transfer = &app.active_transfers[0];
+        assert_eq!(transfer.retry_count, 1);
+        assert_eq!(transfer.next_index, 1);
+        assert!(transfer.status.contains("ACK超时 0x41"));
+        assert_eq!(transfer.failure_packet_index, Some(1));
     }
 
     #[test]

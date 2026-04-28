@@ -1,6 +1,6 @@
 [package]
 name = "mesh-bc-tester-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Rust desktop MQTT tester for the Bluetooth Mesh BC light northbound protocol"
 publish = false

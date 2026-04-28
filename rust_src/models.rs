@@ -167,6 +167,8 @@ pub struct AppConfig {
     pub next_device_id: u64,
     pub transfer_packet_delay_ms: u64,
     pub transfer_ack_timeout_secs: u64,
+    #[serde(default)]
+    pub bc_ota_start_ack_timeout_secs: u64,
     pub transfer_max_retries: u8,
 }
 
@@ -178,6 +180,7 @@ impl Default for AppConfig {
             next_device_id: 0,
             transfer_packet_delay_ms: 15,
             transfer_ack_timeout_secs: 10,
+            bc_ota_start_ack_timeout_secs: 20,
             transfer_max_retries: 2,
         }
     }
