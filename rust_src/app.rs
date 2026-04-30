@@ -31,12 +31,12 @@ pub struct MeshBcTesterApp {
     config: AppConfig,
     broker_editor: BrokerProfile,
     device_editor: DeviceEditor,
+    device_editor_open: bool,
     selected_devices: BTreeSet<u64>,
     auto_discovery_enabled: bool,
     auto_import_discovered: bool,
     discovered_devices: Vec<DiscoveredDevice>,
     discovery_section_had_candidates: bool,
-    device_editor_active_id: Option<u64>,
     selected_log_index: Option<usize>,
     command_key: String,
     command_form: BTreeMap<String, String>,
@@ -155,7 +155,19 @@ const MAX_DISCOVERED_DEVICES: usize = 128;
 const MAX_MQTT_EVENTS_PER_FRAME: usize = 250;
 #[cfg(test)]
 const TRANSFER_PACKET_LOG_INTERVAL: usize = 100;
-const TABLE_ROW_HEIGHT: f32 = 20.0;
+const COMPACT_CONTROL_HEIGHT: f32 = 22.0;
+const COMPACT_LABEL_HEIGHT: f32 = 20.0;
+const COMPACT_ICON_BUTTON_SIZE: egui::Vec2 = egui::vec2(28.0, 24.0);
+const TABLE_ROW_HEIGHT: f32 = COMPACT_CONTROL_HEIGHT;
+const TOP_TOOLBAR_HEIGHT: f32 = 34.0;
+const TOP_TOOLBAR_NOTICE_HEIGHT: f32 = 24.0;
+const TOP_STATUS_WIDTH: f32 = 160.0;
+const MENU_FIELD_LABEL_WIDTH: f32 = 62.0;
+const ACTION_FIELD_LABEL_WIDTH: f32 = 72.0;
+const ACTION_BUTTON_INDENT_WIDTH: f32 = 76.0;
+const DISCOVERED_ROW_ACTION_SLOT_WIDTH: f32 = 138.0;
+const DEVICE_ROW_CONTENT_CLICK_INSET: f32 = 46.0;
+const DISCOVERED_ROW_CONTENT_CLICK_INSET: f32 = 14.0;
 const REQUEST_STATUS_TABLE_HEIGHT: f32 = 90.0;
 const TRANSFER_STATUS_TABLE_HEIGHT: f32 = 120.0;
 const RECENT_OPERATIONS_TABLE_HEIGHT: f32 = 120.0;
@@ -165,6 +177,15 @@ const DISCOVERY_UP_TOPIC_FILTERS: [&str; 2] = [
 ];
 
 impl MeshBcTesterApp {
+    fn blank_device_editor() -> DeviceEditor {
+        DeviceEditor {
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+            ..Default::default()
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_chinese_fonts(&cc.egui_ctx);
         let mut config = load_config();
@@ -224,18 +245,13 @@ impl MeshBcTesterApp {
         Self {
             config,
             broker_editor,
-            device_editor: DeviceEditor {
-                mesh_dev_type: 1,
-                default_dest_addr: 1,
-                subscribe_enabled: true,
-                ..Default::default()
-            },
+            device_editor: Self::blank_device_editor(),
+            device_editor_open: false,
             selected_devices: BTreeSet::new(),
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
             discovery_section_had_candidates: false,
-            device_editor_active_id: None,
             selected_log_index: None,
             command_key,
             command_form,
@@ -912,6 +928,35 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn show_device_editor_modal(&mut self, ctx: &egui::Context) {
+        if !self.device_editor_open {
+            return;
+        }
+
+        let title = if self.device_editor.editing_id.is_some() {
+            "编辑设备"
+        } else {
+            "新增设备"
+        };
+        let subtitle = match self.device_editor.name.trim() {
+            "" => "未命名".to_string(),
+            name => name.to_string(),
+        };
+        let response = egui::Modal::new(egui::Id::new("device-editor-modal")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.vertical(|ui| {
+                ui.heading(title);
+                ui.small(RichText::new(subtitle).color(ui.visuals().weak_text_color()));
+                ui.add_space(8.0);
+                self.render_device_editor_form(ui);
+            });
+        });
+
+        if response.should_close() && self.device_editor_open {
+            self.close_device_editor();
+        }
+    }
+
     fn normalize_raw_payload_for_device(
         &self,
         payload: Value,
@@ -1200,6 +1245,7 @@ impl MeshBcTesterApp {
             default_dest_addr: candidate.default_dest_addr.unwrap_or(1),
             subscribe_enabled: true,
         };
+        self.device_editor_open = true;
     }
 
     fn save_device_editor(&mut self) {
@@ -1234,12 +1280,63 @@ impl MeshBcTesterApp {
             self.config.devices.push(device);
         }
 
-        self.device_editor = DeviceEditor {
-            mesh_dev_type: 1,
-            default_dest_addr: 1,
-            subscribe_enabled: true,
-            ..Default::default()
-        };
+        self.device_editor = Self::blank_device_editor();
+        self.device_editor_open = false;
+        self.sync_subscriptions();
+        let _ = save_config(&self.config);
+    }
+
+    fn open_new_device_editor(&mut self) {
+        self.device_editor = Self::blank_device_editor();
+        self.device_editor_open = true;
+    }
+
+    fn open_device_editor(&mut self, device: &DeviceProfile) {
+        self.device_editor = DeviceEditor::from_device(device);
+        self.device_editor_open = true;
+    }
+
+    fn close_device_editor(&mut self) {
+        self.device_editor = Self::blank_device_editor();
+        self.device_editor_open = false;
+    }
+
+    fn delete_selected_devices(&mut self) {
+        if self.selected_devices.is_empty() {
+            return;
+        }
+        let selected_devices = self.selected_devices.clone();
+        self.config
+            .devices
+            .retain(|device| !selected_devices.contains(&device.local_id));
+        for local_id in &selected_devices {
+            self.runtime_states.remove(local_id);
+        }
+        if self
+            .device_editor
+            .editing_id
+            .is_some_and(|editing_id| selected_devices.contains(&editing_id))
+        {
+            self.close_device_editor();
+        }
+        self.selected_devices.clear();
+        self.sync_subscriptions();
+        let _ = save_config(&self.config);
+    }
+
+    fn delete_device(&mut self, local_id: u64) {
+        let before_len = self.config.devices.len();
+        self.config
+            .devices
+            .retain(|device| device.local_id != local_id);
+        if self.config.devices.len() == before_len {
+            return;
+        }
+        self.selected_devices.remove(&local_id);
+        self.runtime_states.remove(&local_id);
+        if self.device_editor.editing_id == Some(local_id) {
+            self.close_device_editor();
+        }
         self.sync_subscriptions();
         let _ = save_config(&self.config);
     }
@@ -2316,18 +2413,13 @@ impl MeshBcTesterApp {
         Self {
             config: AppConfig::default(),
             broker_editor: BrokerProfile::default(),
-            device_editor: DeviceEditor {
-                mesh_dev_type: 1,
-                default_dest_addr: 1,
-                subscribe_enabled: true,
-                ..Default::default()
-            },
+            device_editor: Self::blank_device_editor(),
+            device_editor_open: false,
             selected_devices: BTreeSet::new(),
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
             discovery_section_had_candidates: false,
-            device_editor_active_id: None,
             selected_log_index: None,
             command_key: "query_bc_info".into(),
             command_form: BTreeMap::new(),
@@ -2444,14 +2536,18 @@ impl eframe::App for MeshBcTesterApp {
         let panel_style = ctx.global_style();
         let panel_style = panel_style.as_ref();
 
-        egui::Panel::top("top_bar")
-            .frame(Self::top_toolbar_frame(panel_style))
-            .show_inside(ui, |ui| {
-                self.render_top_toolbar(ui);
-                if !self.system_notice.is_empty() {
-                    Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
-                }
-            });
+        let top_panel = egui::Panel::top("top_bar").frame(Self::top_toolbar_frame(panel_style));
+        let top_panel = if self.system_notice.is_empty() {
+            top_panel.exact_size(TOP_TOOLBAR_HEIGHT)
+        } else {
+            top_panel.min_size(TOP_TOOLBAR_HEIGHT + TOP_TOOLBAR_NOTICE_HEIGHT)
+        };
+        top_panel.show_inside(ui, |ui| {
+            self.render_top_toolbar(ui);
+            if !self.system_notice.is_empty() {
+                Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
+            }
+        });
 
         egui::Panel::left("devices_panel")
             .resizable(true)
@@ -2476,6 +2572,7 @@ impl eframe::App for MeshBcTesterApp {
             self.render_central_workspace(ui);
         });
 
+        self.show_device_editor_modal(&ctx);
         self.show_pending_confirmation_modal(&ctx);
     }
 
@@ -2707,7 +2804,7 @@ impl VisualPalette {
             text_default: rgb(202, 216, 222),
             text_strong: rgb(255, 255, 255),
             selection_bg_fill: rgb(0, 61, 161),
-            selection_stroke: accent_text_color(),
+            selection_stroke: rgb(240, 242, 255),
             hyperlink_color: accent_text_color(),
             inactive_bg_fill: rgb(49, 56, 59),
             inactive_bg_stroke: rgb(38, 43, 46),
@@ -2731,8 +2828,8 @@ impl VisualPalette {
             text_subdued: rgb(91, 105, 113),
             text_default: rgb(38, 48, 54),
             text_strong: rgb(5, 10, 13),
-            selection_bg_fill: rgb(214, 228, 255),
-            selection_stroke: accent_color(),
+            selection_bg_fill: rgb(0, 90, 230),
+            selection_stroke: rgb(240, 242, 255),
             hyperlink_color: accent_color(),
             inactive_bg_fill: rgb(236, 240, 242),
             inactive_bg_stroke: rgb(205, 213, 219),
@@ -2796,83 +2893,93 @@ impl MeshBcTesterApp {
     }
 
     fn render_top_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_height(28.0);
         ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
-        ui.horizontal(|ui| {
-            Self::status_dot(ui, self.broker_connected);
-            ui.label(
-                RichText::new("Mesh BC")
-                    .strong()
-                    .color(ui.visuals().strong_text_color()),
-            );
-            ui.separator();
-            ui.small(RichText::new("地址").color(ui.visuals().weak_text_color()));
-            Self::compact_widget(
-                ui,
-                132.0,
-                TextEdit::singleline(&mut self.broker_editor.host).hint_text("192.168.1.10"),
-            );
-            ui.label(RichText::new(":").color(ui.visuals().weak_text_color()));
-            Self::compact_widget(
-                ui,
-                58.0,
-                egui::DragValue::new(&mut self.broker_editor.port)
-                    .range(1..=65535)
-                    .speed(1),
-            );
-            ui.checkbox(&mut self.broker_editor.use_tls, "TLS");
-            ui.menu_button("更多", |ui| {
-                ui.set_min_width(250.0);
-                Self::field_row(ui, "用户", |ui| {
-                    Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.username);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), TOP_TOOLBAR_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                Self::status_dot(ui, self.broker_connected);
+                ui.label(
+                    RichText::new("Mesh BC")
+                        .strong()
+                        .color(ui.visuals().strong_text_color()),
+                );
+                ui.separator();
+                ui.small(RichText::new("地址").color(ui.visuals().weak_text_color()));
+                Self::compact_widget(
+                    ui,
+                    132.0,
+                    TextEdit::singleline(&mut self.broker_editor.host).hint_text("192.168.1.10"),
+                );
+                ui.label(RichText::new(":").color(ui.visuals().weak_text_color()));
+                Self::compact_widget(
+                    ui,
+                    58.0,
+                    egui::DragValue::new(&mut self.broker_editor.port)
+                        .range(1..=65535)
+                        .speed(1),
+                );
+                ui.checkbox(&mut self.broker_editor.use_tls, "TLS");
+                ui.menu_button("更多", |ui| {
+                    ui.set_min_width(250.0);
+                    Self::field_row(ui, "用户", |ui| {
+                        Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.username);
+                    });
+                    Self::field_row(ui, "密码", |ui| {
+                        Self::compact_widget(
+                            ui,
+                            170.0,
+                            TextEdit::singleline(&mut self.broker_editor.password)
+                                .password(true)
+                                .hint_text("密码"),
+                        );
+                    });
+                    Self::field_row(ui, "客户端", |ui| {
+                        Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.client_id);
+                    });
+                    Self::field_row(ui, "Keepalive", |ui| {
+                        Self::compact_widget(
+                            ui,
+                            76.0,
+                            egui::DragValue::new(&mut self.broker_editor.keepalive_secs)
+                                .range(5..=3600)
+                                .speed(1),
+                        );
+                        ui.small(RichText::new("秒").color(ui.visuals().weak_text_color()));
+                    });
                 });
-                Self::field_row(ui, "密码", |ui| {
-                    Self::compact_widget(
-                        ui,
-                        170.0,
-                        TextEdit::singleline(&mut self.broker_editor.password)
-                            .password(true)
-                            .hint_text("密码"),
-                    );
-                });
-                Self::field_row(ui, "客户端", |ui| {
-                    Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.client_id);
-                });
-                Self::field_row(ui, "Keepalive", |ui| {
-                    Self::compact_widget(
-                        ui,
-                        76.0,
-                        egui::DragValue::new(&mut self.broker_editor.keepalive_secs)
-                            .range(5..=3600)
-                            .speed(1),
-                    );
-                    ui.small(RichText::new("秒").color(ui.visuals().weak_text_color()));
-                });
-            });
-            ui.separator();
-            if Self::primary_button(ui, "连接").clicked() {
-                self.connect();
-            }
-            if Self::secondary_button(ui, "断开").clicked() {
-                self.mqtt.disconnect();
-                self.transfer_engine
-                    .send(TransferEngineCommand::SetPublisher(None));
-            }
-            if Self::secondary_button(ui, "导出").clicked() {
-                self.export_evidence();
-            }
-            ui.label(RichText::new(&self.connection_status).color(ui.visuals().weak_text_color()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hover = Self::theme_toggle_button_hover(self.config.ui_theme_mode);
-                if Self::theme_icon_button(ui, self.config.ui_theme_mode)
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    self.config.ui_theme_mode = self.config.ui_theme_mode.toggle();
-                    let _ = save_config(&self.config);
+                ui.separator();
+                if Self::primary_button(ui, "连接").clicked() {
+                    self.connect();
                 }
-            });
-        });
+                if Self::secondary_button(ui, "断开").clicked() {
+                    self.mqtt.disconnect();
+                    self.transfer_engine
+                        .send(TransferEngineCommand::SetPublisher(None));
+                }
+                if Self::secondary_button(ui, "导出").clicked() {
+                    self.export_evidence();
+                }
+                ui.add_sized(
+                    [TOP_STATUS_WIDTH, COMPACT_LABEL_HEIGHT],
+                    egui::Label::new(
+                        RichText::new(&self.connection_status)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let hover = Self::theme_toggle_button_hover(self.config.ui_theme_mode);
+                    if Self::theme_icon_button(ui, self.config.ui_theme_mode)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.config.ui_theme_mode = self.config.ui_theme_mode.toggle();
+                        let _ = save_config(&self.config);
+                    }
+                });
+            },
+        );
     }
 
     fn render_right_actions_panel(&mut self, ui: &mut egui::Ui) {
@@ -3223,7 +3330,6 @@ impl MeshBcTesterApp {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         self.render_device_tree_section(ui);
         self.render_discovery_tree_section(ui);
-        self.render_device_editor_section(ui);
     }
 
     fn render_device_tree_section(&mut self, ui: &mut egui::Ui) {
@@ -3233,7 +3339,39 @@ impl MeshBcTesterApp {
             self.online_device_count(),
             self.selected_devices.len()
         );
-        Self::tree_section(ui, "devices_tree", "设备", &summary, true, |ui| {
+        let mut add_requested = false;
+        let header = RichText::new(format!("设备  {summary}"))
+            .size(12.0)
+            .strong()
+            .color(ui.visuals().strong_text_color());
+        let section = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id("devices_tree"),
+            true,
+        )
+        .show_header(ui, |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), COMPACT_CONTROL_HEIGHT),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(header);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::add_icon_button(ui)
+                            .on_hover_text("新增设备")
+                            .clicked()
+                        {
+                            add_requested = true;
+                        }
+                    });
+                },
+            );
+        });
+        section.body(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            if !self.selected_devices.is_empty() && Self::secondary_button(ui, "删除已选").clicked()
+            {
+                self.delete_selected_devices();
+            }
             if self.config.devices.is_empty() {
                 ui.label(RichText::new("还没有配置设备。").color(ui.visuals().weak_text_color()));
                 return;
@@ -3255,6 +3393,9 @@ impl MeshBcTesterApp {
                     }
                 });
         });
+        if add_requested {
+            self.open_new_device_editor();
+        }
     }
 
     fn render_device_tree_row(
@@ -3266,47 +3407,59 @@ impl MeshBcTesterApp {
         let selected = self.selected_devices.contains(&device.local_id);
         let mut checked = selected;
         let mut edit_requested = false;
-        let response = Self::tree_row(ui, selected, 34.0, |ui, hovered| {
-            if ui.checkbox(&mut checked, "").changed() {
-                // Apply after drawing so row response stays presentation-only.
-            }
-            Self::status_dot(ui, state.online);
-            ui.vertical(|ui| {
-                ui.set_width((ui.available_width() - 46.0).max(80.0));
-                ui.label(
-                    RichText::new(&device.name)
-                        .strong()
-                        .color(Self::device_row_name_color(ui, selected)),
-                );
-                let rtt = if state.last_rtt_ms.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}ms", state.last_rtt_ms)
-                };
-                let last = if state.last_result.is_empty() {
-                    state.last_opcode.as_str()
-                } else {
-                    state.last_result.as_str()
-                };
-                ui.small(
-                    RichText::new(format!(
-                        "{} · RX {} TX {} 待{}{} · {}",
-                        Self::device_id_suffix(&device.device_id),
-                        state.rx_count,
-                        state.tx_count,
-                        state.pending_count,
-                        rtt,
-                        Self::truncate_for_row(last, 18),
-                    ))
-                    .color(ui.visuals().weak_text_color()),
-                );
-            });
-            if hovered || selected {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if Self::secondary_button(ui, "编辑").clicked() {
-                        edit_requested = true;
-                    }
+        let mut delete_requested = false;
+        let response = Self::tree_row(
+            ui,
+            ("device", device.local_id),
+            selected,
+            34.0,
+            0.0,
+            DEVICE_ROW_CONTENT_CLICK_INSET,
+            |ui, _row_hovered| {
+                if ui.checkbox(&mut checked, "").changed() {
+                    // Apply after drawing so row response stays presentation-only.
+                }
+                Self::status_dot(ui, state.online);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width().max(80.0));
+                    ui.label(
+                        RichText::new(&device.name)
+                            .strong()
+                            .color(Self::device_row_name_color(ui, selected)),
+                    );
+                    let rtt = if state.last_rtt_ms.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}ms", state.last_rtt_ms)
+                    };
+                    let last = if state.last_result.is_empty() {
+                        state.last_opcode.as_str()
+                    } else {
+                        state.last_result.as_str()
+                    };
+                    ui.small(
+                        RichText::new(format!(
+                            "{} · RX {} TX {} 待{}{} · {}",
+                            Self::device_id_suffix(&device.device_id),
+                            state.rx_count,
+                            state.tx_count,
+                            state.pending_count,
+                            rtt,
+                            Self::truncate_for_row(last, 18),
+                        ))
+                        .color(Self::device_row_meta_color(ui, selected)),
+                    );
                 });
+            },
+        );
+        response.context_menu(|ui| {
+            if ui.button("编辑").clicked() {
+                edit_requested = true;
+                ui.close();
+            }
+            if ui.button("删除").clicked() {
+                delete_requested = true;
+                ui.close();
             }
         });
 
@@ -3317,8 +3470,10 @@ impl MeshBcTesterApp {
                 self.selected_devices.remove(&device.local_id);
             }
         }
-        if edit_requested || response.double_clicked() {
-            self.device_editor = DeviceEditor::from_device(device);
+        if delete_requested {
+            self.delete_device(device.local_id);
+        } else if edit_requested || response.double_clicked() {
+            self.open_device_editor(device);
         }
     }
 
@@ -3415,137 +3570,115 @@ impl MeshBcTesterApp {
         let mut import_requested = false;
         let mut edit_requested = false;
         let mut remove_requested = false;
-        Self::tree_row(ui, false, 38.0, |ui, hovered| {
-            Self::status_dot(ui, true);
-            ui.vertical(|ui| {
-                ui.set_width((ui.available_width() - 122.0).max(80.0));
-                ui.label(
-                    RichText::new(&candidate.suggested_name)
-                        .strong()
-                        .color(ui.visuals().strong_text_color()),
-                );
-                let model = if candidate.dev_model.is_empty() {
-                    candidate.discovery_reason.as_str()
-                } else {
-                    candidate.dev_model.as_str()
-                };
-                ui.small(
-                    RichText::new(format!(
-                        "{} · {} · {} 次 · {}",
-                        Self::device_id_suffix(&candidate.device_id),
-                        model,
-                        candidate.seen_count,
-                        candidate.last_opcode
-                    ))
-                    .color(ui.visuals().weak_text_color()),
-                );
-            });
-            if hovered {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if Self::secondary_button(ui, "移除").clicked() {
-                        remove_requested = true;
-                    }
-                    if Self::secondary_button(ui, "填入").clicked() {
-                        edit_requested = true;
-                    }
-                    if Self::primary_button(ui, "导入").clicked() {
-                        import_requested = true;
-                    }
+        Self::tree_row(
+            ui,
+            ("discovered", candidate.device_id.as_str()),
+            false,
+            38.0,
+            DISCOVERED_ROW_ACTION_SLOT_WIDTH,
+            DISCOVERED_ROW_CONTENT_CLICK_INSET,
+            |ui, row_hovered| {
+                Self::status_dot(ui, true);
+                ui.vertical(|ui| {
+                    ui.set_width(
+                        (ui.available_width() - DISCOVERED_ROW_ACTION_SLOT_WIDTH).max(80.0),
+                    );
+                    ui.label(
+                        RichText::new(&candidate.suggested_name)
+                            .strong()
+                            .color(ui.visuals().strong_text_color()),
+                    );
+                    let model = if candidate.dev_model.is_empty() {
+                        candidate.discovery_reason.as_str()
+                    } else {
+                        candidate.dev_model.as_str()
+                    };
+                    ui.small(
+                        RichText::new(format!(
+                            "{} · {} · {} 次 · {}",
+                            Self::device_id_suffix(&candidate.device_id),
+                            model,
+                            candidate.seen_count,
+                            candidate.last_opcode
+                        ))
+                        .color(ui.visuals().weak_text_color()),
+                    );
                 });
-            }
-        });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(DISCOVERED_ROW_ACTION_SLOT_WIDTH, COMPACT_CONTROL_HEIGHT),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if row_hovered {
+                            if Self::secondary_button(ui, "移除").clicked() {
+                                remove_requested = true;
+                            }
+                            if Self::secondary_button(ui, "填入").clicked() {
+                                edit_requested = true;
+                            }
+                            if Self::primary_button(ui, "导入").clicked() {
+                                import_requested = true;
+                            }
+                        }
+                    },
+                );
+            },
+        );
         (import_requested, edit_requested, remove_requested)
     }
 
-    fn render_device_editor_section(&mut self, ui: &mut egui::Ui) {
-        let title = if self.device_editor.editing_id.is_some() {
-            "编辑设备"
-        } else {
-            "新增设备"
-        };
-        let summary = if self.device_editor.name.trim().is_empty() {
-            "未命名".to_string()
-        } else {
-            self.device_editor.name.clone()
-        };
-        let editing_id = self.device_editor.editing_id;
-        let is_editing = editing_id.is_some();
-        let open = match (editing_id, self.device_editor_active_id) {
-            (Some(id), previous) if previous != Some(id) => Some(true),
-            (None, Some(_)) => Some(false),
-            _ => None,
-        };
-        self.device_editor_active_id = editing_id;
-        Self::tree_section_with_open(
+    fn render_device_editor_form(&mut self, ui: &mut egui::Ui) {
+        Self::field_row(ui, "名称", |ui| {
+            Self::compact_text_edit(ui, 300.0, &mut self.device_editor.name);
+        });
+        Self::field_row(ui, "设备ID", |ui| {
+            let response = Self::compact_text_edit(ui, 300.0, &mut self.device_editor.device_id);
+            if response.changed() && !self.device_editor.device_id.trim().is_empty() {
+                let (up, down) = DeviceProfile::default_topics(self.device_editor.device_id.trim());
+                if self.device_editor.up_topic.is_empty() {
+                    self.device_editor.up_topic = up;
+                }
+                if self.device_editor.down_topic.is_empty() {
+                    self.device_editor.down_topic = down;
+                }
+            }
+        });
+        Self::field_row(ui, "上行", |ui| {
+            Self::compact_text_edit(ui, 300.0, &mut self.device_editor.up_topic);
+        });
+        Self::field_row(ui, "下行", |ui| {
+            Self::compact_text_edit(ui, 300.0, &mut self.device_editor.down_topic);
+        });
+        Self::field_row(ui, "Mesh", |ui| {
+            Self::compact_widget(
+                ui,
+                58.0,
+                egui::DragValue::new(&mut self.device_editor.mesh_dev_type).range(0..=255),
+            );
+            ui.label("目标");
+            Self::compact_widget(
+                ui,
+                70.0,
+                egui::DragValue::new(&mut self.device_editor.default_dest_addr).range(1..=65535),
+            );
+        });
+        Self::checkbox_chip(
             ui,
-            "device_editor_tree",
-            title,
-            &summary,
-            is_editing,
-            open,
-            |ui| {
-                Self::field_row(ui, "名称", |ui| {
-                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.name);
-                });
-                Self::field_row(ui, "设备ID", |ui| {
-                    let response =
-                        Self::compact_text_edit(ui, 196.0, &mut self.device_editor.device_id);
-                    if response.changed() && !self.device_editor.device_id.trim().is_empty() {
-                        let (up, down) =
-                            DeviceProfile::default_topics(self.device_editor.device_id.trim());
-                        if self.device_editor.up_topic.is_empty() {
-                            self.device_editor.up_topic = up;
-                        }
-                        if self.device_editor.down_topic.is_empty() {
-                            self.device_editor.down_topic = down;
-                        }
-                    }
-                });
-                Self::field_row(ui, "上行", |ui| {
-                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.up_topic);
-                });
-                Self::field_row(ui, "下行", |ui| {
-                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.down_topic);
-                });
-                Self::field_row(ui, "Mesh", |ui| {
-                    Self::compact_widget(
-                        ui,
-                        58.0,
-                        egui::DragValue::new(&mut self.device_editor.mesh_dev_type).range(0..=255),
-                    );
-                    ui.label("目标");
-                    Self::compact_widget(
-                        ui,
-                        70.0,
-                        egui::DragValue::new(&mut self.device_editor.default_dest_addr)
-                            .range(1..=65535),
-                    );
-                });
-                ui.checkbox(&mut self.device_editor.subscribe_enabled, "订阅上行主题");
-                ui.horizontal(|ui| {
-                    if Self::primary_button(ui, "保存").clicked() {
-                        self.save_device_editor();
-                    }
-                    if Self::secondary_button(ui, "清空").clicked() {
-                        self.device_editor = DeviceEditor {
-                            mesh_dev_type: 1,
-                            default_dest_addr: 1,
-                            subscribe_enabled: true,
-                            ..Default::default()
-                        };
-                    }
-                    ui.separator();
-                    if Self::secondary_button(ui, "删除已选").clicked() {
-                        self.config
-                            .devices
-                            .retain(|device| !self.selected_devices.contains(&device.local_id));
-                        self.selected_devices.clear();
-                        self.sync_subscriptions();
-                        let _ = save_config(&self.config);
-                    }
-                });
-            },
+            &mut self.device_editor.subscribe_enabled,
+            "订阅上行主题",
         );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if Self::primary_button(ui, "保存").clicked() {
+                self.save_device_editor();
+            }
+            if Self::secondary_button(ui, "取消").clicked() {
+                self.close_device_editor();
+            }
+            ui.separator();
+            if Self::secondary_button(ui, "清空").clicked() {
+                self.open_new_device_editor();
+            }
+        });
     }
 
     fn tree_section(
@@ -3584,16 +3717,39 @@ impl MeshBcTesterApp {
 
     fn tree_row(
         ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash,
         selected: bool,
         height: f32,
+        action_slot_width: f32,
+        content_click_inset: f32,
         add_content: impl FnOnce(&mut egui::Ui, bool),
     ) -> egui::Response {
         let desired = egui::vec2(ui.available_width(), height);
-        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
-        let hovered = response.hovered();
+        let (rect, row_response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let inner_rect = rect.shrink2(egui::vec2(6.0, 0.0));
+        let action_slot_width = action_slot_width.clamp(0.0, inner_rect.width());
+        let non_action_rect = egui::Rect::from_min_max(
+            inner_rect.min,
+            egui::pos2(inner_rect.max.x - action_slot_width, inner_rect.max.y),
+        );
+        let content_click_inset = content_click_inset.clamp(0.0, non_action_rect.width());
+        let content_click_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                non_action_rect.min.x + content_click_inset,
+                non_action_rect.min.y,
+            ),
+            non_action_rect.max,
+        );
+        let content_response = ui.interact(
+            content_click_rect,
+            ui.id().with(("tree-row-content", id_salt)),
+            egui::Sense::click(),
+        );
+        let content_hovered = ui.rect_contains_pointer(non_action_rect);
+        let row_hovered = row_response.hovered() || ui.rect_contains_pointer(rect);
         let fill = if selected {
-            Self::selected_tree_row_fill(ui, hovered)
-        } else if hovered {
+            Self::selected_tree_row_fill(ui, content_hovered)
+        } else if content_hovered {
             ui.visuals().widgets.hovered.weak_bg_fill
         } else {
             egui::Color32::TRANSPARENT
@@ -3614,7 +3770,7 @@ impl MeshBcTesterApp {
                 Self::selected_tree_row_stroke(ui),
                 egui::StrokeKind::Inside,
             );
-        } else if hovered {
+        } else if content_hovered {
             ui.painter().rect_stroke(
                 row_rect,
                 3.0,
@@ -3622,17 +3778,16 @@ impl MeshBcTesterApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let inner_rect = rect.shrink2(egui::vec2(6.0, 0.0));
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(inner_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
-                add_content(ui, hovered);
+                add_content(ui, row_hovered);
             },
         );
-        response
+        content_response
     }
 
     fn selected_tree_row_fill(ui: &egui::Ui, hovered: bool) -> egui::Color32 {
@@ -3663,25 +3818,44 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn device_row_meta_color(ui: &egui::Ui, selected: bool) -> egui::Color32 {
+        if !selected {
+            return ui.visuals().weak_text_color();
+        }
+        if ui.visuals().dark_mode {
+            rgb(164, 188, 204)
+        } else {
+            rgb(57, 91, 145)
+        }
+    }
+
     fn field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
-        ui.horizontal(|ui| {
-            ui.set_height(22.0);
-            ui.add_sized(
-                [62.0, 20.0],
-                egui::Label::new(RichText::new(label).color(ui.visuals().weak_text_color())),
-            );
-            add_field(ui);
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), COMPACT_CONTROL_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_sized(
+                    [MENU_FIELD_LABEL_WIDTH, COMPACT_LABEL_HEIGHT],
+                    egui::Label::new(RichText::new(label).color(ui.visuals().weak_text_color())),
+                );
+                add_field(ui);
+            },
+        );
     }
 
     fn action_field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
-        ui.horizontal_wrapped(|ui| {
-            ui.set_min_height(22.0);
+        ui.horizontal_top(|ui| {
             ui.add_sized(
-                [72.0, 20.0],
+                [ACTION_FIELD_LABEL_WIDTH, COMPACT_LABEL_HEIGHT],
                 egui::Label::new(RichText::new(label).color(ui.visuals().weak_text_color())),
             );
-            add_field(ui);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(COMPACT_CONTROL_HEIGHT);
+                    add_field(ui);
+                });
+            });
         });
     }
 
@@ -3694,10 +3868,14 @@ impl MeshBcTesterApp {
     }
 
     fn action_button_row(ui: &mut egui::Ui, add_button: impl FnOnce(&mut egui::Ui)) {
-        ui.horizontal(|ui| {
-            ui.add_space(76.0);
-            add_button(ui);
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), COMPACT_CONTROL_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(ACTION_BUTTON_INDENT_WIDTH);
+                add_button(ui);
+            },
+        );
     }
 
     fn section_gap(ui: &mut egui::Ui) {
@@ -3718,7 +3896,10 @@ impl MeshBcTesterApp {
         } else {
             ui.visuals().weak_text_color()
         };
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 18.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(9.0, COMPACT_CONTROL_HEIGHT),
+            egui::Sense::hover(),
+        );
         ui.painter().circle_filled(rect.center(), 3.5, color);
     }
 
@@ -3770,7 +3951,7 @@ impl MeshBcTesterApp {
             Self::stat_chip(ui, "待应答", self.pending_requests.len().to_string());
             Self::stat_chip(ui, "传输", self.transfer_snapshots.len().to_string());
             Self::stat_chip(ui, "日志", self.logs.len().to_string());
-            ui.checkbox(&mut self.show_selected_logs_only, "仅已选设备日志");
+            Self::checkbox_chip(ui, &mut self.show_selected_logs_only, "仅已选设备日志");
         });
         ui.add_space(2.0);
     }
@@ -4190,7 +4371,7 @@ impl MeshBcTesterApp {
                     self.selected_log_index = None;
                     cleared_logs = true;
                 }
-                ui.checkbox(&mut self.follow_latest_logs, "跟随最新");
+                Self::checkbox_chip(ui, &mut self.follow_latest_logs, "跟随最新");
                 ui.small(format!(
                     "{}/{}",
                     filtered_log_indices.len(),
@@ -4361,7 +4542,7 @@ impl MeshBcTesterApp {
         ctx.global_style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(5.0, 3.0);
             style.spacing.button_padding = egui::vec2(5.0, 0.0);
-            style.spacing.interact_size = egui::vec2(32.0, 22.0);
+            style.spacing.interact_size = egui::vec2(32.0, COMPACT_CONTROL_HEIGHT);
             style.spacing.slider_width = 150.0;
             style.spacing.combo_width = 140.0;
             style.spacing.indent = 10.0;
@@ -4427,7 +4608,7 @@ impl MeshBcTesterApp {
 
     fn top_toolbar_frame(style: &egui::Style) -> egui::Frame {
         egui::Frame::side_top_panel(style)
-            .inner_margin(egui::Margin::symmetric(8, 2))
+            .inner_margin(egui::Margin::symmetric(8, 0))
             .fill(style.visuals.panel_fill)
             .stroke(chrome_stroke(style.visuals.dark_mode))
     }
@@ -4444,6 +4625,7 @@ impl MeshBcTesterApp {
     fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         ui.add(
             egui::Button::new(RichText::new(text).color(rgb(255, 255, 255)))
+                .min_size(egui::vec2(0.0, COMPACT_CONTROL_HEIGHT))
                 .fill(rgb(0, 54, 146))
                 .stroke(stroke(rgb(0, 75, 194))),
         )
@@ -4457,13 +4639,71 @@ impl MeshBcTesterApp {
         };
         ui.add(
             egui::Button::new(text)
+                .min_size(egui::vec2(0.0, COMPACT_CONTROL_HEIGHT))
                 .fill(fill)
                 .stroke(stroke(stroke_color)),
         )
     }
 
+    fn add_icon_button(ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(COMPACT_ICON_BUTTON_SIZE, egui::Sense::click());
+        let pressed = response.hovered() && ui.input(|input| input.pointer.primary_down());
+        let (base_fill, hover_fill, active_fill, stroke_color, icon_color) =
+            if ui.visuals().dark_mode {
+                (
+                    rgb(20, 24, 25),
+                    rgb(43, 49, 52),
+                    rgb(55, 63, 66),
+                    rgb(62, 70, 74),
+                    rgb(147, 196, 255),
+                )
+            } else {
+                (
+                    rgb(244, 246, 247),
+                    rgb(226, 232, 236),
+                    rgb(214, 228, 255),
+                    rgb(190, 200, 207),
+                    rgb(0, 75, 194),
+                )
+            };
+        let fill = if pressed {
+            active_fill
+        } else if response.hovered() {
+            hover_fill
+        } else {
+            base_fill
+        };
+        let button_rect = rect.shrink2(egui::vec2(1.0, 1.0));
+        ui.painter().rect(
+            button_rect,
+            4.0,
+            fill,
+            stroke(stroke_color),
+            egui::StrokeKind::Inside,
+        );
+        let center = button_rect.center();
+        let half = 4.8;
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-half, 0.0),
+                center + egui::vec2(half, 0.0),
+            ],
+            egui::Stroke::new(1.4_f32, icon_color),
+        );
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(0.0, -half),
+                center + egui::vec2(0.0, half),
+            ],
+            egui::Stroke::new(1.4_f32, icon_color),
+        );
+        response
+    }
+
     fn theme_icon_button(ui: &mut egui::Ui, theme: UiThemeMode) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+        let (rect, response) =
+            ui.allocate_exact_size(COMPACT_ICON_BUTTON_SIZE, egui::Sense::click());
         let pressed = response.hovered() && ui.input(|input| input.pointer.primary_down());
         let (hover_fill, active_fill, stroke_color, icon_color) = if ui.visuals().dark_mode {
             (
@@ -4549,6 +4789,7 @@ impl MeshBcTesterApp {
             .fill(ui.visuals().extreme_bg_color)
             .stroke(surface_stroke(ui.visuals().dark_mode))
             .show(ui, |ui| {
+                ui.set_min_height(COMPACT_CONTROL_HEIGHT);
                 ui.horizontal(|ui| {
                     ui.small(RichText::new(label).color(ui.visuals().weak_text_color()));
                     ui.separator();
@@ -4559,6 +4800,18 @@ impl MeshBcTesterApp {
                     );
                 });
             });
+    }
+
+    fn checkbox_chip(ui: &mut egui::Ui, checked: &mut bool, text: &str) -> egui::Response {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(5, 1))
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(surface_stroke(ui.visuals().dark_mode))
+            .show(ui, |ui| {
+                ui.set_min_height(COMPACT_CONTROL_HEIGHT);
+                ui.checkbox(checked, text)
+            })
+            .inner
     }
 
     fn section_heading(ui: &mut egui::Ui, text: &str) {
@@ -4590,6 +4843,7 @@ impl MeshBcTesterApp {
             .fill(fill)
             .stroke(stroke(border))
             .show(ui, |ui| {
+                ui.set_min_height(COMPACT_CONTROL_HEIGHT);
                 ui.horizontal(|ui| {
                     ui.small(RichText::new(label).color(ui.visuals().weak_text_color()));
                     ui.separator();
@@ -4605,7 +4859,7 @@ impl MeshBcTesterApp {
     }
 
     fn compact_widget<W: egui::Widget>(ui: &mut egui::Ui, width: f32, widget: W) -> egui::Response {
-        ui.add_sized([width, 22.0], widget)
+        ui.add_sized([width, COMPACT_CONTROL_HEIGHT], widget)
     }
 
     fn compact_text_edit(ui: &mut egui::Ui, width: f32, value: &mut String) -> egui::Response {
@@ -5730,6 +5984,97 @@ mod tests {
         );
         assert_eq!(device.name, "Turbo AP-C-BM-1");
         assert!(app.discovered_devices.is_empty());
+    }
+
+    #[test]
+    fn device_editor_modal_opens_for_existing_device_and_closes_on_save() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+
+        let device = app.config.devices[0].clone();
+        app.open_device_editor(&device);
+        assert!(app.device_editor_open);
+        assert_eq!(app.device_editor.editing_id, Some(1));
+
+        app.device_editor.name = "改名设备".into();
+        app.save_device_editor();
+
+        assert!(!app.device_editor_open);
+        assert_eq!(app.config.devices[0].name, "改名设备");
+        assert!(app.device_editor.editing_id.is_none());
+    }
+
+    #[test]
+    fn delete_device_removes_single_row_state_and_closes_matching_editor() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![
+            DeviceProfile {
+                local_id: 1,
+                name: "BC灯".into(),
+                device_id: "34B7DA848802".into(),
+                up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+                down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+                mesh_dev_type: 1,
+                default_dest_addr: 1,
+                subscribe_enabled: true,
+            },
+            DeviceProfile {
+                local_id: 2,
+                name: "BC灯 2".into(),
+                device_id: "34B7DA848803".into(),
+                up_topic: "/application/AP-C-BM/device/34B7DA848803/up".into(),
+                down_topic: "/application/AP-C-BM/device/34B7DA848803/down".into(),
+                mesh_dev_type: 1,
+                default_dest_addr: 1,
+                subscribe_enabled: true,
+            },
+        ];
+        app.selected_devices.insert(1);
+        app.runtime_states.insert(1, DeviceRuntimeState::default());
+        app.runtime_states.insert(2, DeviceRuntimeState::default());
+        let device = app.config.devices[0].clone();
+        app.open_device_editor(&device);
+
+        app.delete_device(1);
+
+        assert_eq!(app.config.devices.len(), 1);
+        assert_eq!(app.config.devices[0].local_id, 2);
+        assert!(!app.selected_devices.contains(&1));
+        assert!(!app.runtime_states.contains_key(&1));
+        assert!(app.runtime_states.contains_key(&2));
+        assert!(!app.device_editor_open);
+    }
+
+    #[test]
+    fn discovered_fill_opens_prefilled_device_editor_modal() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        let payload = serde_json::json!({
+            "opcode": 0x47,
+            "version": "13",
+            "dev_model": "Turbo AP-C-BM-1",
+            "dev_id": "34B7DA848802"
+        });
+
+        app.observe_discovered_message(
+            "/application/AP-C-BM/device/34B7DA848802/up",
+            Some(&payload),
+            &payload.to_string(),
+        );
+        app.load_discovered_device_into_editor("34B7DA848802");
+
+        assert!(app.device_editor_open);
+        assert!(app.device_editor.editing_id.is_none());
+        assert_eq!(app.device_editor.name, "Turbo AP-C-BM-1");
+        assert_eq!(app.device_editor.device_id, "34B7DA848802");
     }
 
     #[test]
