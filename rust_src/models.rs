@@ -1,5 +1,7 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerProfile {
@@ -141,12 +143,88 @@ pub struct LogEntry {
     pub payload: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct OperationRecord {
+    pub timestamp: String,
+    pub device_name: String,
+    pub opcode: String,
+    pub status: String,
+    pub detail: String,
+    pub rtt_ms: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
     BcOta,
     AOta,
     VoiceFile,
     RealtimeVoice,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveTransfer {
+    pub device_local_id: u64,
+    pub device_name: String,
+    pub device_id: String,
+    pub up_topic: String,
+    pub down_topic: String,
+    pub kind: TransferKind,
+    pub packets: Vec<Value>,
+    pub next_index: usize,
+    pub next_send_at: Instant,
+    pub waiting_ack_opcode: Option<u32>,
+    pub waiting_since: Option<Instant>,
+    pub last_sent_index: Option<usize>,
+    pub last_sent_time_stamp: Option<u64>,
+    pub retry_count: u8,
+    pub max_retries: u8,
+    pub status: String,
+    pub terminal: bool,
+    pub succeeded: bool,
+    pub paused: bool,
+    pub failure_packet_index: Option<usize>,
+    pub last_failure_reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferSnapshot {
+    pub device_local_id: u64,
+    pub device_name: String,
+    pub device_id: String,
+    pub kind: TransferKind,
+    pub next_index: usize,
+    pub packet_count: usize,
+    pub waiting_ack_opcode: Option<u32>,
+    pub retry_count: u8,
+    pub max_retries: u8,
+    pub status: String,
+    pub terminal: bool,
+    pub succeeded: bool,
+    pub paused: bool,
+    pub failure_packet_index: Option<usize>,
+    pub last_failure_reason: String,
+}
+
+impl From<&ActiveTransfer> for TransferSnapshot {
+    fn from(transfer: &ActiveTransfer) -> Self {
+        Self {
+            device_local_id: transfer.device_local_id,
+            device_name: transfer.device_name.clone(),
+            device_id: transfer.device_id.clone(),
+            kind: transfer.kind,
+            next_index: transfer.next_index,
+            packet_count: transfer.packets.len(),
+            waiting_ack_opcode: transfer.waiting_ack_opcode,
+            retry_count: transfer.retry_count,
+            max_retries: transfer.max_retries,
+            status: transfer.status.clone(),
+            terminal: transfer.terminal,
+            succeeded: transfer.succeeded,
+            paused: transfer.paused,
+            failure_packet_index: transfer.failure_packet_index,
+            last_failure_reason: transfer.last_failure_reason.clone(),
+        }
+    }
 }
 
 impl TransferKind {
@@ -170,6 +248,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub bc_ota_start_ack_timeout_secs: u64,
     pub transfer_max_retries: u8,
+    #[serde(default)]
+    pub voice_transfer_packet_delay_ms: u64,
+    #[serde(default)]
+    pub voice_transfer_ack_timeout_secs: u64,
+    #[serde(default)]
+    pub voice_transfer_max_retries: u8,
+    #[serde(default)]
+    pub ui_theme_mode: UiThemeMode,
 }
 
 impl Default for AppConfig {
@@ -182,6 +268,10 @@ impl Default for AppConfig {
             transfer_ack_timeout_secs: 10,
             bc_ota_start_ack_timeout_secs: 20,
             transfer_max_retries: 2,
+            voice_transfer_packet_delay_ms: 15,
+            voice_transfer_ack_timeout_secs: 10,
+            voice_transfer_max_retries: 2,
+            ui_theme_mode: UiThemeMode::Dark,
         }
     }
 }
@@ -194,7 +284,45 @@ impl AppConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl UiThemeMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "深色",
+            Self::Light => "浅色",
+        }
+    }
+}
+
 pub fn now_display() -> String {
     let now: DateTime<Local> = Local::now();
-    now.format("%Y-%m-%d %H:%M:%S").to_string()
+    now.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::now_display;
+
+    #[test]
+    fn now_display_keeps_three_millisecond_digits() {
+        let value = now_display();
+
+        assert_eq!(value.len(), "2026-04-30 15:16:17.123".len());
+        assert_eq!(&value[19..20], ".");
+        assert!(value[20..].chars().all(|ch| ch.is_ascii_digit()));
+    }
 }

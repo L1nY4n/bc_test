@@ -3,6 +3,7 @@ mod models;
 mod mqtt;
 mod protocol;
 mod store;
+mod transfer_engine;
 
 use app::MeshBcTesterApp;
 

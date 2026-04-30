@@ -37,9 +37,17 @@ cargo run
 
 If you want to bundle your own Chinese font for more stable rendering on minimal systems, place one of these files under [assets/fonts](assets/fonts):
 
-- `NotoSansSC-Regular.otf`
-- `SourceHanSansCN-Regular.otf`
 - `SourceHanSansSC-Regular.otf`
+- `SourceHanSansCN-Regular.otf`
+- `NotoSansCJKsc-Regular.otf`
+- `NotoSansSC-Regular.otf`
+
+For log and JSON editors, the app tries a separate CJK monospace fallback:
+
+- `NotoSansMonoCJKsc-Regular.otf`
+- `NotoSansMonoCJKSC-Regular.otf`
+- `SarasaMonoSC-Regular.ttf`
+- `SarasaMonoSC-Regular.otf`
 
 ## Verify
 

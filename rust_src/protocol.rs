@@ -894,7 +894,7 @@ pub fn hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .to_uppercase();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         return Err("十六进制字符串长度必须为偶数".into());
     }
     (0..cleaned.len())
@@ -1067,85 +1067,53 @@ fn payload_u64(payload: &Value, key: &str) -> Option<u64> {
 fn validate_payload_semantics(opcode: u32, payload: &Value) -> Result<(), String> {
     let value = payload_u64(payload, "value");
     match opcode {
-        0x02 => {
-            if value != Some(1) {
-                return Err("复位命令 value 必须为 1".into());
-            }
+        0x02 if value != Some(1) => {
+            return Err("复位命令 value 必须为 1".into());
         }
-        0x0F => {
-            if !matches!(value, Some(0..=120)) {
-                return Err("能耗上报周期必须在 0..120 小时之间".into());
-            }
+        0x0F if !matches!(value, Some(0..=120)) => {
+            return Err("能耗上报周期必须在 0..120 小时之间".into());
         }
-        0x11 => {
-            if value.is_none() {
-                return Err("A灯 OTA 通知必须包含目标版本".into());
-            }
+        0x11 if value.is_none() => {
+            return Err("A灯 OTA 通知必须包含目标版本".into());
         }
-        0x15 => {
-            if !matches!(value, Some(10..=255)) {
-                return Err("无人关灯延时必须在 10..255 秒之间".into());
-            }
+        0x15 if !matches!(value, Some(10..=255)) => {
+            return Err("无人关灯延时必须在 10..255 秒之间".into());
         }
-        0x17 => {
-            if !matches!(value, Some(2 | 3)) {
-                return Err("运行模式只允许 2(工程模式) 或 3(感应模式)".into());
-            }
+        0x17 if !matches!(value, Some(2 | 3)) => {
+            return Err("运行模式只允许 2(工程模式) 或 3(感应模式)".into());
         }
-        0x19 | 0x27 | 0x28 | 0x30 => {
-            if !matches!(value, Some(0 | 1)) {
-                return Err("该开关类命令只允许 0 或 1".into());
-            }
+        0x19 | 0x27 | 0x28 | 0x30 if !matches!(value, Some(0 | 1)) => {
+            return Err("该开关类命令只允许 0 或 1".into());
         }
-        0x1A => {
-            if !matches!(value, Some(0) | Some(30..=180)) {
-                return Err("心跳周期只允许 0 或 30..180 秒".into());
-            }
+        0x1A if !matches!(value, Some(0) | Some(30..=180)) => {
+            return Err("心跳周期只允许 0 或 30..180 秒".into());
         }
-        0x20 => {
-            if !matches!(value, Some(0..=20) | Some(254 | 255)) {
-                return Err("场景切换值只允许 0..20、254 或 255".into());
-            }
+        0x20 if !matches!(value, Some(0..=20) | Some(254 | 255)) => {
+            return Err("场景切换值只允许 0..20、254 或 255".into());
         }
-        0x24 => {
-            if !matches!(value, Some(1..=20)) {
-                return Err("删除场景编号只允许 1..20".into());
-            }
+        0x24 if !matches!(value, Some(1..=20)) => {
+            return Err("删除场景编号只允许 1..20".into());
         }
-        0x25 => {
-            if !matches!(value, Some(0..=20) | Some(255)) {
-                return Err("查询场景值只允许 0..20 或 255".into());
-            }
+        0x25 if !matches!(value, Some(0..=20) | Some(255)) => {
+            return Err("查询场景值只允许 0..20 或 255".into());
         }
-        0x31 => {
-            if !matches!(value, Some(1..=0xFFFF)) {
-                return Err("联动组地址必须在 0x0001..0xFFFF".into());
-            }
+        0x31 if !matches!(value, Some(1..=0xFFFF)) => {
+            return Err("联动组地址必须在 0x0001..0xFFFF".into());
         }
-        0x34 => {
-            if !matches!(value, Some(0..=10)) {
-                return Err("智能联动模式参数只允许 0..10".into());
-            }
+        0x34 if !matches!(value, Some(0..=10)) => {
+            return Err("智能联动模式参数只允许 0..10".into());
         }
-        0x35 => {
-            if !matches!(value, Some(0) | Some(1..=5) | Some(255)) {
-                return Err("人体微波设置只允许 0、1..5 或 255".into());
-            }
+        0x35 if !matches!(value, Some(0) | Some(1..=5) | Some(255)) => {
+            return Err("人体微波设置只允许 0、1..5 或 255".into());
         }
-        0x4E => {
-            if !matches!(value, Some(0..=255)) {
-                return Err("查询BC Mesh组网信息的保留值必须在 0..255".into());
-            }
+        0x4E if !matches!(value, Some(0..=255)) => {
+            return Err("查询BC Mesh组网信息的保留值必须在 0..255".into());
         }
-        0x50 => {
-            if !matches!(value, Some(0 | 1)) {
-                return Err("查询A灯列表只允许 0(全部) 或 1(遥控选中)".into());
-            }
+        0x50 if !matches!(value, Some(0 | 1)) => {
+            return Err("查询A灯列表只允许 0(全部) 或 1(遥控选中)".into());
         }
-        0x62 => {
-            if !matches!(value, Some(0..=10)) {
-                return Err("喇叭音量只允许 0..10".into());
-            }
+        0x62 if !matches!(value, Some(0..=10)) => {
+            return Err("喇叭音量只允许 0..10".into());
         }
         _ => {}
     }
@@ -1154,17 +1122,15 @@ fn validate_payload_semantics(opcode: u32, payload: &Value) -> Result<(), String
 
 pub fn summarize_payload(payload: &Value) -> String {
     if let Some(opcode) = payload.get("opcode").and_then(Value::as_u64) {
-        if opcode == 0x1B {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if bytes.len() >= 4 {
-                        return format!(
-                            "心跳 开关={} 模式={} 版本=0x{:02X} 类型={}",
-                            bytes[0], bytes[1], bytes[2], bytes[3]
-                        );
-                    }
-                }
-            }
+        if opcode == 0x1B
+            && let Some(value) = payload.get("value").and_then(Value::as_str)
+            && let Ok(bytes) = hex_to_bytes(value)
+            && bytes.len() >= 4
+        {
+            return format!(
+                "心跳 开关={} 模式={} 版本=0x{:02X} 类型={}",
+                bytes[0], bytes[1], bytes[2], bytes[3]
+            );
         }
         if opcode == 0x47 {
             let version = payload
@@ -1197,24 +1163,22 @@ pub fn summarize_payload(payload: &Value) -> String {
             let to = payload.get("index_to").and_then(Value::as_u64).unwrap_or(0);
             return format!("A灯列表 分页 {}..{} / 总数 {}", from, to, total);
         }
-        if opcode == 0x1D {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if bytes.len() >= 2 {
-                        return format!("状态查询 查询码={} 返回=0x{:02X}", bytes[0], bytes[1]);
-                    }
-                }
-            }
+        if opcode == 0x1D
+            && let Some(value) = payload.get("value").and_then(Value::as_str)
+            && let Ok(bytes) = hex_to_bytes(value)
+            && bytes.len() >= 2
+        {
+            return format!("状态查询 查询码={} 返回=0x{:02X}", bytes[0], bytes[1]);
         }
-        if opcode == 0x1F {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                return format!("组网信息 {}", value.chars().take(24).collect::<String>());
-            }
+        if opcode == 0x1F
+            && let Some(value) = payload.get("value").and_then(Value::as_str)
+        {
+            return format!("组网信息 {}", value.chars().take(24).collect::<String>());
         }
-        if opcode == 0x22 || opcode == 0x26 {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                return format!("场景数据 {}", value.chars().take(24).collect::<String>());
-            }
+        if (opcode == 0x22 || opcode == 0x26)
+            && let Some(value) = payload.get("value").and_then(Value::as_str)
+        {
+            return format!("场景数据 {}", value.chars().take(24).collect::<String>());
         }
         if opcode == 0x29 {
             let power = payload.get("power").and_then(Value::as_u64).unwrap_or(0);
@@ -1259,64 +1223,58 @@ pub fn decode_payload_details(payload: &Value) -> Vec<(String, String)> {
             details.push(("人体微波事件".into(), event.into()));
         }
         0x1B => {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if bytes.len() >= 4 {
-                        details.push(("开关状态".into(), bytes[0].to_string()));
-                        details.push(("运行模式".into(), bytes[1].to_string()));
-                        details.push(("固件版本".into(), format!("0x{:02X}", bytes[2])));
-                        details.push(("设备类型".into(), bytes[3].to_string()));
-                    }
-                }
+            if let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = hex_to_bytes(value)
+                && bytes.len() >= 4
+            {
+                details.push(("开关状态".into(), bytes[0].to_string()));
+                details.push(("运行模式".into(), bytes[1].to_string()));
+                details.push(("固件版本".into(), format!("0x{:02X}", bytes[2])));
+                details.push(("设备类型".into(), bytes[3].to_string()));
             }
         }
         0x1D => {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if bytes.len() >= 2 {
-                        let query_code = bytes[0];
-                        details.push(("查询码".into(), query_code.to_string()));
-                        match query_code {
-                            0 | 1 | 3 | 4 | 5 | 6 | 7 | 9 | 11 | 12 => {
-                                details.push(("返回值".into(), bytes[1].to_string()));
-                            }
-                            8 | 255 => {
-                                if bytes.len() >= 7 {
-                                    details.push(("MAC地址".into(), format_mac(&bytes[1..7])));
-                                }
-                            }
-                            _ => {}
-                        }
+            if let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = hex_to_bytes(value)
+                && bytes.len() >= 2
+            {
+                let query_code = bytes[0];
+                details.push(("查询码".into(), query_code.to_string()));
+                match query_code {
+                    0 | 1 | 3 | 4 | 5 | 6 | 7 | 9 | 11 | 12 => {
+                        details.push(("返回值".into(), bytes[1].to_string()));
                     }
+                    8 | 255 if bytes.len() >= 7 => {
+                        details.push(("MAC地址".into(), format_mac(&bytes[1..7])));
+                    }
+                    _ => {}
                 }
             }
         }
         0x1F => {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if !bytes.is_empty() {
-                        let query_code = bytes[0];
-                        details.push(("查询码".into(), query_code.to_string()));
-                        let addresses = decode_be_u16_addresses(&bytes[1..]);
-                        if !addresses.is_empty() {
-                            details.push(("地址列表".into(), addresses.join(", ")));
-                        }
-                    }
+            if let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = hex_to_bytes(value)
+                && !bytes.is_empty()
+            {
+                let query_code = bytes[0];
+                details.push(("查询码".into(), query_code.to_string()));
+                let addresses = decode_be_u16_addresses(&bytes[1..]);
+                if !addresses.is_empty() {
+                    details.push(("地址列表".into(), addresses.join(", ")));
                 }
             }
         }
         0x22 | 0x26 => {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = hex_to_bytes(value) {
-                    if bytes.len() >= 6 {
-                        details.push(("场景编号".into(), bytes[0].to_string()));
-                        details.push(("有人亮度".into(), bytes[1].to_string()));
-                        details.push(("无人亮度".into(), bytes[2].to_string()));
-                        details.push(("无人关灯延时".into(), bytes[3].to_string()));
-                        details.push(("运行模式".into(), bytes[4].to_string()));
-                        details.push(("开关状态".into(), bytes[5].to_string()));
-                    }
-                }
+            if let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = hex_to_bytes(value)
+                && bytes.len() >= 6
+            {
+                details.push(("场景编号".into(), bytes[0].to_string()));
+                details.push(("有人亮度".into(), bytes[1].to_string()));
+                details.push(("无人亮度".into(), bytes[2].to_string()));
+                details.push(("无人关灯延时".into(), bytes[3].to_string()));
+                details.push(("运行模式".into(), bytes[4].to_string()));
+                details.push(("开关状态".into(), bytes[5].to_string()));
             }
         }
         0x29 => {
@@ -1448,7 +1406,7 @@ pub fn chunk_count(data: &[u8], chunk_size: usize) -> usize {
     if data.is_empty() {
         0
     } else {
-        (data.len() + chunk_size - 1) / chunk_size
+        data.len().div_ceil(chunk_size)
     }
 }
 

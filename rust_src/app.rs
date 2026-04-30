@@ -10,9 +10,11 @@ use egui_extras::{Column, TableBuilder};
 use rfd::FileDialog;
 use serde_json::Value;
 
+#[cfg(test)]
+use crate::models::ActiveTransfer;
 use crate::models::{
     AppConfig, BrokerProfile, DeviceEditor, DeviceProfile, DeviceRuntimeState, LogDirection,
-    LogEntry, TransferKind, now_display,
+    LogEntry, OperationRecord, TransferKind, TransferSnapshot, UiThemeMode, now_display,
 };
 use crate::mqtt::{MqttEvent, MqttRuntime};
 use crate::protocol::{
@@ -21,6 +23,9 @@ use crate::protocol::{
     parse_opcode, redact_json, response_can_omit_timestamp, summarize_payload, transfer_preview,
 };
 use crate::store::{load_config, save_config};
+use crate::transfer_engine::{
+    TransferEngine, TransferEngineCommand, TransferEngineEvent, TransferEngineSettings,
+};
 
 pub struct MeshBcTesterApp {
     config: AppConfig,
@@ -30,6 +35,8 @@ pub struct MeshBcTesterApp {
     auto_discovery_enabled: bool,
     auto_import_discovered: bool,
     discovered_devices: Vec<DiscoveredDevice>,
+    discovery_section_had_candidates: bool,
+    device_editor_active_id: Option<u64>,
     selected_log_index: Option<usize>,
     command_key: String,
     command_form: BTreeMap<String, String>,
@@ -38,10 +45,12 @@ pub struct MeshBcTesterApp {
     connection_status: String,
     broker_connected: bool,
     mqtt: MqttRuntime,
+    transfer_engine: TransferEngine,
     runtime_states: HashMap<u64, DeviceRuntimeState>,
     logs: Vec<LogEntry>,
     recent_operations: Vec<OperationRecord>,
     show_selected_logs_only: bool,
+    follow_latest_logs: bool,
     log_filter_text: String,
     ota_transfer_kind: TransferKind,
     ota_transfer_file: String,
@@ -53,11 +62,16 @@ pub struct MeshBcTesterApp {
     transfer_ack_timeout_secs: u64,
     bc_ota_start_ack_timeout_secs: u64,
     transfer_max_retries: u8,
+    voice_transfer_packet_delay_ms: u64,
+    voice_transfer_ack_timeout_secs: u64,
+    voice_transfer_max_retries: u8,
     system_notice: String,
     needs_connection_recovery: bool,
     pending_confirmation: Option<PendingConfirmation>,
     pending_file_dialog: Option<PendingFileDialog>,
     pending_requests: Vec<PendingRequest>,
+    transfer_snapshots: Vec<TransferSnapshot>,
+    #[cfg(test)]
     active_transfers: Vec<ActiveTransfer>,
     device_last_seen_at: HashMap<u64, Instant>,
 }
@@ -73,15 +87,7 @@ struct PendingRequest {
     time_stamp: Option<u64>,
 }
 
-struct OperationRecord {
-    timestamp: String,
-    device_name: String,
-    opcode: String,
-    status: String,
-    detail: String,
-    rtt_ms: String,
-}
-
+#[derive(Clone)]
 struct DiscoveredDevice {
     device_id: String,
     up_topic: String,
@@ -100,29 +106,6 @@ struct DiscoveredDevice {
     seen_count: u32,
 }
 
-struct ActiveTransfer {
-    device_local_id: u64,
-    device_name: String,
-    device_id: String,
-    down_topic: String,
-    kind: TransferKind,
-    packets: Vec<Value>,
-    next_index: usize,
-    next_send_at: Instant,
-    waiting_ack_opcode: Option<u32>,
-    waiting_since: Option<Instant>,
-    last_sent_index: Option<usize>,
-    last_sent_time_stamp: Option<u64>,
-    retry_count: u8,
-    max_retries: u8,
-    status: String,
-    terminal: bool,
-    succeeded: bool,
-    paused: bool,
-    failure_packet_index: Option<usize>,
-    last_failure_reason: String,
-}
-
 struct PendingConfirmation {
     title: String,
     detail: String,
@@ -131,8 +114,6 @@ struct PendingConfirmation {
 
 #[derive(Clone, Copy)]
 enum ChipTone {
-    Neutral,
-    Success,
     Warning,
 }
 
@@ -171,6 +152,17 @@ const MAX_TRANSFER_BYTES: usize = 10 * 1024 * 1024;
 const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
 const MAX_OPERATION_HISTORY: usize = 300;
 const MAX_DISCOVERED_DEVICES: usize = 128;
+const MAX_MQTT_EVENTS_PER_FRAME: usize = 250;
+#[cfg(test)]
+const TRANSFER_PACKET_LOG_INTERVAL: usize = 100;
+const TABLE_ROW_HEIGHT: f32 = 20.0;
+const REQUEST_STATUS_TABLE_HEIGHT: f32 = 90.0;
+const TRANSFER_STATUS_TABLE_HEIGHT: f32 = 120.0;
+const RECENT_OPERATIONS_TABLE_HEIGHT: f32 = 120.0;
+const DISCOVERY_UP_TOPIC_FILTERS: [&str; 2] = [
+    "/application/AP-C-BM/device/+/up",
+    "/application/AP-C-BM/device/+/up/#",
+];
 
 impl MeshBcTesterApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -200,6 +192,21 @@ impl MeshBcTesterApp {
         } else {
             config.transfer_max_retries
         };
+        let voice_transfer_packet_delay_ms = if config.voice_transfer_packet_delay_ms == 0 {
+            transfer_packet_delay_ms
+        } else {
+            config.voice_transfer_packet_delay_ms
+        };
+        let voice_transfer_ack_timeout_secs = if config.voice_transfer_ack_timeout_secs == 0 {
+            transfer_ack_timeout_secs
+        } else {
+            config.voice_transfer_ack_timeout_secs
+        };
+        let voice_transfer_max_retries = if config.voice_transfer_max_retries == 0 {
+            transfer_max_retries
+        } else {
+            config.voice_transfer_max_retries
+        };
         let command_key = COMMANDS
             .first()
             .map(|spec| spec.key.to_string())
@@ -210,6 +217,9 @@ impl MeshBcTesterApp {
             .iter()
             .map(|device| (device.local_id, DeviceRuntimeState::default()))
             .collect();
+        let transfer_engine = TransferEngine::new();
+        let mut mqtt = MqttRuntime::default();
+        mqtt.set_event_mirror(Some(transfer_engine.mqtt_event_sender()));
 
         Self {
             config,
@@ -224,6 +234,8 @@ impl MeshBcTesterApp {
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
+            discovery_section_had_candidates: false,
+            device_editor_active_id: None,
             selected_log_index: None,
             command_key,
             command_form,
@@ -236,11 +248,13 @@ impl MeshBcTesterApp {
             raw_expected_opcode: String::new(),
             connection_status: "未连接".into(),
             broker_connected: false,
-            mqtt: MqttRuntime::default(),
+            mqtt,
+            transfer_engine,
             runtime_states,
             logs: Vec::new(),
             recent_operations: Vec::new(),
             show_selected_logs_only: false,
+            follow_latest_logs: true,
             log_filter_text: String::new(),
             ota_transfer_kind: TransferKind::BcOta,
             ota_transfer_file: String::new(),
@@ -252,11 +266,16 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs,
             bc_ota_start_ack_timeout_secs,
             transfer_max_retries,
+            voice_transfer_packet_delay_ms,
+            voice_transfer_ack_timeout_secs,
+            voice_transfer_max_retries,
             system_notice: String::new(),
             needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
             pending_requests: Vec::new(),
+            transfer_snapshots: Vec::new(),
+            #[cfg(test)]
             active_transfers: Vec::new(),
             device_last_seen_at: HashMap::new(),
         }
@@ -303,15 +322,21 @@ impl MeshBcTesterApp {
 
     fn process_mqtt_events(&mut self) {
         self.collect_pending_timeouts();
-        self.collect_transfer_timeouts();
         self.collect_device_offline_timeouts();
-        while let Ok(event) = self.mqtt.events_rx.try_recv() {
+        for _ in 0..MAX_MQTT_EVENTS_PER_FRAME {
+            let Ok(event) = self.mqtt.events_rx.try_recv() else {
+                break;
+            };
             match event {
                 MqttEvent::Connection {
+                    generation,
                     connected,
                     reconnecting,
                     message,
                 } => {
+                    if !self.mqtt.is_current_generation(generation) {
+                        continue;
+                    }
                     self.handle_mqtt_connection_state(connected, reconnecting, &message);
                     self.append_log(LogEntry {
                         timestamp: now_display(),
@@ -325,7 +350,14 @@ impl MeshBcTesterApp {
                         payload: message,
                     });
                 }
-                MqttEvent::Message { topic, payload } => {
+                MqttEvent::Message {
+                    generation,
+                    topic,
+                    payload,
+                } => {
+                    if !self.mqtt.is_current_generation(generation) {
+                        continue;
+                    }
                     let device = self.device_by_topic(&topic).cloned();
                     let parsed: Option<Value> = serde_json::from_str(&payload).ok();
                     if device.is_none() {
@@ -333,7 +365,6 @@ impl MeshBcTesterApp {
                     }
                     let mut rx_status = "接收".to_string();
                     if let (Some(device), Some(parsed)) = (&device, &parsed) {
-                        self.resolve_transfer_ack(device, parsed);
                         self.resolve_pending_request(device, parsed);
                         if let Some((status, _)) = classify_execution_result(parsed) {
                             rx_status = status.to_string();
@@ -407,12 +438,46 @@ impl MeshBcTesterApp {
         }
     }
 
+    fn process_transfer_engine_events(&mut self) {
+        for _ in 0..MAX_MQTT_EVENTS_PER_FRAME {
+            let Ok(event) = self.transfer_engine.try_recv_event() else {
+                break;
+            };
+            match event {
+                TransferEngineEvent::Snapshot(transfers) => {
+                    self.transfer_snapshots = transfers;
+                }
+                TransferEngineEvent::Log(entry) => {
+                    self.append_log(entry);
+                }
+                TransferEngineEvent::Operation(record) => {
+                    self.append_operation(record);
+                }
+                TransferEngineEvent::DeviceResult {
+                    device_local_id,
+                    label,
+                    text,
+                } => {
+                    if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
+                        Self::set_device_result(state, &label, text);
+                    }
+                }
+                TransferEngineEvent::SystemNotice(text) => {
+                    self.system_notice = text;
+                }
+            }
+        }
+    }
+
     fn handle_mqtt_connection_state(&mut self, connected: bool, reconnecting: bool, message: &str) {
+        #[cfg(not(test))]
+        let _ = reconnecting;
         self.broker_connected = connected;
         self.connection_status = message.to_string();
         if connected {
             if self.needs_connection_recovery {
                 self.mqtt.reapply_subscriptions();
+                #[cfg(test)]
                 self.resume_transfers_after_reconnect();
                 self.needs_connection_recovery = false;
             }
@@ -424,10 +489,12 @@ impl MeshBcTesterApp {
             state.pending_count = 0;
         }
         self.pending_requests.clear();
+        #[cfg(test)]
         self.pause_transfers_for_connection_loss(reconnecting);
         self.needs_connection_recovery = true;
     }
 
+    #[cfg(test)]
     fn pause_transfers_for_connection_loss(&mut self, reconnecting: bool) {
         for transfer in &mut self.active_transfers {
             if transfer.terminal {
@@ -456,6 +523,7 @@ impl MeshBcTesterApp {
         }
     }
 
+    #[cfg(test)]
     fn resume_transfers_after_reconnect(&mut self) {
         let resume_at = Instant::now() + Duration::from_millis(self.transfer_packet_delay_ms);
         for transfer in &mut self.active_transfers {
@@ -500,63 +568,59 @@ impl MeshBcTesterApp {
                 }
             }
             0x1B => {
-                if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                        if bytes.len() >= 2 {
-                            state.last_switch_state = bytes[0].to_string();
-                            state.last_run_mode = bytes[1].to_string();
-                            if bytes.len() >= 3 {
-                                state.last_version = format!("0x{:02X}", bytes[2]);
-                            }
-                        }
+                if let Some(value) = payload.get("value").and_then(Value::as_str)
+                    && let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+                    && bytes.len() >= 2
+                {
+                    state.last_switch_state = bytes[0].to_string();
+                    state.last_run_mode = bytes[1].to_string();
+                    if bytes.len() >= 3 {
+                        state.last_version = format!("0x{:02X}", bytes[2]);
                     }
                 }
             }
             0x1D => {
-                if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                        if bytes.len() >= 2 {
-                            match bytes[0] {
-                                0 => state.last_version = format!("0x{:02X}", bytes[1]),
-                                1 => state.last_run_mode = bytes[1].to_string(),
-                                4 => state.last_remote_network_enable = bytes[1].to_string(),
-                                5 => state.last_heartbeat_interval = bytes[1].to_string(),
-                                6 => state.last_group_linkage = bytes[1].to_string(),
-                                7 => state.last_switch_state = bytes[1].to_string(),
-                                9 => state.last_linkage_mode = bytes[1].to_string(),
-                                12 => state.last_microwave_setting = bytes[1].to_string(),
-                                8 | 255 => {
-                                    if bytes.len() >= 7 {
-                                        state.last_mac_addr = bytes[1..7]
-                                            .iter()
-                                            .map(|byte| format!("{byte:02X}"))
-                                            .collect::<Vec<_>>()
-                                            .join(":");
-                                    }
-                                }
-                                _ => {}
-                            }
+                if let Some(value) = payload.get("value").and_then(Value::as_str)
+                    && let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+                    && bytes.len() >= 2
+                {
+                    match bytes[0] {
+                        0 => state.last_version = format!("0x{:02X}", bytes[1]),
+                        1 => state.last_run_mode = bytes[1].to_string(),
+                        4 => state.last_remote_network_enable = bytes[1].to_string(),
+                        5 => state.last_heartbeat_interval = bytes[1].to_string(),
+                        6 => state.last_group_linkage = bytes[1].to_string(),
+                        7 => state.last_switch_state = bytes[1].to_string(),
+                        9 => state.last_linkage_mode = bytes[1].to_string(),
+                        12 => state.last_microwave_setting = bytes[1].to_string(),
+                        8 | 255 if bytes.len() >= 7 => {
+                            state.last_mac_addr = bytes[1..7]
+                                .iter()
+                                .map(|byte| format!("{byte:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(":");
                         }
+                        _ => {}
                     }
                 }
             }
             0x22 | 0x26 => {
-                if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                        if !bytes.is_empty() {
-                            state.last_scene_id = bytes[0].to_string();
-                        }
-                        if bytes.len() >= 5 {
-                            state.last_run_mode = bytes[4].to_string();
-                        }
-                        if bytes.len() >= 6 {
-                            state.last_switch_state = bytes[5].to_string();
-                        }
-                        state.last_scene_summary = format!(
-                            "场景{} 模式{} 开关{}",
-                            state.last_scene_id, state.last_run_mode, state.last_switch_state
-                        );
+                if let Some(value) = payload.get("value").and_then(Value::as_str)
+                    && let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+                {
+                    if !bytes.is_empty() {
+                        state.last_scene_id = bytes[0].to_string();
                     }
+                    if bytes.len() >= 5 {
+                        state.last_run_mode = bytes[4].to_string();
+                    }
+                    if bytes.len() >= 6 {
+                        state.last_switch_state = bytes[5].to_string();
+                    }
+                    state.last_scene_summary = format!(
+                        "场景{} 模式{} 开关{}",
+                        state.last_scene_id, state.last_run_mode, state.last_switch_state
+                    );
                 }
             }
             0x29 => {
@@ -590,28 +654,29 @@ impl MeshBcTesterApp {
                 if let Some(value) = payload.get("value").and_then(Value::as_str) {
                     let compact = value.chars().take(24).collect::<String>();
                     state.last_group_info = compact;
-                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                        if !bytes.is_empty() && bytes[0] == 0 && bytes.len() >= 7 {
-                            let partition = u16::from_be_bytes([bytes[1], bytes[2]]);
-                            let lane = u16::from_be_bytes([bytes[3], bytes[4]]);
-                            let adjacent = u16::from_be_bytes([bytes[5], bytes[6]]);
-                            state.last_partition_addr = if partition == 0 || partition == 0xFFFF {
-                                String::new()
-                            } else {
-                                format!("0x{partition:04X}")
-                            };
-                            state.last_lane_group_addr = if lane == 0 || lane == 0xFFFF {
-                                String::new()
-                            } else {
-                                format!("0x{lane:04X}")
-                            };
-                            state.last_adjacent_group_addr = if adjacent == 0 || adjacent == 0xFFFF
-                            {
-                                String::new()
-                            } else {
-                                format!("0x{adjacent:04X}")
-                            };
-                        }
+                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+                        && !bytes.is_empty()
+                        && bytes[0] == 0
+                        && bytes.len() >= 7
+                    {
+                        let partition = u16::from_be_bytes([bytes[1], bytes[2]]);
+                        let lane = u16::from_be_bytes([bytes[3], bytes[4]]);
+                        let adjacent = u16::from_be_bytes([bytes[5], bytes[6]]);
+                        state.last_partition_addr = if partition == 0 || partition == 0xFFFF {
+                            String::new()
+                        } else {
+                            format!("0x{partition:04X}")
+                        };
+                        state.last_lane_group_addr = if lane == 0 || lane == 0xFFFF {
+                            String::new()
+                        } else {
+                            format!("0x{lane:04X}")
+                        };
+                        state.last_adjacent_group_addr = if adjacent == 0 || adjacent == 0xFFFF {
+                            String::new()
+                        } else {
+                            format!("0x{adjacent:04X}")
+                        };
                     }
                 }
             }
@@ -634,23 +699,23 @@ impl MeshBcTesterApp {
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.transfer_max_retries = self.transfer_max_retries;
+        self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
+        self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
+        self.config.voice_transfer_max_retries = self.voice_transfer_max_retries;
         self.connection_status = "连接中...".into();
         self.broker_connected = false;
         self.mqtt.connect(&self.config.broker);
+        self.transfer_engine
+            .send(TransferEngineCommand::SetPublisher(
+                self.mqtt.client_handle(),
+            ));
         self.sync_subscriptions();
         let _ = save_config(&self.config);
     }
 
     fn sync_subscriptions(&mut self) {
-        let topics = self
-            .config
-            .devices
-            .iter()
-            .filter(|device| device.subscribe_enabled)
-            .flat_map(|device| compatible_up_topic_filters(&device.up_topic))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let topics =
+            subscription_topics_for_devices(&self.config.devices, self.auto_discovery_enabled);
         self.mqtt.sync_subscriptions(topics);
     }
 
@@ -660,6 +725,8 @@ impl MeshBcTesterApp {
         payload: &Value,
         source: &str,
         expected_override: Option<u32>,
+        append_log_entry: bool,
+        append_operation_record: bool,
     ) -> Result<(), String> {
         self.mqtt
             .publish_json(&device.down_topic, &payload.to_string())?;
@@ -673,64 +740,68 @@ impl MeshBcTesterApp {
             .unwrap_or_else(|| "-".into());
         state.last_opcode = opcode.clone();
         Self::set_device_result(state, "发送", format!("已发送({source})"));
-        if source != "transfer" {
-            if let Some(opcode_num) = payload.get("opcode").and_then(Value::as_u64) {
-                let time_stamp = payload.get("time_stamp").and_then(Value::as_u64);
-                let expected_opcode =
-                    expected_override.or_else(|| expected_response_opcode(opcode_num as u32));
-                if let Some(expected_opcode) = expected_opcode {
-                    if let Some(time_stamp) = time_stamp {
-                        self.pending_requests.push(PendingRequest {
-                            device_local_id: device.local_id,
-                            device_name: device.name.clone(),
-                            device_id: device.device_id.clone(),
-                            topic: device.down_topic.clone(),
-                            opcode: opcode_num as u32,
-                            expected_opcode,
-                            sent_at: Instant::now(),
-                            time_stamp: Some(time_stamp),
-                        });
-                        state.pending_count = state.pending_count.saturating_add(1);
-                        Self::set_device_result(
-                            state,
-                            "待应答",
-                            format!("等待应答(0x{:02X})", expected_opcode),
-                        );
-                    } else {
-                        Self::set_device_result(
-                            state,
-                            "发送",
-                            format!("已发送({source}, 未跟踪应答)"),
-                        );
-                    }
+        if source != "transfer"
+            && let Some(opcode_num) = payload.get("opcode").and_then(Value::as_u64)
+        {
+            let time_stamp = payload.get("time_stamp").and_then(Value::as_u64);
+            let expected_opcode =
+                expected_override.or_else(|| expected_response_opcode(opcode_num as u32));
+            if let Some(expected_opcode) = expected_opcode {
+                if let Some(time_stamp) = time_stamp {
+                    self.pending_requests.push(PendingRequest {
+                        device_local_id: device.local_id,
+                        device_name: device.name.clone(),
+                        device_id: device.device_id.clone(),
+                        topic: device.down_topic.clone(),
+                        opcode: opcode_num as u32,
+                        expected_opcode,
+                        sent_at: Instant::now(),
+                        time_stamp: Some(time_stamp),
+                    });
+                    state.pending_count = state.pending_count.saturating_add(1);
+                    Self::set_device_result(
+                        state,
+                        "待应答",
+                        format!("等待应答(0x{:02X})", expected_opcode),
+                    );
+                } else {
+                    Self::set_device_result(state, "发送", format!("已发送({source}, 未跟踪应答)"));
                 }
             }
         }
-        let redacted = redact_json(payload);
-        let logged_payload = if source == "transfer" {
-            compact_transfer_payload_log(&redacted)
-        } else {
-            serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
-        };
-        self.append_log(LogEntry {
-            timestamp: now_display(),
-            direction: LogDirection::Tx,
-            device_name: device.name.clone(),
-            device_id: device.device_id.clone(),
-            topic: device.down_topic.clone(),
-            opcode: opcode.clone(),
-            status: source.to_uppercase(),
-            summary: summarize_payload(&redacted),
-            payload: logged_payload,
-        });
-        self.append_operation(OperationRecord {
-            timestamp: now_display(),
-            device_name: device.name.clone(),
-            opcode: opcode.clone(),
-            status: source.to_uppercase(),
-            detail: summarize_payload(&redacted),
-            rtt_ms: String::new(),
-        });
+        if append_log_entry || append_operation_record {
+            let redacted = redact_json(payload);
+            let summary = summarize_payload(&redacted);
+            let status = source.to_uppercase();
+            if append_log_entry {
+                let logged_payload = if source == "transfer" {
+                    compact_transfer_payload_log(&redacted)
+                } else {
+                    serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
+                };
+                self.append_log(LogEntry {
+                    timestamp: now_display(),
+                    direction: LogDirection::Tx,
+                    device_name: device.name.clone(),
+                    device_id: device.device_id.clone(),
+                    topic: device.down_topic.clone(),
+                    opcode: opcode.clone(),
+                    status: status.clone(),
+                    summary: summary.clone(),
+                    payload: logged_payload,
+                });
+            }
+            if append_operation_record {
+                self.append_operation(OperationRecord {
+                    timestamp: now_display(),
+                    device_name: device.name.clone(),
+                    opcode: opcode.clone(),
+                    status,
+                    detail: summary,
+                    rtt_ms: String::new(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -771,7 +842,9 @@ impl MeshBcTesterApp {
 
     fn execute_preset_send(&mut self, items: Vec<(DeviceProfile, Value)>) {
         for (device, payload) in items {
-            if let Err(err) = self.send_payload_to_device(&device, &payload, "preset", None) {
+            if let Err(err) =
+                self.send_payload_to_device(&device, &payload, "preset", None, true, true)
+            {
                 self.system_notice = err;
                 return;
             }
@@ -781,7 +854,7 @@ impl MeshBcTesterApp {
     fn execute_raw_send(&mut self, items: Vec<(DeviceProfile, Value, Option<u32>)>) {
         for (device, payload, expected_override) in items {
             if let Err(err) =
-                self.send_payload_to_device(&device, &payload, "raw", expected_override)
+                self.send_payload_to_device(&device, &payload, "raw", expected_override, true, true)
             {
                 self.system_notice = err;
                 return;
@@ -896,16 +969,14 @@ impl MeshBcTesterApp {
         state.pending_count = state.pending_count.saturating_sub(1);
         state.last_rtt_ms = format!("{}", request.sent_at.elapsed().as_millis());
         let rtt_ms = state.last_rtt_ms.clone();
-        let (status, result_summary) = classify_execution_result(payload)
-            .map(|(status, summary)| (status, summary))
-            .unwrap_or_else(|| {
-                let fallback = payload
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or("ACK")
-                    .to_string();
-                ("ACK", fallback)
-            });
+        let (status, result_summary) = classify_execution_result(payload).unwrap_or_else(|| {
+            let fallback = payload
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("ACK")
+                .to_string();
+            ("ACK", fallback)
+        });
         Self::set_device_result(
             state,
             status,
@@ -1104,9 +1175,7 @@ impl MeshBcTesterApp {
             subscribe_enabled: true,
         };
         self.config.next_device_id += 1;
-        self.runtime_states
-            .entry(device.local_id)
-            .or_insert_with(DeviceRuntimeState::default);
+        self.runtime_states.entry(device.local_id).or_default();
         self.config.devices.push(device);
         self.sync_subscriptions();
         let _ = save_config(&self.config);
@@ -1207,23 +1276,23 @@ impl MeshBcTesterApp {
         Ok(())
     }
 
-    fn selected_logs(&self) -> Vec<(usize, &LogEntry)> {
+    fn selected_log_indices(&self) -> Vec<usize> {
+        let filter_text = self.log_filter_text.trim().to_lowercase();
         self.logs
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
+            .filter_map(|(index, entry)| {
                 if !self.show_selected_logs_only || self.selected_devices.is_empty() {
                 } else if !self.config.devices.iter().any(|device| {
                     self.selected_devices.contains(&device.local_id)
                         && device.device_id == entry.device_id
                 }) {
-                    return false;
+                    return None;
                 }
-                if self.log_filter_text.trim().is_empty() {
-                    return true;
+                if filter_text.is_empty() {
+                    return Some(index);
                 }
-                let needle = self.log_filter_text.to_lowercase();
-                [
+                let matches_filter = [
                     entry.device_name.as_str(),
                     entry.device_id.as_str(),
                     entry.topic.as_str(),
@@ -1232,9 +1301,15 @@ impl MeshBcTesterApp {
                     entry.summary.as_str(),
                 ]
                 .iter()
-                .any(|field| field.to_lowercase().contains(&needle))
+                .any(|field| field.to_lowercase().contains(&filter_text));
+                matches_filter.then_some(index)
             })
             .collect()
+    }
+
+    fn select_log_row(&mut self, log_index: usize) {
+        self.selected_log_index = Some(log_index);
+        self.follow_latest_logs = false;
     }
 
     fn pick_ota_transfer_file(&mut self) {
@@ -1340,61 +1415,33 @@ impl MeshBcTesterApp {
             payload: serde_json::to_string_pretty(&redact_json(&preview))
                 .unwrap_or_else(|_| preview.to_string()),
         });
-        for device in devices {
-            if self
-                .active_transfers
-                .iter()
-                .any(|transfer| transfer.device_local_id == device.local_id)
-            {
-                self.append_log(LogEntry {
-                    timestamp: now_display(),
-                    direction: LogDirection::System,
-                    device_name: device.name.clone(),
-                    device_id: device.device_id.clone(),
-                    topic: device.down_topic.clone(),
-                    opcode: "-".into(),
-                    status: "跳过".into(),
-                    summary: "该设备已有活跃传输任务".into(),
-                    payload: String::new(),
-                });
-                continue;
-            }
-            if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
-                Self::set_device_result(
-                    state,
-                    "传输",
-                    format!(
-                        "{} 已排队，共{}包",
-                        kind.label(),
-                        transfer_display_total_packets(kind, packets.len())
-                    ),
-                );
-            }
-            self.active_transfers.push(ActiveTransfer {
-                device_local_id: device.local_id,
-                device_name: device.name.clone(),
-                device_id: device.device_id.clone(),
-                down_topic: device.down_topic.clone(),
+        self.transfer_engine
+            .send(TransferEngineCommand::QueueTransfer {
+                devices,
+                packets,
                 kind,
-                packets: packets.clone(),
-                next_index: 0,
-                next_send_at: Instant::now(),
-                waiting_ack_opcode: None,
-                waiting_since: None,
-                last_sent_index: None,
-                last_sent_time_stamp: None,
-                retry_count: 0,
-                max_retries: self.transfer_max_retries,
-                status: "已排队".into(),
-                terminal: false,
-                succeeded: false,
-                paused: false,
-                failure_packet_index: None,
-                last_failure_reason: String::new(),
+                settings: self.transfer_engine_settings(kind),
             });
+    }
+
+    fn transfer_engine_settings(&self, kind: TransferKind) -> TransferEngineSettings {
+        match kind {
+            TransferKind::BcOta | TransferKind::AOta => TransferEngineSettings {
+                packet_delay_ms: self.transfer_packet_delay_ms,
+                ack_timeout_secs: self.transfer_ack_timeout_secs,
+                bc_ota_start_ack_timeout_secs: self.bc_ota_start_ack_timeout_secs,
+                max_retries: self.transfer_max_retries,
+            },
+            TransferKind::VoiceFile | TransferKind::RealtimeVoice => TransferEngineSettings {
+                packet_delay_ms: self.voice_transfer_packet_delay_ms,
+                ack_timeout_secs: self.voice_transfer_ack_timeout_secs,
+                bc_ota_start_ack_timeout_secs: self.bc_ota_start_ack_timeout_secs,
+                max_retries: self.voice_transfer_max_retries,
+            },
         }
     }
 
+    #[cfg(test)]
     fn tick_active_transfers(&mut self) {
         let now = Instant::now();
         let devices_by_id: HashMap<u64, DeviceProfile> = self
@@ -1442,8 +1489,11 @@ impl MeshBcTesterApp {
                 [self.active_transfers[index].next_index]
                 .clone();
             let packet_index = self.active_transfers[index].next_index;
+            let packet_count = self.active_transfers[index].packets.len();
+            let log_packet = should_log_transfer_packet(packet_index, packet_count);
             let opcode = packet.get("opcode").and_then(Value::as_u64).unwrap_or(0) as u32;
-            match self.send_payload_to_device(device, &packet, "transfer", None) {
+            match self.send_payload_to_device(device, &packet, "transfer", None, log_packet, false)
+            {
                 Ok(()) => {
                     self.active_transfers[index].last_sent_index = Some(packet_index);
                     self.active_transfers[index].last_sent_time_stamp =
@@ -1582,6 +1632,7 @@ impl MeshBcTesterApp {
         }
     }
 
+    #[cfg(test)]
     fn resolve_transfer_ack(&mut self, device: &DeviceProfile, payload: &Value) {
         let Some(opcode) = payload
             .get("opcode")
@@ -1655,8 +1706,7 @@ impl MeshBcTesterApp {
                     transfer.waiting_ack_opcode = None;
                     transfer.waiting_since = None;
                     transfer.paused = false;
-                    transfer.next_send_at =
-                        now + Duration::from_millis(self.transfer_packet_delay_ms);
+                    transfer.next_send_at = now;
                     transfer.status = "BC OTA ACK成功，继续发送".into();
                     if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
                         Self::set_device_result(state, "传输", "BC OTA ACK成功，继续发送".into());
@@ -1709,43 +1759,43 @@ impl MeshBcTesterApp {
             }
         }
         let transfer = &mut self.active_transfers[position];
-        if let Some((status, summary)) = classify_execution_result(payload) {
-            if status == "错误" {
-                let device_name = transfer.device_name.clone();
-                let device_id = transfer.device_id.clone();
-                let down_topic = transfer.down_topic.clone();
-                let op_device_name = device_name.clone();
-                let op_summary = summary.clone();
-                transfer.status = format!("ACK失败: {summary}");
-                transfer.next_index = transfer.packets.len();
-                transfer.waiting_ack_opcode = None;
-                transfer.waiting_since = None;
-                transfer.terminal = true;
-                transfer.succeeded = false;
-                transfer.paused = false;
-                let payload_text = serde_json::to_string_pretty(&redact_json(payload))
-                    .unwrap_or_else(|_| payload.to_string());
-                self.append_log(LogEntry {
-                    timestamp: now_display(),
-                    direction: LogDirection::System,
-                    device_name,
-                    device_id,
-                    topic: down_topic,
-                    opcode: format!("0x{:02X}", opcode),
-                    status: "错误".into(),
-                    summary,
-                    payload: payload_text,
-                });
-                self.append_operation(OperationRecord {
-                    timestamp: now_display(),
-                    device_name: op_device_name,
-                    opcode: format!("0x{:02X}", opcode),
-                    status: "错误".into(),
-                    detail: op_summary,
-                    rtt_ms: String::new(),
-                });
-                return;
-            }
+        if let Some((status, summary)) = classify_execution_result(payload)
+            && status == "错误"
+        {
+            let device_name = transfer.device_name.clone();
+            let device_id = transfer.device_id.clone();
+            let down_topic = transfer.down_topic.clone();
+            let op_device_name = device_name.clone();
+            let op_summary = summary.clone();
+            transfer.status = format!("ACK失败: {summary}");
+            transfer.next_index = transfer.packets.len();
+            transfer.waiting_ack_opcode = None;
+            transfer.waiting_since = None;
+            transfer.terminal = true;
+            transfer.succeeded = false;
+            transfer.paused = false;
+            let payload_text = serde_json::to_string_pretty(&redact_json(payload))
+                .unwrap_or_else(|_| payload.to_string());
+            self.append_log(LogEntry {
+                timestamp: now_display(),
+                direction: LogDirection::System,
+                device_name,
+                device_id,
+                topic: down_topic,
+                opcode: format!("0x{:02X}", opcode),
+                status: "错误".into(),
+                summary,
+                payload: payload_text,
+            });
+            self.append_operation(OperationRecord {
+                timestamp: now_display(),
+                device_name: op_device_name,
+                opcode: format!("0x{:02X}", opcode),
+                status: "错误".into(),
+                detail: op_summary,
+                rtt_ms: String::new(),
+            });
+            return;
         }
         if matches!(opcode, 0x41 | 0x44) {
             let consent = payload.get("value").and_then(Value::as_u64).unwrap_or(0);
@@ -1807,6 +1857,7 @@ impl MeshBcTesterApp {
         }
     }
 
+    #[cfg(test)]
     fn transfer_ack_timeout_for(&self, transfer: &ActiveTransfer) -> Duration {
         let timeout_secs = if transfer.kind == TransferKind::BcOta
             && transfer.waiting_ack_opcode == Some(0x41)
@@ -1819,6 +1870,7 @@ impl MeshBcTesterApp {
         Duration::from_secs(timeout_secs)
     }
 
+    #[cfg(test)]
     fn collect_transfer_timeouts(&mut self) {
         let now = Instant::now();
         let mut timed_out = Vec::new();
@@ -1856,61 +1908,69 @@ impl MeshBcTesterApp {
         let timeout = Duration::from_secs(DEVICE_OFFLINE_TIMEOUT_SECS);
         let now = Instant::now();
         for (device_id, last_seen_at) in &self.device_last_seen_at {
-            if now.duration_since(*last_seen_at) >= timeout {
-                if let Some(state) = self.runtime_states.get_mut(device_id) {
-                    state.online = false;
-                }
+            if now.duration_since(*last_seen_at) >= timeout
+                && let Some(state) = self.runtime_states.get_mut(device_id)
+            {
+                state.online = false;
             }
         }
     }
 
     fn cancel_transfers_for_devices(&mut self, device_ids: &[u64]) {
-        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
-        let mut cancelled = Vec::new();
-        for transfer in &mut self.active_transfers {
-            if device_ids.contains(&transfer.device_local_id) {
-                transfer.terminal = true;
-                transfer.succeeded = false;
-                transfer.waiting_ack_opcode = None;
-                transfer.waiting_since = None;
-                transfer.status = "已取消".into();
-                transfer.paused = false;
-                cancelled.push((
-                    transfer.device_name.clone(),
-                    transfer.device_id.clone(),
-                    transfer.down_topic.clone(),
-                    transfer.kind.label().to_string(),
-                ));
-            }
+        self.transfer_engine
+            .send(TransferEngineCommand::CancelDevices(device_ids.to_vec()));
+        #[cfg(not(test))]
+        {
+            let _ = device_ids;
         }
-        for (device_name, device_id, down_topic, kind_label) in cancelled {
-            let device_id_for_lookup = device_id.clone();
-            self.append_log(LogEntry {
-                timestamp: now_display(),
-                direction: LogDirection::System,
-                device_name: device_name.clone(),
-                device_id: device_id.clone(),
-                topic: down_topic.clone(),
-                opcode: "-".into(),
-                status: "取消".into(),
-                summary: format!("{kind_label} 传输已取消"),
-                payload: String::new(),
-            });
-            self.append_operation(OperationRecord {
-                timestamp: now_display(),
-                device_name: device_name.clone(),
-                opcode: kind_label.clone(),
-                status: "取消".into(),
-                detail: "传输已取消".into(),
-                rtt_ms: String::new(),
-            });
-            if let Some(device) = self
-                .config
-                .devices
-                .iter()
-                .find(|device| device.device_id == device_id_for_lookup)
-            {
-                if let Some(state) = self.runtime_states.get_mut(&device.local_id) {
+        #[cfg(test)]
+        {
+            let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+            let mut cancelled = Vec::new();
+            for transfer in &mut self.active_transfers {
+                if device_ids.contains(&transfer.device_local_id) {
+                    transfer.terminal = true;
+                    transfer.succeeded = false;
+                    transfer.waiting_ack_opcode = None;
+                    transfer.waiting_since = None;
+                    transfer.status = "已取消".into();
+                    transfer.paused = false;
+                    cancelled.push((
+                        transfer.device_name.clone(),
+                        transfer.device_id.clone(),
+                        transfer.down_topic.clone(),
+                        transfer.kind.label().to_string(),
+                    ));
+                }
+            }
+            for (device_name, device_id, down_topic, kind_label) in cancelled {
+                let device_id_for_lookup = device_id.clone();
+                self.append_log(LogEntry {
+                    timestamp: now_display(),
+                    direction: LogDirection::System,
+                    device_name: device_name.clone(),
+                    device_id: device_id.clone(),
+                    topic: down_topic.clone(),
+                    opcode: "-".into(),
+                    status: "取消".into(),
+                    summary: format!("{kind_label} 传输已取消"),
+                    payload: String::new(),
+                });
+                self.append_operation(OperationRecord {
+                    timestamp: now_display(),
+                    device_name: device_name.clone(),
+                    opcode: kind_label.clone(),
+                    status: "取消".into(),
+                    detail: "传输已取消".into(),
+                    rtt_ms: String::new(),
+                });
+                if let Some(device) = self
+                    .config
+                    .devices
+                    .iter()
+                    .find(|device| device.device_id == device_id_for_lookup)
+                    && let Some(state) = self.runtime_states.get_mut(&device.local_id)
+                {
                     Self::set_device_result(state, "取消", format!("{kind_label} 传输已取消"));
                 }
             }
@@ -1918,46 +1978,73 @@ impl MeshBcTesterApp {
     }
 
     fn retry_failed_transfers_for_devices(&mut self, device_ids: &[u64]) {
-        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
-        for transfer in &mut self.active_transfers {
-            if !device_ids.contains(&transfer.device_local_id) {
-                continue;
-            }
-            if transfer.terminal && !transfer.succeeded {
-                transfer.terminal = false;
-                transfer.status = "重新排队".into();
-                transfer.next_index = transfer.last_sent_index.unwrap_or(0);
-                transfer.waiting_ack_opcode = None;
-                transfer.waiting_since = None;
-                transfer.next_send_at = Instant::now();
-                transfer.retry_count = 0;
-                transfer.paused = false;
-                if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
-                    Self::set_device_result(state, "重试", "失败传输重新排队".into());
+        self.transfer_engine
+            .send(TransferEngineCommand::RetryDevices(device_ids.to_vec()));
+        #[cfg(test)]
+        {
+            let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+            for transfer in &mut self.active_transfers {
+                if !device_ids.contains(&transfer.device_local_id) {
+                    continue;
+                }
+                if transfer.terminal && !transfer.succeeded {
+                    transfer.terminal = false;
+                    transfer.status = "重新排队".into();
+                    transfer.next_index = transfer.last_sent_index.unwrap_or(0);
+                    transfer.waiting_ack_opcode = None;
+                    transfer.waiting_since = None;
+                    transfer.next_send_at = Instant::now();
+                    transfer.retry_count = 0;
+                    transfer.paused = false;
+                    if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                        Self::set_device_result(state, "重试", "失败传输重新排队".into());
+                    }
                 }
             }
         }
     }
 
     fn resume_transfers_for_devices(&mut self, device_ids: &[u64]) {
-        let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
-        for transfer in &mut self.active_transfers {
-            if device_ids.contains(&transfer.device_local_id)
-                && transfer.paused
-                && !transfer.terminal
-            {
-                transfer.paused = false;
-                transfer.status = "继续传输".into();
-                transfer.next_send_at = Instant::now();
-                if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
-                    Self::set_device_result(state, "继续", "继续传输".into());
+        self.transfer_engine
+            .send(TransferEngineCommand::ResumeDevices(device_ids.to_vec()));
+        #[cfg(test)]
+        {
+            let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+            for transfer in &mut self.active_transfers {
+                if device_ids.contains(&transfer.device_local_id)
+                    && transfer.paused
+                    && !transfer.terminal
+                {
+                    transfer.paused = false;
+                    transfer.status = "继续传输".into();
+                    transfer.next_send_at = Instant::now();
+                    if let Some(state) = self.runtime_states.get_mut(&transfer.device_local_id) {
+                        Self::set_device_result(state, "继续", "继续传输".into());
+                    }
                 }
             }
         }
     }
 
     fn clear_terminal_transfers(&mut self) {
+        self.transfer_engine
+            .send(TransferEngineCommand::ClearTerminal);
+        #[cfg(test)]
         self.active_transfers.retain(|transfer| !transfer.terminal);
+    }
+
+    fn clear_terminal_transfers_for_devices(&mut self, device_ids: &[u64]) {
+        self.transfer_engine
+            .send(TransferEngineCommand::ClearTerminalDevices(
+                device_ids.to_vec(),
+            ));
+        #[cfg(test)]
+        {
+            let device_ids = device_ids.iter().copied().collect::<BTreeSet<_>>();
+            self.active_transfers.retain(|transfer| {
+                !(transfer.terminal && device_ids.contains(&transfer.device_local_id))
+            });
+        }
     }
 
     fn export_evidence(&mut self) {
@@ -2083,14 +2170,14 @@ impl MeshBcTesterApp {
             .collect::<Vec<_>>();
 
         let transfers = self
-            .active_transfers
+            .transfer_snapshots
             .iter()
             .map(|transfer| {
                 serde_json::json!({
                     "device_name": transfer.device_name,
                     "device_id": transfer.device_id,
                     "kind": transfer.kind.label(),
-                    "progress": transfer_display_progress(transfer),
+                    "progress": transfer_snapshot_display_progress(transfer),
                     "waiting_ack_opcode": transfer.waiting_ack_opcode.map(|opcode| format!("0x{:02X}", opcode)),
                     "retry_count": transfer.retry_count,
                     "max_retries": transfer.max_retries,
@@ -2178,10 +2265,17 @@ impl MeshBcTesterApp {
                 "use_tls": self.broker_editor.use_tls,
             },
                 "transfer_settings": {
+                    "ota": {
                     "packet_delay_ms": self.transfer_packet_delay_ms,
                     "ack_timeout_secs": self.transfer_ack_timeout_secs,
                     "bc_ota_start_ack_timeout_secs": self.bc_ota_start_ack_timeout_secs,
                     "max_retries": self.transfer_max_retries,
+                    },
+                    "voice": {
+                        "packet_delay_ms": self.voice_transfer_packet_delay_ms,
+                        "ack_timeout_secs": self.voice_transfer_ack_timeout_secs,
+                        "max_retries": self.voice_transfer_max_retries,
+                    },
                 },
             "device_states": device_states,
             "pending_requests": pending,
@@ -2206,6 +2300,7 @@ impl MeshBcTesterApp {
         }
     }
 
+    #[cfg(test)]
     fn retry_or_fail_transfer(&mut self, index: usize, retry_packet_index: usize, reason: String) {
         let transfer = &mut self.active_transfers[index];
         apply_transfer_retry_state(
@@ -2231,6 +2326,8 @@ impl MeshBcTesterApp {
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
+            discovery_section_had_candidates: false,
+            device_editor_active_id: None,
             selected_log_index: None,
             command_key: "query_bc_info".into(),
             command_form: BTreeMap::new(),
@@ -2239,10 +2336,12 @@ impl MeshBcTesterApp {
             connection_status: "未连接".into(),
             broker_connected: false,
             mqtt: MqttRuntime::default(),
+            transfer_engine: TransferEngine::new(),
             runtime_states: HashMap::new(),
             logs: Vec::new(),
             recent_operations: Vec::new(),
             show_selected_logs_only: false,
+            follow_latest_logs: true,
             log_filter_text: String::new(),
             ota_transfer_kind: TransferKind::BcOta,
             ota_transfer_file: String::new(),
@@ -2254,17 +2353,23 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
             bc_ota_start_ack_timeout_secs: BC_OTA_START_ACK_TIMEOUT_SECS,
             transfer_max_retries: TRANSFER_MAX_RETRIES,
+            voice_transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
+            voice_transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
+            voice_transfer_max_retries: TRANSFER_MAX_RETRIES,
             system_notice: String::new(),
             needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
             pending_requests: Vec::new(),
+            transfer_snapshots: Vec::new(),
+            #[cfg(test)]
             active_transfers: Vec::new(),
             device_last_seen_at: HashMap::new(),
         }
     }
 }
 
+#[cfg(test)]
 fn apply_transfer_retry_state(
     transfer: &mut ActiveTransfer,
     retry_packet_index: usize,
@@ -2327,95 +2432,25 @@ fn match_pending_request_index(
 impl eframe::App for MeshBcTesterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_mqtt_events();
+        self.process_transfer_engine_events();
         self.poll_pending_file_dialog();
-        self.tick_active_transfers();
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(100));
-        Self::apply_visual_style(&ctx);
+        ctx.set_theme(match self.config.ui_theme_mode {
+            UiThemeMode::Dark => egui::Theme::Dark,
+            UiThemeMode::Light => egui::Theme::Light,
+        });
+        Self::apply_visual_style(&ctx, self.config.ui_theme_mode);
         let panel_style = ctx.global_style();
         let panel_style = panel_style.as_ref();
 
         egui::Panel::top("top_bar")
-            .frame(Self::top_bottom_panel_frame(panel_style))
+            .frame(Self::top_toolbar_frame(panel_style))
             .show_inside(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Mesh BC").strong().color(rgb(142, 226, 255)));
-                    Self::compact_text_edit_hint(ui, 110.0, &mut self.broker_editor.name, "代理");
-                    Self::compact_text_edit_hint(ui, 160.0, &mut self.broker_editor.host, "地址");
-                    Self::compact_widget(
-                        ui,
-                        54.0,
-                        egui::DragValue::new(&mut self.broker_editor.port).range(1..=65535),
-                    );
-                    Self::compact_text_edit_hint(
-                        ui,
-                        100.0,
-                        &mut self.broker_editor.username,
-                        "用户",
-                    );
-                    Self::compact_widget(
-                        ui,
-                        120.0,
-                        TextEdit::singleline(&mut self.broker_editor.password)
-                            .password(true)
-                            .hint_text("密码"),
-                    );
-                    Self::compact_text_edit_hint(
-                        ui,
-                        110.0,
-                        &mut self.broker_editor.client_id,
-                        "客户端ID",
-                    );
-                    Self::compact_widget(
-                        ui,
-                        46.0,
-                        egui::DragValue::new(&mut self.broker_editor.keepalive_secs)
-                            .range(5..=3600),
-                    );
-                    ui.checkbox(&mut self.broker_editor.use_tls, "TLS");
-                    if Self::primary_button(ui, "连接").clicked() {
-                        self.connect();
-                    }
-                    if Self::secondary_button(ui, "断开").clicked() {
-                        self.mqtt.disconnect();
-                    }
-                    if Self::secondary_button(ui, "导出结果").clicked() {
-                        self.export_evidence();
-                    }
-                    let connection_tone = if self.broker_connected {
-                        ChipTone::Success
-                    } else {
-                        ChipTone::Neutral
-                    };
-                    Self::status_chip(ui, "状态", &self.connection_status, connection_tone);
-                });
+                self.render_top_toolbar(ui);
                 if !self.system_notice.is_empty() {
                     Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
                 }
-            });
-
-        egui::Panel::bottom("status_bar")
-            .frame(Self::top_bottom_panel_frame(panel_style))
-            .show_inside(ui, |ui| {
-                let online_count = self
-                    .runtime_states
-                    .values()
-                    .filter(|state| state.online)
-                    .count();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("连接状态: {}", self.connection_status));
-                    ui.separator();
-                    ui.label(format!("已配置设备: {}", self.config.devices.len()));
-                    ui.separator();
-                    ui.label(format!("在线设备: {}", online_count));
-                    ui.separator();
-                    ui.label(format!("已选设备: {}", self.selected_devices.len()));
-                    ui.separator();
-                    ui.label(format!("等待应答: {}", self.pending_requests.len()));
-                    ui.separator();
-                    ui.label(format!("日志条数: {}", self.logs.len()));
-                });
             });
 
         egui::Panel::left("devices_panel")
@@ -2424,1067 +2459,21 @@ impl eframe::App for MeshBcTesterApp {
             .min_size(220.0)
             .frame(Self::side_panel_frame(panel_style))
             .show_inside(ui, |ui| {
-                Self::panel_card_collapsible(ui, "devices_card", "设备工作台", |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            for (index, device) in self.config.devices.iter().enumerate() {
-                                let selected = self.selected_devices.contains(&device.local_id);
-                                ui.horizontal(|ui| {
-                                    let mut checked = selected;
-                                    if ui.checkbox(&mut checked, "").changed() {
-                                        if checked {
-                                            self.selected_devices.insert(device.local_id);
-                                        } else {
-                                            self.selected_devices.remove(&device.local_id);
-                                        }
-                                    }
-                                    let state = self
-                                        .runtime_states
-                                        .get(&device.local_id)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    ui.vertical(|ui| {
-                                        ui.label(RichText::new(&device.name).strong());
-                                        let online_label =
-                                            if state.online { "在线" } else { "离线" };
-                                        let rtt_text = if state.last_rtt_ms.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" · {}ms", state.last_rtt_ms)
-                                        };
-                                        ui.small(format!(
-                                            "{} · {} · RX {} TX {} 待{}{}",
-                                            online_label,
-                                            device.device_id,
-                                            state.rx_count,
-                                            state.tx_count,
-                                            state.pending_count,
-                                            rtt_text
-                                        ));
-                                        if let Some(summary) =
-                                            Self::device_secondary_summary(&state)
-                                        {
-                                            ui.small(summary);
-                                        }
-                                        if selected {
-                                            if let Some(extra) =
-                                                Self::device_selected_detail_summary(&state)
-                                            {
-                                                ui.small(extra);
-                                            }
-                                        }
-                                    });
-                                    if ui.button("编辑").clicked() {
-                                        self.device_editor = DeviceEditor::from_device(device);
-                                    }
-                                });
-                                if index + 1 < self.config.devices.len() {
-                                    ui.add_space(2.0);
-                                }
-                            }
-                        });
-                });
-
-                Self::panel_card_collapsible(ui, "discovery_card", "自动发现", |ui| {
-                    ui.checkbox(&mut self.auto_discovery_enabled, "从主动上报生成候选设备");
-                    ui.checkbox(&mut self.auto_import_discovered, "发现后自动导入设备资源");
-                    ui.horizontal(|ui| {
-                        ui.label(format!("候选设备: {}", self.discovered_devices.len()));
-                        if !self.discovered_devices.is_empty()
-                            && Self::secondary_button(ui, "导入全部").clicked()
-                        {
-                            let ids = self
-                                .discovered_devices
-                                .iter()
-                                .map(|candidate| candidate.device_id.clone())
-                                .collect::<Vec<_>>();
-                            for device_id in ids {
-                                self.import_discovered_device_by_id(&device_id);
-                            }
-                        }
-                        if !self.discovered_devices.is_empty()
-                            && Self::secondary_button(ui, "清空候选").clicked()
-                        {
-                            self.discovered_devices.clear();
-                        }
-                    });
-                    ui.small("依据 MQTT 主题中的设备ID以及心跳/事件/设备信息上报生成候选资源。");
-
-                    if self.discovered_devices.is_empty() {
-                        ui.label("当前没有待导入的发现设备。");
-                    } else {
-                        let mut import_ids = Vec::new();
-                        let mut edit_ids = Vec::new();
-                        let mut remove_ids = Vec::new();
-                        egui::ScrollArea::vertical()
-                            .max_height(240.0)
-                            .id_salt("discovered-devices-scroll")
-                            .show(ui, |ui| {
-                                for candidate in &self.discovered_devices {
-                                    Self::panel_card_frame(ui).show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(&candidate.suggested_name).strong(),
-                                            );
-                                            ui.label(format!("· {}", candidate.device_id));
-                                        });
-                                        ui.small(format!(
-                                            "{} · {} · 次数 {}",
-                                            if candidate.dev_model.is_empty() {
-                                                candidate.discovery_reason.as_str()
-                                            } else {
-                                                candidate.dev_model.as_str()
-                                            },
-                                            candidate.last_opcode,
-                                            candidate.seen_count
-                                        ));
-                                        ui.small(format!(
-                                            "上次: {} · addr {}",
-                                            candidate.last_seen,
-                                            candidate
-                                                .default_dest_addr
-                                                .map(|addr| format!("0x{addr:04X}"))
-                                                .unwrap_or_else(|| "-".into())
-                                        ));
-                                        ui.small(&candidate.last_summary);
-                                        ui.horizontal(|ui| {
-                                            if Self::primary_button(ui, "导入").clicked() {
-                                                import_ids.push(candidate.device_id.clone());
-                                            }
-                                            if Self::secondary_button(ui, "填入编辑").clicked()
-                                            {
-                                                edit_ids.push(candidate.device_id.clone());
-                                            }
-                                            if Self::secondary_button(ui, "移除").clicked() {
-                                                remove_ids.push(candidate.device_id.clone());
-                                            }
-                                        });
-                                    });
-                                }
-                            });
-
-                        for device_id in import_ids {
-                            self.import_discovered_device_by_id(&device_id);
-                        }
-                        for device_id in edit_ids {
-                            self.load_discovered_device_into_editor(&device_id);
-                        }
-                        if !remove_ids.is_empty() {
-                            self.discovered_devices
-                                .retain(|candidate| !remove_ids.contains(&candidate.device_id));
-                        }
-                    }
-                });
-
-                Self::panel_card_collapsible(ui, "device_editor_card", "设备编辑", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("名称");
-                        Self::compact_text_edit(ui, 232.0, &mut self.device_editor.name);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("设备ID");
-                        let response =
-                            Self::compact_text_edit(ui, 220.0, &mut self.device_editor.device_id);
-                        if response.changed() && !self.device_editor.device_id.trim().is_empty() {
-                            let (up, down) =
-                                DeviceProfile::default_topics(self.device_editor.device_id.trim());
-                            if self.device_editor.up_topic.is_empty() {
-                                self.device_editor.up_topic = up;
-                            }
-                            if self.device_editor.down_topic.is_empty() {
-                                self.device_editor.down_topic = down;
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("上行主题");
-                        Self::compact_text_edit(ui, 220.0, &mut self.device_editor.up_topic);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("下行主题");
-                        Self::compact_text_edit(ui, 220.0, &mut self.device_editor.down_topic);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Mesh类型");
-                        Self::compact_widget(
-                            ui,
-                            56.0,
-                            egui::DragValue::new(&mut self.device_editor.mesh_dev_type)
-                                .range(0..=255),
-                        );
-                        ui.label("目标地址");
-                        Self::compact_widget(
-                            ui,
-                            56.0,
-                            egui::DragValue::new(&mut self.device_editor.default_dest_addr)
-                                .range(1..=65535),
-                        );
-                    });
-                    ui.checkbox(&mut self.device_editor.subscribe_enabled, "订阅上行主题");
-                    ui.horizontal(|ui| {
-                        if Self::primary_button(ui, "保存设备").clicked() {
-                            self.save_device_editor();
-                        }
-                        if Self::secondary_button(ui, "清空").clicked() {
-                            self.device_editor = DeviceEditor {
-                                mesh_dev_type: 1,
-                                default_dest_addr: 1,
-                                subscribe_enabled: true,
-                                ..Default::default()
-                            };
-                        }
-                        if Self::secondary_button(ui, "删除已选").clicked() {
-                            self.config
-                                .devices
-                                .retain(|device| !self.selected_devices.contains(&device.local_id));
-                            self.selected_devices.clear();
-                            self.sync_subscriptions();
-                            let _ = save_config(&self.config);
-                        }
-                    });
-                });
+                self.render_left_sidebar(ui);
             });
 
         egui::Panel::right("actions_panel")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(320.0)
             .min_size(220.0)
+            .max_size(380.0)
             .frame(Self::side_panel_frame(panel_style))
             .show_inside(ui, |ui| {
-                Self::panel_card_collapsible(ui, "preset_commands", "预置命令", |ui| {
-                    egui::ComboBox::from_label("命令")
-                        .width(180.0)
-                        .selected_text(
-                            command_by_key(&self.command_key)
-                                .map(|spec| spec.label)
-                                .unwrap_or("未知命令"),
-                        )
-                        .show_ui(ui, |ui| {
-                            for spec in COMMANDS {
-                                if ui
-                                    .selectable_label(self.command_key == spec.key, spec.label)
-                                    .clicked()
-                                {
-                                    self.command_key = spec.key.to_string();
-                                    self.command_form = default_form_for_command(&self.command_key);
-                                }
-                            }
-                        });
-
-                    if let Some(spec) = command_by_key(&self.command_key) {
-                        if spec.include_dest_addr {
-                            ui.horizontal(|ui| {
-                                ui.label("目标地址");
-                                let entry = self
-                                    .command_form
-                                    .entry("dest_addr".into())
-                                    .or_insert_with(|| "1".into());
-                                Self::compact_text_edit(ui, 90.0, entry);
-                            });
-                        }
-                        for field in spec.fields {
-                            ui.horizontal(|ui| {
-                                ui.label(field.label);
-                                let value = self
-                                    .command_form
-                                    .entry(field.key.to_string())
-                                    .or_insert_with(|| field.default.to_string());
-                                match field.kind {
-                                    FieldKind::Text | FieldKind::Integer => {
-                                        Self::compact_text_edit(ui, 190.0, value);
-                                    }
-                                    FieldKind::Choice(choices) => {
-                                        egui::ComboBox::from_id_salt(field.key)
-                                            .width(190.0)
-                                            .selected_text(value.clone())
-                                            .show_ui(ui, |ui| {
-                                                for choice in choices {
-                                                    ui.selectable_value(
-                                                        value,
-                                                        choice.value.to_string(),
-                                                        choice.label,
-                                                    );
-                                                }
-                                            });
-                                    }
-                                }
-                            });
-                        }
-                        if Self::primary_button(ui, "发送预置命令").clicked() {
-                            let Some(devices) = self.ensure_selected_devices() else {
-                                return;
-                            };
-                            let mut items = Vec::new();
-                            for device in devices {
-                                match build_command_payload(spec, &device, &self.command_form) {
-                                    Ok(payload) => items.push((device, payload)),
-                                    Err(err) => self.system_notice = err,
-                                }
-                            }
-                            if self.should_confirm_preset_send(spec.key, items.len()) {
-                                self.pending_confirmation = Some(PendingConfirmation {
-                                    title: "确认发送预置命令".into(),
-                                    detail: format!(
-                                        "命令：{}，目标设备：{} 台",
-                                        spec.label,
-                                        items.len()
-                                    ),
-                                    action: PendingAction::PresetSend { items },
-                                });
-                            } else {
-                                self.execute_preset_send(items);
-                            }
-                        }
-                    }
-                });
-
-                Self::panel_card_collapsible(ui, "raw_json_card", "原始 JSON", |ui| {
-                    ui.add(
-                        TextEdit::multiline(&mut self.raw_json_text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(7)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("期望应答");
-                        Self::compact_widget(
-                            ui,
-                            86.0,
-                            TextEdit::singleline(&mut self.raw_expected_opcode)
-                                .hint_text("如 0x47"),
-                        );
-                    });
-                    if Self::primary_button(ui, "发送原始 JSON").clicked() {
-                        match serde_json::from_str::<Value>(&self.raw_json_text) {
-                            Ok(payload @ Value::Object(_)) => {
-                                if let Some(opcode) = payload.get("opcode") {
-                                    let opcode_text = opcode.to_string().replace('"', "");
-                                    if parse_opcode(&opcode_text).is_err() {
-                                        self.system_notice =
-                                            "opcode 必须是十进制整数或 0x 十六进制字符串".into();
-                                    } else {
-                                        let expected_override =
-                                            if self.raw_expected_opcode.trim().is_empty() {
-                                                None
-                                            } else {
-                                                match parse_opcode(&self.raw_expected_opcode) {
-                                                    Ok(opcode) => Some(opcode),
-                                                    Err(err) => {
-                                                        self.system_notice =
-                                                            format!("期望应答操作码无效: {err}");
-                                                        return;
-                                                    }
-                                                }
-                                            };
-                                        let Some(devices) = self.ensure_selected_devices() else {
-                                            return;
-                                        };
-                                        let opcode_num = parse_opcode(&opcode_text).unwrap_or(0);
-                                        let mut items = Vec::new();
-                                        for device in devices {
-                                            match self.normalize_raw_payload_for_device(
-                                                payload.clone(),
-                                                &device,
-                                            ) {
-                                                Ok(normalized) => items.push((
-                                                    device,
-                                                    normalized,
-                                                    expected_override,
-                                                )),
-                                                Err(err) => {
-                                                    self.system_notice = err;
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        if self.should_confirm_raw_send(opcode_num, items.len()) {
-                                            self.pending_confirmation = Some(PendingConfirmation {
-                                                title: "确认发送原始 JSON".into(),
-                                                detail: format!(
-                                                    "操作码：0x{:02X}，目标设备：{} 台",
-                                                    opcode_num,
-                                                    items.len()
-                                                ),
-                                                action: PendingAction::RawSend { items },
-                                            });
-                                        } else {
-                                            self.execute_raw_send(items);
-                                        }
-                                    }
-                                } else {
-                                    self.system_notice = "原始 JSON 必须包含 opcode 字段".into();
-                                }
-                            }
-                            Ok(_) => self.system_notice = "原始负载必须是 JSON 对象".into(),
-                            Err(err) => self.system_notice = err.to_string(),
-                        }
-                    }
-                });
-
-                Self::panel_card_collapsible(ui, "ota_transfer_card", "OTA升级", |ui| {
-                    egui::ComboBox::from_label("升级类型")
-                        .width(180.0)
-                        .selected_text(self.ota_transfer_kind.label())
-                        .show_ui(ui, |ui| {
-                            for kind in [TransferKind::BcOta, TransferKind::AOta] {
-                                ui.selectable_value(
-                                    &mut self.ota_transfer_kind,
-                                    kind,
-                                    kind.label(),
-                                );
-                            }
-                        });
-                    ui.horizontal(|ui| {
-                        ui.label("固件文件");
-                        Self::compact_text_edit(ui, 170.0, &mut self.ota_transfer_file);
-                        if Self::secondary_button(ui, "浏览").clicked() {
-                            self.pick_ota_transfer_file();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("版本");
-                        Self::compact_widget(
-                            ui,
-                            52.0,
-                            egui::DragValue::new(&mut self.transfer_version).range(0..=255),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("包间隔(ms)");
-                        Self::compact_widget(
-                            ui,
-                            60.0,
-                            egui::DragValue::new(&mut self.transfer_packet_delay_ms)
-                                .range(1..=5_000),
-                        );
-                        ui.label("ACK超时(s)");
-                        Self::compact_widget(
-                            ui,
-                            60.0,
-                            egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
-                                .range(1..=300),
-                        );
-                        ui.label("BC起始ACK(s)");
-                        Self::compact_widget(
-                            ui,
-                            60.0,
-                            egui::DragValue::new(&mut self.bc_ota_start_ack_timeout_secs)
-                                .range(1..=300),
-                        );
-                        ui.label("最大重试");
-                        Self::compact_widget(
-                            ui,
-                            48.0,
-                            egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
-                        );
-                    });
-                    if Self::primary_button(ui, "发起 OTA 升级").clicked() {
-                        self.start_transfer(
-                            self.ota_transfer_kind,
-                            self.ota_transfer_file.clone(),
-                            self.transfer_version,
-                            String::new(),
-                        );
-                    }
-                });
-
-                Self::panel_card_collapsible(ui, "voice_transfer_card", "声音传输", |ui| {
-                    ui.small("声音播放控制请使用上方预置命令中的“播放声音文件 (0x5A)”。");
-                    egui::ComboBox::from_label("传输类型")
-                        .width(180.0)
-                        .selected_text(self.voice_transfer_kind.label())
-                        .show_ui(ui, |ui| {
-                            for kind in [TransferKind::VoiceFile, TransferKind::RealtimeVoice] {
-                                ui.selectable_value(
-                                    &mut self.voice_transfer_kind,
-                                    kind,
-                                    kind.label(),
-                                );
-                            }
-                        });
-                    ui.horizontal(|ui| {
-                        ui.label("声音文件");
-                        Self::compact_text_edit(ui, 170.0, &mut self.voice_transfer_file);
-                        if Self::secondary_button(ui, "浏览").clicked() {
-                            self.pick_voice_transfer_file();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("声音文件名");
-                        Self::compact_text_edit(ui, 170.0, &mut self.transfer_voice_name);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("包间隔(ms)");
-                        Self::compact_widget(
-                            ui,
-                            60.0,
-                            egui::DragValue::new(&mut self.transfer_packet_delay_ms)
-                                .range(1..=5_000),
-                        );
-                        ui.label("ACK超时(s)");
-                        Self::compact_widget(
-                            ui,
-                            60.0,
-                            egui::DragValue::new(&mut self.transfer_ack_timeout_secs)
-                                .range(1..=300),
-                        );
-                        ui.label("最大重试");
-                        Self::compact_widget(
-                            ui,
-                            48.0,
-                            egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
-                        );
-                    });
-                    if Self::primary_button(ui, "发起声音传输").clicked() {
-                        self.start_transfer(
-                            self.voice_transfer_kind,
-                            self.voice_transfer_file.clone(),
-                            self.transfer_version,
-                            self.transfer_voice_name.clone(),
-                        );
-                    }
-                });
+                self.render_right_actions_panel(ui);
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            Self::paint_tech_background(ui);
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading(RichText::new("实时工作区").color(rgb(142, 226, 255)));
-                    Self::stat_chip(ui, "已配置设备", self.config.devices.len().to_string());
-                    Self::stat_chip(ui, "已选设备", self.selected_devices.len().to_string());
-                    let total_rx: u64 = self
-                        .runtime_states
-                        .values()
-                        .map(|state| state.rx_count)
-                        .sum();
-                    let total_tx: u64 = self
-                        .runtime_states
-                        .values()
-                        .map(|state| state.tx_count)
-                        .sum();
-                    Self::stat_chip(ui, "总接收", total_rx.to_string());
-                    Self::stat_chip(ui, "总发送", total_tx.to_string());
-                    Self::stat_chip(ui, "待应答", self.pending_requests.len().to_string());
-                    Self::stat_chip(ui, "传输中", self.active_transfers.len().to_string());
-                    ui.checkbox(&mut self.show_selected_logs_only, "仅显示已选设备日志");
-                });
-            });
-
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                Self::section_heading(ui, "请求状态");
-                if self.pending_requests.is_empty() {
-                    ui.label("当前没有待应答请求。");
-                } else {
-                    let now = Instant::now();
-                    TableBuilder::new(ui)
-                        .id_salt("request-status-table")
-                        .striped(true)
-                        .column(Column::initial(120.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::remainder())
-                        .min_scrolled_height(72.0)
-                        .header(18.0, |mut header| {
-                            header.col(|ui| {
-                                ui.strong("设备");
-                            });
-                            header.col(|ui| {
-                                ui.strong("请求");
-                            });
-                            header.col(|ui| {
-                                ui.strong("等待");
-                            });
-                            header.col(|ui| {
-                                ui.strong("时间戳");
-                            });
-                            header.col(|ui| {
-                                ui.strong("主题");
-                            });
-                        })
-                        .body(|mut body| {
-                            for request in &self.pending_requests {
-                                body.row(18.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(&request.device_name);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(format!(
-                                            "0x{:02X} -> 0x{:02X}",
-                                            request.opcode, request.expected_opcode
-                                        ));
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(format!(
-                                            "{}ms",
-                                            now.duration_since(request.sent_at).as_millis()
-                                        ));
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(
-                                            request
-                                                .time_stamp
-                                                .map(|value| value.to_string())
-                                                .unwrap_or_else(|| "-".into()),
-                                        );
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&request.topic);
-                                    });
-                                });
-                            }
-                        });
-                }
-            });
-
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    Self::section_heading(ui, "传输状态");
-                    if self
-                        .active_transfers
-                        .iter()
-                        .any(|transfer| transfer.paused && !transfer.terminal)
-                        && Self::secondary_button(ui, "继续待传输").clicked()
-                    {
-                        let ids = self
-                            .active_transfers
-                            .iter()
-                            .filter(|transfer| transfer.paused && !transfer.terminal)
-                            .map(|transfer| transfer.device_local_id)
-                            .collect::<Vec<_>>();
-                        self.resume_transfers_for_devices(&ids);
-                    }
-                    if self
-                        .active_transfers
-                        .iter()
-                        .any(|transfer| transfer.terminal && !transfer.succeeded)
-                        && Self::secondary_button(ui, "重试失败").clicked()
-                    {
-                        let ids = self
-                            .active_transfers
-                            .iter()
-                            .filter(|transfer| transfer.terminal && !transfer.succeeded)
-                            .map(|transfer| transfer.device_local_id)
-                            .collect::<Vec<_>>();
-                        self.retry_failed_transfers_for_devices(&ids);
-                    }
-                    if self
-                        .active_transfers
-                        .iter()
-                        .any(|transfer| transfer.terminal)
-                        && Self::secondary_button(ui, "清除终态").clicked()
-                    {
-                        self.clear_terminal_transfers();
-                    }
-                    if !self.active_transfers.is_empty()
-                        && Self::secondary_button(ui, "取消全部").clicked()
-                    {
-                        let ids = self
-                            .active_transfers
-                            .iter()
-                            .map(|transfer| transfer.device_local_id)
-                            .collect::<Vec<_>>();
-                        self.cancel_transfers_for_devices(&ids);
-                    }
-                });
-                if self.active_transfers.is_empty() {
-                    ui.label("当前没有活跃传输。");
-                } else {
-                    let mut cancel_ids = Vec::new();
-                    let mut resume_ids = Vec::new();
-                    let mut retry_ids = Vec::new();
-                    let mut clear_ids = Vec::new();
-                    TableBuilder::new(ui)
-                        .id_salt("transfer-status-table")
-                        .striped(true)
-                        .column(Column::initial(120.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(90.0))
-                        .column(Column::initial(180.0))
-                        .column(Column::initial(70.0))
-                        .column(Column::initial(70.0))
-                        .column(Column::remainder())
-                        .min_scrolled_height(72.0)
-                        .header(18.0, |mut header| {
-                            header.col(|ui| {
-                                ui.strong("设备");
-                            });
-                            header.col(|ui| {
-                                ui.strong("类型");
-                            });
-                            header.col(|ui| {
-                                ui.strong("进度");
-                            });
-                            header.col(|ui| {
-                                ui.strong("等待ACK");
-                            });
-                            header.col(|ui| {
-                                ui.strong("失败点");
-                            });
-                            header.col(|ui| {
-                                ui.strong("失败原因");
-                            });
-                            header.col(|ui| {
-                                ui.strong("重试");
-                            });
-                            header.col(|ui| {
-                                ui.strong("操作");
-                            });
-                            header.col(|ui| {
-                                ui.strong("状态");
-                            });
-                        })
-                        .body(|mut body| {
-                            for transfer in &self.active_transfers {
-                                body.row(18.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(&transfer.device_name);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(transfer.kind.label());
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(transfer_display_progress(transfer));
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(
-                                            transfer
-                                                .waiting_ack_opcode
-                                                .map(|opcode| format!("0x{:02X}", opcode))
-                                                .unwrap_or_else(|| "-".into()),
-                                        );
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(
-                                            transfer
-                                                .failure_packet_index
-                                                .map(|index| {
-                                                    format!(
-                                                        "#{}",
-                                                        transfer_display_packet_number(
-                                                            transfer.kind,
-                                                            index
-                                                        )
-                                                    )
-                                                })
-                                                .unwrap_or_else(|| "-".into()),
-                                        );
-                                    });
-                                    row.col(|ui| {
-                                        if transfer.last_failure_reason.is_empty() {
-                                            ui.label("-");
-                                        } else {
-                                            ui.label(&transfer.last_failure_reason);
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(format!(
-                                            "{}/{}",
-                                            transfer.retry_count, transfer.max_retries
-                                        ));
-                                    });
-                                    row.col(|ui| {
-                                        if transfer.paused && !transfer.terminal {
-                                            if Self::secondary_button(ui, "继续").clicked() {
-                                                resume_ids.push(transfer.device_local_id);
-                                            }
-                                        } else if transfer.terminal && !transfer.succeeded {
-                                            if Self::secondary_button(ui, "重试").clicked() {
-                                                retry_ids.push(transfer.device_local_id);
-                                            }
-                                        } else if transfer.terminal {
-                                            if Self::secondary_button(ui, "清理").clicked() {
-                                                clear_ids.push(transfer.device_local_id);
-                                            }
-                                        } else if Self::secondary_button(ui, "取消").clicked() {
-                                            cancel_ids.push(transfer.device_local_id);
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&transfer.status);
-                                    });
-                                });
-                            }
-                        });
-                    if !cancel_ids.is_empty() {
-                        self.cancel_transfers_for_devices(&cancel_ids);
-                    }
-                    if !resume_ids.is_empty() {
-                        self.resume_transfers_for_devices(&resume_ids);
-                    }
-                    if !retry_ids.is_empty() {
-                        self.retry_failed_transfers_for_devices(&retry_ids);
-                    }
-                    if !clear_ids.is_empty() {
-                        self.active_transfers
-                            .retain(|transfer| !clear_ids.contains(&transfer.device_local_id));
-                    }
-                }
-            });
-
-            Self::panel_card_frame(ui).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    Self::section_heading(ui, "最近操作");
-                    if !self.recent_operations.is_empty()
-                        && Self::secondary_button(ui, "清空操作").clicked()
-                    {
-                        self.recent_operations.clear();
-                    }
-                });
-                if self.recent_operations.is_empty() {
-                    ui.label("当前没有最近操作记录。");
-                } else {
-                    TableBuilder::new(ui)
-                        .id_salt("recent-operations-table")
-                        .striped(true)
-                        .column(Column::initial(140.0))
-                        .column(Column::initial(120.0))
-                        .column(Column::initial(110.0))
-                        .column(Column::initial(80.0))
-                        .column(Column::initial(80.0))
-                        .column(Column::remainder())
-                        .min_scrolled_height(80.0)
-                        .header(18.0, |mut header| {
-                            header.col(|ui| {
-                                ui.strong("时间");
-                            });
-                            header.col(|ui| {
-                                ui.strong("设备");
-                            });
-                            header.col(|ui| {
-                                ui.strong("操作");
-                            });
-                            header.col(|ui| {
-                                ui.strong("状态");
-                            });
-                            header.col(|ui| {
-                                ui.strong("RTT");
-                            });
-                            header.col(|ui| {
-                                ui.strong("详情");
-                            });
-                        })
-                        .body(|mut body| {
-                            for op in self.recent_operations.iter().rev().take(20) {
-                                body.row(18.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(&op.timestamp);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&op.device_name);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&op.opcode);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&op.status);
-                                    });
-                                    row.col(|ui| {
-                                        let value = if op.rtt_ms.is_empty() {
-                                            "-".to_string()
-                                        } else {
-                                            op.rtt_ms.clone()
-                                        };
-                                        ui.label(value);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&op.detail);
-                                    });
-                                });
-                            }
-                        });
-                }
-            });
-
-            let filtered_logs: Vec<(usize, LogEntry)> = self
-                .selected_logs()
-                .into_iter()
-                .map(|(index, entry)| (index, entry.clone()))
-                .collect();
-
-            let detail_area_height = ui.available_height().max(260.0);
-            let detail_card_spacing = ui.spacing().item_spacing.y;
-            let side_detail_height = (detail_area_height * 0.34).clamp(140.0, 240.0);
-            let payload_height =
-                (detail_area_height - side_detail_height - detail_card_spacing).max(180.0);
-
-            ui.horizontal_top(|ui| {
-                let total_width = ui.available_width();
-                let gutter = ui.spacing().item_spacing.x;
-                let max_left_width = (total_width - gutter - 260.0).max(320.0);
-                let left_width = (total_width * 0.62).clamp(320.0, max_left_width);
-                let right_width = (total_width - left_width - gutter).max(260.0);
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(left_width, detail_area_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        Self::panel_card_frame(ui).show(ui, |ui| {
-                            Self::section_heading(ui, "消息日志");
-                            ui.horizontal(|ui| {
-                                ui.label("筛选");
-                                Self::compact_widget(
-                                    ui,
-                                    190.0,
-                                    TextEdit::singleline(&mut self.log_filter_text)
-                                        .hint_text("设备 / opcode / 状态 / 主题"),
-                                );
-                                if Self::secondary_button(ui, "清空日志").clicked() {
-                                    self.logs.clear();
-                                    self.selected_log_index = None;
-                                }
-                            });
-                            let log_table_height = (detail_area_height - 76.0).max(180.0);
-                            TableBuilder::new(ui)
-                                .id_salt("message-log-table")
-                                .striped(true)
-                                .column(Column::initial(140.0))
-                                .column(Column::initial(70.0))
-                                .column(Column::initial(120.0))
-                                .column(Column::initial(90.0))
-                                .column(Column::initial(90.0))
-                                .column(Column::initial(160.0))
-                                .column(Column::remainder())
-                                .min_scrolled_height(log_table_height)
-                                .max_scroll_height(log_table_height)
-                                .header(18.0, |mut header| {
-                                    header.col(|ui| {
-                                        ui.strong("时间");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("方向");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("设备");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("操作码");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("状态");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("主题");
-                                    });
-                                    header.col(|ui| {
-                                        ui.strong("摘要");
-                                    });
-                                })
-                                .body(|mut body| {
-                                    for (index, entry) in &filtered_logs {
-                                        body.row(18.0, |mut row| {
-                                            row.col(|ui| {
-                                                if ui
-                                                    .selectable_label(
-                                                        self.selected_log_index == Some(*index),
-                                                        &entry.timestamp,
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.selected_log_index = Some(*index);
-                                                }
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(entry.direction.as_str());
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(&entry.device_name);
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(&entry.opcode);
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(&entry.status);
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(&entry.topic);
-                                            });
-                                            row.col(|ui| {
-                                                ui.label(&entry.summary);
-                                            });
-                                        });
-                                    }
-                                });
-                        });
-                    },
-                );
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(right_width, detail_area_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        Self::panel_card_frame(ui).show(ui, |ui| {
-                            Self::section_heading(ui, "解析详情");
-                            if let Some(index) = self.selected_log_index {
-                                if let Some(entry) = self.logs.get(index) {
-                                    if let Ok(payload) =
-                                        serde_json::from_str::<Value>(&entry.payload)
-                                    {
-                                        let details = decode_payload_details(&payload);
-                                        if details.is_empty() {
-                                            ui.label("当前负载暂无结构化解析。");
-                                        } else {
-                                            TableBuilder::new(ui)
-                                                .id_salt("payload-details-table")
-                                                .striped(true)
-                                                .column(Column::initial(160.0))
-                                                .column(Column::remainder())
-                                                .min_scrolled_height(side_detail_height)
-                                                .max_scroll_height(side_detail_height)
-                                                .body(|mut body| {
-                                                    for (key, value) in details {
-                                                        body.row(18.0, |mut row| {
-                                                            row.col(|ui| {
-                                                                ui.strong(key);
-                                                            });
-                                                            row.col(|ui| {
-                                                                ui.label(value);
-                                                            });
-                                                        });
-                                                    }
-                                                });
-                                        }
-                                    } else {
-                                        ui.label("当前负载不是可解析的 JSON。");
-                                    }
-                                } else {
-                                    ui.label("未选择日志。");
-                                }
-                            } else {
-                                ui.label("未选择日志。");
-                            }
-                        });
-
-                        Self::panel_card_frame(ui).show(ui, |ui| {
-                            Self::section_heading(ui, "当前负载");
-                            if let Some(index) = self.selected_log_index {
-                                if let Some(entry) = self.logs.get(index) {
-                                    let mut payload = entry.payload.clone();
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("current-payload-scroll")
-                                        .max_height(payload_height)
-                                        .show(ui, |ui| {
-                                            ui.add(
-                                                TextEdit::multiline(&mut payload)
-                                                    .font(egui::TextStyle::Monospace)
-                                                    .desired_width(f32::INFINITY)
-                                                    .interactive(false),
-                                            );
-                                        });
-                                } else {
-                                    ui.label("未选择日志。");
-                                }
-                            } else {
-                                ui.label("未选择日志。");
-                            }
-                        });
-                    },
-                );
-            });
+            self.render_central_workspace(ui);
         });
 
         self.show_pending_confirmation_modal(&ctx);
@@ -3496,28 +2485,33 @@ impl eframe::App for MeshBcTesterApp {
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.transfer_max_retries = self.transfer_max_retries;
+        self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
+        self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
+        self.config.voice_transfer_max_retries = self.voice_transfer_max_retries;
         let _ = save_config(&self.config);
         self.mqtt.disconnect();
+        self.transfer_engine
+            .send(TransferEngineCommand::SetPublisher(None));
     }
 }
 
 fn compact_transfer_payload_log(payload: &Value) -> String {
     let mut redacted = redact_json(payload);
-    if let Some(object) = redacted.as_object_mut() {
-        if let Some(value) = object.get_mut("value") {
-            if let Some(text) = value.as_str() {
-                let abbreviated = if text.len() > 32 {
-                    format!("{}...(len={})", &text[..32], text.len())
-                } else {
-                    text.to_string()
-                };
-                *value = Value::String(abbreviated);
-            }
-        }
+    if let Some(object) = redacted.as_object_mut()
+        && let Some(value) = object.get_mut("value")
+        && let Some(text) = value.as_str()
+    {
+        let abbreviated = if text.len() > 32 {
+            format!("{}...(len={})", &text[..32], text.len())
+        } else {
+            text.to_string()
+        };
+        *value = Value::String(abbreviated);
     }
     serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
 }
 
+#[cfg(test)]
 fn transfer_expected_ack_opcode(
     kind: TransferKind,
     opcode: u32,
@@ -3550,6 +2544,7 @@ fn transfer_expected_ack_opcode(
     }
 }
 
+#[cfg(test)]
 fn transfer_sent_last_packet(transfer: &ActiveTransfer) -> bool {
     transfer
         .last_sent_index
@@ -3557,6 +2552,7 @@ fn transfer_sent_last_packet(transfer: &ActiveTransfer) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn transfer_resume_index_after_disconnect(transfer: &ActiveTransfer) -> usize {
     let packet_count = transfer.packets.len();
     let fallback = transfer.next_index.min(packet_count.saturating_sub(1));
@@ -3580,14 +2576,25 @@ fn transfer_display_total_packets(kind: TransferKind, packet_count: usize) -> us
     }
 }
 
-fn transfer_display_completed_packets(transfer: &ActiveTransfer) -> usize {
-    let total = transfer_display_total_packets(transfer.kind, transfer.packets.len());
-    match transfer.kind {
-        TransferKind::BcOta | TransferKind::AOta => {
-            transfer.next_index.saturating_sub(1).min(total)
-        }
-        TransferKind::VoiceFile | TransferKind::RealtimeVoice => transfer.next_index.min(total),
+fn transfer_display_completed_packets_for(
+    kind: TransferKind,
+    next_index: usize,
+    packet_count: usize,
+) -> usize {
+    let total = transfer_display_total_packets(kind, packet_count);
+    match kind {
+        TransferKind::BcOta | TransferKind::AOta => next_index.saturating_sub(1).min(total),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => next_index.min(total),
     }
+}
+
+#[cfg(test)]
+fn transfer_display_completed_packets(transfer: &ActiveTransfer) -> usize {
+    transfer_display_completed_packets_for(
+        transfer.kind,
+        transfer.next_index,
+        transfer.packets.len(),
+    )
 }
 
 fn transfer_display_packet_number(kind: TransferKind, packet_index: usize) -> usize {
@@ -3597,12 +2604,32 @@ fn transfer_display_packet_number(kind: TransferKind, packet_index: usize) -> us
     }
 }
 
+#[cfg(test)]
 fn transfer_display_progress(transfer: &ActiveTransfer) -> String {
     format!(
         "{}/{}",
         transfer_display_completed_packets(transfer),
         transfer_display_total_packets(transfer.kind, transfer.packets.len())
     )
+}
+
+fn transfer_snapshot_display_progress(transfer: &TransferSnapshot) -> String {
+    format!(
+        "{}/{}",
+        transfer_display_completed_packets_for(
+            transfer.kind,
+            transfer.next_index,
+            transfer.packet_count
+        ),
+        transfer_display_total_packets(transfer.kind, transfer.packet_count)
+    )
+}
+
+#[cfg(test)]
+fn should_log_transfer_packet(packet_index: usize, packet_count: usize) -> bool {
+    packet_index == 0
+        || packet_index + 1 >= packet_count
+        || packet_index.is_multiple_of(TRANSFER_PACKET_LOG_INTERVAL)
 }
 
 #[inline]
@@ -3615,6 +2642,34 @@ fn stroke(color: egui::Color32) -> egui::Stroke {
     egui::Stroke::new(1.0_f32, color)
 }
 
+#[inline]
+fn chrome_stroke(dark_mode: bool) -> egui::Stroke {
+    stroke(if dark_mode {
+        rgb(30, 35, 37)
+    } else {
+        rgb(218, 224, 228)
+    })
+}
+
+#[inline]
+fn surface_stroke(dark_mode: bool) -> egui::Stroke {
+    stroke(if dark_mode {
+        rgb(34, 39, 41)
+    } else {
+        rgb(222, 228, 232)
+    })
+}
+
+#[inline]
+fn accent_color() -> egui::Color32 {
+    rgb(42, 108, 255)
+}
+
+#[inline]
+fn accent_text_color() -> egui::Color32 {
+    accent_color()
+}
+
 #[derive(Clone, Copy)]
 struct VisualPalette {
     panel_fill: egui::Color32,
@@ -3623,6 +2678,9 @@ struct VisualPalette {
     extreme_bg_color: egui::Color32,
     code_bg_color: egui::Color32,
     window_stroke: egui::Color32,
+    text_subdued: egui::Color32,
+    text_default: egui::Color32,
+    text_strong: egui::Color32,
     selection_bg_fill: egui::Color32,
     selection_stroke: egui::Color32,
     hyperlink_color: egui::Color32,
@@ -3639,23 +2697,58 @@ struct VisualPalette {
 impl VisualPalette {
     fn dark() -> Self {
         Self {
-            panel_fill: rgb(9, 13, 20),
-            window_fill: rgb(6, 10, 16),
-            faint_bg_color: rgb(14, 22, 34),
-            extreme_bg_color: rgb(4, 7, 12),
-            code_bg_color: rgb(7, 18, 29),
-            window_stroke: rgb(35, 58, 78),
-            selection_bg_fill: rgb(14, 95, 133),
-            selection_stroke: rgb(142, 226, 255),
-            hyperlink_color: rgb(82, 205, 255),
-            inactive_bg_fill: rgb(13, 24, 38),
-            inactive_bg_stroke: rgb(41, 68, 91),
-            hovered_bg_fill: rgb(18, 39, 58),
-            hovered_bg_stroke: rgb(58, 142, 181),
-            active_bg_fill: rgb(13, 86, 122),
-            active_bg_stroke: rgb(80, 202, 255),
-            open_bg_fill: rgb(18, 48, 70),
-            open_bg_stroke: rgb(80, 178, 224),
+            panel_fill: rgb(13, 16, 17),
+            window_fill: rgb(5, 6, 7),
+            faint_bg_color: rgb(20, 24, 25),
+            extreme_bg_color: rgb(0, 0, 0),
+            code_bg_color: rgb(28, 33, 35),
+            window_stroke: rgb(38, 43, 46),
+            text_subdued: rgb(125, 140, 146),
+            text_default: rgb(202, 216, 222),
+            text_strong: rgb(255, 255, 255),
+            selection_bg_fill: rgb(0, 61, 161),
+            selection_stroke: accent_text_color(),
+            hyperlink_color: accent_text_color(),
+            inactive_bg_fill: rgb(49, 56, 59),
+            inactive_bg_stroke: rgb(38, 43, 46),
+            hovered_bg_fill: rgb(55, 63, 66),
+            hovered_bg_stroke: rgb(62, 70, 74),
+            active_bg_fill: rgb(55, 63, 66),
+            active_bg_stroke: accent_color(),
+            open_bg_fill: rgb(43, 49, 52),
+            open_bg_stroke: rgb(76, 86, 90),
+        }
+    }
+
+    fn light() -> Self {
+        Self {
+            panel_fill: rgb(244, 246, 247),
+            window_fill: rgb(255, 255, 255),
+            faint_bg_color: rgb(238, 241, 243),
+            extreme_bg_color: rgb(229, 233, 236),
+            code_bg_color: rgb(248, 250, 251),
+            window_stroke: rgb(205, 213, 219),
+            text_subdued: rgb(91, 105, 113),
+            text_default: rgb(38, 48, 54),
+            text_strong: rgb(5, 10, 13),
+            selection_bg_fill: rgb(214, 228, 255),
+            selection_stroke: accent_color(),
+            hyperlink_color: accent_color(),
+            inactive_bg_fill: rgb(236, 240, 242),
+            inactive_bg_stroke: rgb(205, 213, 219),
+            hovered_bg_fill: rgb(226, 232, 236),
+            hovered_bg_stroke: rgb(190, 200, 207),
+            active_bg_fill: rgb(214, 228, 255),
+            active_bg_stroke: accent_color(),
+            open_bg_fill: rgb(226, 232, 236),
+            open_bg_stroke: rgb(190, 200, 207),
+        }
+    }
+
+    fn for_theme(theme: UiThemeMode) -> Self {
+        match theme {
+            UiThemeMode::Dark => Self::dark(),
+            UiThemeMode::Light => Self::light(),
         }
     }
 }
@@ -3670,33 +2763,1619 @@ fn apply_visual_palette(visuals: &mut egui::Visuals, palette: VisualPalette) {
     visuals.selection.bg_fill = palette.selection_bg_fill;
     visuals.selection.stroke = stroke(palette.selection_stroke);
     visuals.hyperlink_color = palette.hyperlink_color;
+    visuals.weak_text_color = Some(palette.text_subdued);
     visuals.widgets.inactive.weak_bg_fill = palette.inactive_bg_fill;
+    visuals.widgets.inactive.bg_fill = palette.inactive_bg_fill;
     visuals.widgets.inactive.bg_stroke = stroke(palette.inactive_bg_stroke);
     visuals.widgets.hovered.weak_bg_fill = palette.hovered_bg_fill;
+    visuals.widgets.hovered.bg_fill = palette.hovered_bg_fill;
     visuals.widgets.hovered.bg_stroke = stroke(palette.hovered_bg_stroke);
     visuals.widgets.active.weak_bg_fill = palette.active_bg_fill;
+    visuals.widgets.active.bg_fill = palette.active_bg_fill;
     visuals.widgets.active.bg_stroke = stroke(palette.active_bg_stroke);
     visuals.widgets.open.weak_bg_fill = palette.open_bg_fill;
+    visuals.widgets.open.bg_fill = palette.open_bg_fill;
     visuals.widgets.open.bg_stroke = stroke(palette.open_bg_stroke);
+    visuals.widgets.noninteractive.weak_bg_fill = palette.faint_bg_color;
+    visuals.widgets.noninteractive.bg_fill = palette.faint_bg_color;
+    visuals.widgets.noninteractive.bg_stroke = stroke(palette.window_stroke);
+    visuals.widgets.noninteractive.fg_stroke.color = palette.text_subdued;
+    visuals.widgets.inactive.fg_stroke.color = palette.text_default;
+    visuals.widgets.hovered.fg_stroke.color = palette.text_default;
+    visuals.widgets.active.fg_stroke.color = palette.text_strong;
+    visuals.widgets.open.fg_stroke.color = palette.text_default;
+    visuals.text_edit_bg_color = Some(palette.code_bg_color);
 }
 
 impl MeshBcTesterApp {
-    fn apply_visual_style(ctx: &egui::Context) {
+    fn online_device_count(&self) -> usize {
+        self.runtime_states
+            .values()
+            .filter(|state| state.online)
+            .count()
+    }
+
+    fn render_top_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_height(28.0);
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+        ui.horizontal(|ui| {
+            Self::status_dot(ui, self.broker_connected);
+            ui.label(
+                RichText::new("Mesh BC")
+                    .strong()
+                    .color(ui.visuals().strong_text_color()),
+            );
+            ui.separator();
+            ui.small(RichText::new("地址").color(ui.visuals().weak_text_color()));
+            Self::compact_widget(
+                ui,
+                132.0,
+                TextEdit::singleline(&mut self.broker_editor.host).hint_text("192.168.1.10"),
+            );
+            ui.label(RichText::new(":").color(ui.visuals().weak_text_color()));
+            Self::compact_widget(
+                ui,
+                58.0,
+                egui::DragValue::new(&mut self.broker_editor.port)
+                    .range(1..=65535)
+                    .speed(1),
+            );
+            ui.checkbox(&mut self.broker_editor.use_tls, "TLS");
+            ui.menu_button("更多", |ui| {
+                ui.set_min_width(250.0);
+                Self::field_row(ui, "用户", |ui| {
+                    Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.username);
+                });
+                Self::field_row(ui, "密码", |ui| {
+                    Self::compact_widget(
+                        ui,
+                        170.0,
+                        TextEdit::singleline(&mut self.broker_editor.password)
+                            .password(true)
+                            .hint_text("密码"),
+                    );
+                });
+                Self::field_row(ui, "客户端", |ui| {
+                    Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.client_id);
+                });
+                Self::field_row(ui, "Keepalive", |ui| {
+                    Self::compact_widget(
+                        ui,
+                        76.0,
+                        egui::DragValue::new(&mut self.broker_editor.keepalive_secs)
+                            .range(5..=3600)
+                            .speed(1),
+                    );
+                    ui.small(RichText::new("秒").color(ui.visuals().weak_text_color()));
+                });
+            });
+            ui.separator();
+            if Self::primary_button(ui, "连接").clicked() {
+                self.connect();
+            }
+            if Self::secondary_button(ui, "断开").clicked() {
+                self.mqtt.disconnect();
+                self.transfer_engine
+                    .send(TransferEngineCommand::SetPublisher(None));
+            }
+            if Self::secondary_button(ui, "导出").clicked() {
+                self.export_evidence();
+            }
+            ui.label(RichText::new(&self.connection_status).color(ui.visuals().weak_text_color()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hover = Self::theme_toggle_button_hover(self.config.ui_theme_mode);
+                if Self::theme_icon_button(ui, self.config.ui_theme_mode)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.config.ui_theme_mode = self.config.ui_theme_mode.toggle();
+                    let _ = save_config(&self.config);
+                }
+            });
+        });
+    }
+
+    fn render_right_actions_panel(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("actions-panel-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width(340.0);
+                self.render_preset_command_section(ui);
+                Self::section_gap(ui);
+                self.render_raw_json_section(ui);
+                Self::section_gap(ui);
+                self.render_ota_transfer_section(ui);
+                Self::section_gap(ui);
+                self.render_voice_transfer_section(ui);
+            });
+    }
+
+    fn render_preset_command_section(&mut self, ui: &mut egui::Ui) {
+        let command_label = command_by_key(&self.command_key)
+            .map(|spec| spec.label)
+            .unwrap_or("未知命令");
+        Self::tree_section(
+            ui,
+            "right_preset_commands",
+            "预置命令",
+            command_label,
+            true,
+            |ui| {
+                Self::action_field_row(ui, "命令", |ui| {
+                    egui::ComboBox::from_id_salt("right-command-combo")
+                        .width(Self::action_value_width(ui, 190.0))
+                        .selected_text(command_label)
+                        .show_ui(ui, |ui| {
+                            for spec in COMMANDS {
+                                if ui
+                                    .selectable_label(self.command_key == spec.key, spec.label)
+                                    .clicked()
+                                {
+                                    self.command_key = spec.key.to_string();
+                                    self.command_form = default_form_for_command(&self.command_key);
+                                }
+                            }
+                        });
+                });
+
+                if let Some(spec) = command_by_key(&self.command_key) {
+                    if spec.include_dest_addr {
+                        Self::action_field_row(ui, "目标地址", |ui| {
+                            let entry = self
+                                .command_form
+                                .entry("dest_addr".into())
+                                .or_insert_with(|| "1".into());
+                            Self::compact_text_edit(ui, Self::action_value_width(ui, 100.0), entry);
+                        });
+                    }
+                    for field in spec.fields {
+                        Self::action_field_row(ui, field.label, |ui| {
+                            let value = self
+                                .command_form
+                                .entry(field.key.to_string())
+                                .or_insert_with(|| field.default.to_string());
+                            match field.kind {
+                                FieldKind::Text | FieldKind::Integer => {
+                                    Self::compact_text_edit(
+                                        ui,
+                                        Self::action_value_width(ui, 190.0),
+                                        value,
+                                    );
+                                }
+                                FieldKind::Choice(choices) => {
+                                    egui::ComboBox::from_id_salt(field.key)
+                                        .width(Self::action_value_width(ui, 190.0))
+                                        .selected_text(value.clone())
+                                        .show_ui(ui, |ui| {
+                                            for choice in choices {
+                                                ui.selectable_value(
+                                                    value,
+                                                    choice.value.to_string(),
+                                                    choice.label,
+                                                );
+                                            }
+                                        });
+                                }
+                            }
+                        });
+                    }
+                    Self::action_button_row(ui, |ui| {
+                        if Self::primary_button(ui, "发送预置命令").clicked() {
+                            let Some(devices) = self.ensure_selected_devices() else {
+                                return;
+                            };
+                            let mut items = Vec::new();
+                            for device in devices {
+                                match build_command_payload(spec, &device, &self.command_form) {
+                                    Ok(payload) => items.push((device, payload)),
+                                    Err(err) => self.system_notice = err,
+                                }
+                            }
+                            if self.should_confirm_preset_send(spec.key, items.len()) {
+                                self.pending_confirmation = Some(PendingConfirmation {
+                                    title: "确认发送预置命令".into(),
+                                    detail: format!(
+                                        "命令：{}，目标设备：{} 台",
+                                        spec.label,
+                                        items.len()
+                                    ),
+                                    action: PendingAction::PresetSend { items },
+                                });
+                            } else {
+                                self.execute_preset_send(items);
+                            }
+                        }
+                    });
+                }
+            },
+        );
+    }
+
+    fn render_raw_json_section(&mut self, ui: &mut egui::Ui) {
+        let meta = if self.raw_expected_opcode.trim().is_empty() {
+            "未指定 ACK".to_string()
+        } else {
+            format!("ACK {}", self.raw_expected_opcode.trim())
+        };
+        Self::tree_section(ui, "right_raw_json", "原始 JSON", &meta, false, |ui| {
+            ui.add(
+                TextEdit::multiline(&mut self.raw_json_text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            );
+            Self::action_field_row(ui, "期望应答", |ui| {
+                Self::compact_widget(
+                    ui,
+                    Self::action_value_width(ui, 100.0),
+                    TextEdit::singleline(&mut self.raw_expected_opcode).hint_text("如 0x47"),
+                );
+            });
+            Self::action_button_row(ui, |ui| {
+                if Self::primary_button(ui, "发送原始 JSON").clicked() {
+                    self.submit_raw_json();
+                }
+            });
+        });
+    }
+
+    fn submit_raw_json(&mut self) {
+        match serde_json::from_str::<Value>(&self.raw_json_text) {
+            Ok(payload @ Value::Object(_)) => {
+                let Some(opcode) = payload.get("opcode") else {
+                    self.system_notice = "原始 JSON 必须包含 opcode 字段".into();
+                    return;
+                };
+                let opcode_text = opcode.to_string().replace('"', "");
+                if parse_opcode(&opcode_text).is_err() {
+                    self.system_notice = "opcode 必须是十进制整数或 0x 十六进制字符串".into();
+                    return;
+                }
+                let expected_override = if self.raw_expected_opcode.trim().is_empty() {
+                    None
+                } else {
+                    match parse_opcode(&self.raw_expected_opcode) {
+                        Ok(opcode) => Some(opcode),
+                        Err(err) => {
+                            self.system_notice = format!("期望应答操作码无效: {err}");
+                            return;
+                        }
+                    }
+                };
+                let Some(devices) = self.ensure_selected_devices() else {
+                    return;
+                };
+                let opcode_num = parse_opcode(&opcode_text).unwrap_or(0);
+                let mut items = Vec::new();
+                for device in devices {
+                    match self.normalize_raw_payload_for_device(payload.clone(), &device) {
+                        Ok(normalized) => items.push((device, normalized, expected_override)),
+                        Err(err) => {
+                            self.system_notice = err;
+                            return;
+                        }
+                    }
+                }
+                if self.should_confirm_raw_send(opcode_num, items.len()) {
+                    self.pending_confirmation = Some(PendingConfirmation {
+                        title: "确认发送原始 JSON".into(),
+                        detail: format!(
+                            "操作码：0x{:02X}，目标设备：{} 台",
+                            opcode_num,
+                            items.len()
+                        ),
+                        action: PendingAction::RawSend { items },
+                    });
+                } else {
+                    self.execute_raw_send(items);
+                }
+            }
+            Ok(_) => self.system_notice = "原始负载必须是 JSON 对象".into(),
+            Err(err) => self.system_notice = err.to_string(),
+        }
+    }
+
+    fn render_ota_transfer_section(&mut self, ui: &mut egui::Ui) {
+        let meta = self.ota_transfer_kind.label();
+        Self::tree_section(ui, "right_ota_transfer", "OTA升级", meta, true, |ui| {
+            Self::action_field_row(ui, "升级类型", |ui| {
+                egui::ComboBox::from_id_salt("right-ota-kind")
+                    .width(Self::action_value_width(ui, 160.0))
+                    .selected_text(self.ota_transfer_kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [TransferKind::BcOta, TransferKind::AOta] {
+                            ui.selectable_value(&mut self.ota_transfer_kind, kind, kind.label());
+                        }
+                    });
+            });
+            Self::action_field_row(ui, "固件文件", |ui| {
+                let file_width = Self::action_file_width(ui);
+                Self::compact_text_edit(ui, file_width, &mut self.ota_transfer_file);
+                if Self::secondary_button(ui, "浏览").clicked() {
+                    self.pick_ota_transfer_file();
+                }
+            });
+            Self::action_field_row(ui, "参数", |ui| {
+                Self::inline_dim_label(ui, "版本");
+                Self::compact_widget(
+                    ui,
+                    52.0,
+                    egui::DragValue::new(&mut self.transfer_version).range(0..=255),
+                );
+                Self::inline_dim_label(ui, "重试");
+                Self::compact_widget(
+                    ui,
+                    48.0,
+                    egui::DragValue::new(&mut self.transfer_max_retries).range(0..=10),
+                );
+            });
+            Self::action_field_row(ui, "时序", |ui| {
+                Self::inline_dim_label(ui, "间隔");
+                Self::compact_widget(
+                    ui,
+                    56.0,
+                    egui::DragValue::new(&mut self.transfer_packet_delay_ms).range(1..=5_000),
+                );
+                Self::inline_dim_label(ui, "ACK");
+                Self::compact_widget(
+                    ui,
+                    56.0,
+                    egui::DragValue::new(&mut self.transfer_ack_timeout_secs).range(1..=300),
+                );
+            });
+            Self::action_field_row(ui, "BC起始", |ui| {
+                Self::compact_widget(
+                    ui,
+                    56.0,
+                    egui::DragValue::new(&mut self.bc_ota_start_ack_timeout_secs).range(1..=300),
+                );
+                Self::inline_dim_label(ui, "s");
+            });
+            Self::action_button_row(ui, |ui| {
+                if Self::primary_button(ui, "发起 OTA 升级").clicked() {
+                    self.start_transfer(
+                        self.ota_transfer_kind,
+                        self.ota_transfer_file.clone(),
+                        self.transfer_version,
+                        String::new(),
+                    );
+                }
+            });
+        });
+    }
+
+    fn render_voice_transfer_section(&mut self, ui: &mut egui::Ui) {
+        let meta = self.voice_transfer_kind.label();
+        Self::tree_section(
+            ui,
+            "right_voice_transfer",
+            "声音传输",
+            meta,
+            false,
+            |ui| {
+                Self::action_field_row(ui, "传输类型", |ui| {
+                    egui::ComboBox::from_id_salt("right-voice-kind")
+                        .width(Self::action_value_width(ui, 160.0))
+                        .selected_text(self.voice_transfer_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in [TransferKind::VoiceFile, TransferKind::RealtimeVoice] {
+                                ui.selectable_value(
+                                    &mut self.voice_transfer_kind,
+                                    kind,
+                                    kind.label(),
+                                );
+                            }
+                        });
+                });
+                Self::action_field_row(ui, "声音文件", |ui| {
+                    let file_width = Self::action_file_width(ui);
+                    Self::compact_text_edit(ui, file_width, &mut self.voice_transfer_file);
+                    if Self::secondary_button(ui, "浏览").clicked() {
+                        self.pick_voice_transfer_file();
+                    }
+                });
+                Self::action_field_row(ui, "文件名", |ui| {
+                    Self::compact_text_edit(
+                        ui,
+                        Self::action_value_width(ui, 170.0),
+                        &mut self.transfer_voice_name,
+                    );
+                });
+                Self::action_field_row(ui, "参数", |ui| {
+                    Self::inline_dim_label(ui, "间隔");
+                    Self::compact_widget(
+                        ui,
+                        44.0,
+                        egui::DragValue::new(&mut self.voice_transfer_packet_delay_ms)
+                            .range(1..=5_000),
+                    );
+                    Self::inline_dim_label(ui, "ACK");
+                    Self::compact_widget(
+                        ui,
+                        44.0,
+                        egui::DragValue::new(&mut self.voice_transfer_ack_timeout_secs)
+                            .range(1..=300),
+                    );
+                    Self::inline_dim_label(ui, "重试");
+                    Self::compact_widget(
+                        ui,
+                        38.0,
+                        egui::DragValue::new(&mut self.voice_transfer_max_retries).range(0..=10),
+                    );
+                });
+                Self::action_button_row(ui, |ui| {
+                    if Self::primary_button(ui, "发起声音传输").clicked() {
+                        self.start_transfer(
+                            self.voice_transfer_kind,
+                            self.voice_transfer_file.clone(),
+                            self.transfer_version,
+                            self.transfer_voice_name.clone(),
+                        );
+                    }
+                });
+            },
+        );
+    }
+
+    fn render_left_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        self.render_device_tree_section(ui);
+        self.render_discovery_tree_section(ui);
+        self.render_device_editor_section(ui);
+    }
+
+    fn render_device_tree_section(&mut self, ui: &mut egui::Ui) {
+        let summary = format!(
+            "{} 台 · {} 在线 · {} 已选",
+            self.config.devices.len(),
+            self.online_device_count(),
+            self.selected_devices.len()
+        );
+        Self::tree_section(ui, "devices_tree", "设备", &summary, true, |ui| {
+            if self.config.devices.is_empty() {
+                ui.label(RichText::new("还没有配置设备。").color(ui.visuals().weak_text_color()));
+                return;
+            }
+
+            let devices = self.config.devices.clone();
+            egui::ScrollArea::vertical()
+                .id_salt("configured-device-tree-scroll")
+                .max_height(280.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for device in devices {
+                        let state = self
+                            .runtime_states
+                            .get(&device.local_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.render_device_tree_row(ui, &device, &state);
+                    }
+                });
+        });
+    }
+
+    fn render_device_tree_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        device: &DeviceProfile,
+        state: &DeviceRuntimeState,
+    ) {
+        let selected = self.selected_devices.contains(&device.local_id);
+        let mut checked = selected;
+        let mut edit_requested = false;
+        let response = Self::tree_row(ui, selected, 34.0, |ui, hovered| {
+            if ui.checkbox(&mut checked, "").changed() {
+                // Apply after drawing so row response stays presentation-only.
+            }
+            Self::status_dot(ui, state.online);
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 46.0).max(80.0));
+                ui.label(
+                    RichText::new(&device.name)
+                        .strong()
+                        .color(Self::device_row_name_color(ui, selected)),
+                );
+                let rtt = if state.last_rtt_ms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}ms", state.last_rtt_ms)
+                };
+                let last = if state.last_result.is_empty() {
+                    state.last_opcode.as_str()
+                } else {
+                    state.last_result.as_str()
+                };
+                ui.small(
+                    RichText::new(format!(
+                        "{} · RX {} TX {} 待{}{} · {}",
+                        Self::device_id_suffix(&device.device_id),
+                        state.rx_count,
+                        state.tx_count,
+                        state.pending_count,
+                        rtt,
+                        Self::truncate_for_row(last, 18),
+                    ))
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+            if hovered || selected {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::secondary_button(ui, "编辑").clicked() {
+                        edit_requested = true;
+                    }
+                });
+            }
+        });
+
+        if checked != selected {
+            if checked {
+                self.selected_devices.insert(device.local_id);
+            } else {
+                self.selected_devices.remove(&device.local_id);
+            }
+        }
+        if edit_requested || response.double_clicked() {
+            self.device_editor = DeviceEditor::from_device(device);
+        }
+    }
+
+    fn render_discovery_tree_section(&mut self, ui: &mut egui::Ui) {
+        let summary = format!("{} 候选", self.discovered_devices.len());
+        let has_discovered_devices = !self.discovered_devices.is_empty();
+        let open_on_new_candidates =
+            has_discovered_devices && !self.discovery_section_had_candidates;
+        self.discovery_section_had_candidates = has_discovered_devices;
+        Self::tree_section_with_open(
+            ui,
+            "discovery_tree",
+            "发现",
+            &summary,
+            has_discovered_devices,
+            open_on_new_candidates.then_some(true),
+            |ui| {
+                if ui
+                    .checkbox(&mut self.auto_discovery_enabled, "从主动上报生成候选设备")
+                    .changed()
+                {
+                    self.sync_subscriptions();
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.auto_import_discovered, "自动导入");
+                    if !self.discovered_devices.is_empty()
+                        && Self::secondary_button(ui, "导入全部").clicked()
+                    {
+                        let ids = self
+                            .discovered_devices
+                            .iter()
+                            .map(|candidate| candidate.device_id.clone())
+                            .collect::<Vec<_>>();
+                        for device_id in ids {
+                            self.import_discovered_device_by_id(&device_id);
+                        }
+                    }
+                    if !self.discovered_devices.is_empty()
+                        && Self::secondary_button(ui, "清空").clicked()
+                    {
+                        self.discovered_devices.clear();
+                    }
+                });
+
+                if self.discovered_devices.is_empty() {
+                    ui.label(
+                        RichText::new("当前没有发现设备。").color(ui.visuals().weak_text_color()),
+                    );
+                    return;
+                }
+
+                let candidates = self.discovered_devices.clone();
+                let mut import_ids = Vec::new();
+                let mut edit_ids = Vec::new();
+                let mut remove_ids = Vec::new();
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .id_salt("discovered-devices-tree-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for candidate in candidates {
+                            let (import, edit, remove) =
+                                Self::render_discovered_tree_row(ui, &candidate);
+                            if import {
+                                import_ids.push(candidate.device_id.clone());
+                            }
+                            if edit {
+                                edit_ids.push(candidate.device_id.clone());
+                            }
+                            if remove {
+                                remove_ids.push(candidate.device_id.clone());
+                            }
+                        }
+                    });
+
+                for device_id in import_ids {
+                    self.import_discovered_device_by_id(&device_id);
+                }
+                for device_id in edit_ids {
+                    self.load_discovered_device_into_editor(&device_id);
+                }
+                if !remove_ids.is_empty() {
+                    self.discovered_devices
+                        .retain(|candidate| !remove_ids.contains(&candidate.device_id));
+                }
+            },
+        );
+    }
+
+    fn render_discovered_tree_row(
+        ui: &mut egui::Ui,
+        candidate: &DiscoveredDevice,
+    ) -> (bool, bool, bool) {
+        let mut import_requested = false;
+        let mut edit_requested = false;
+        let mut remove_requested = false;
+        Self::tree_row(ui, false, 38.0, |ui, hovered| {
+            Self::status_dot(ui, true);
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 122.0).max(80.0));
+                ui.label(
+                    RichText::new(&candidate.suggested_name)
+                        .strong()
+                        .color(ui.visuals().strong_text_color()),
+                );
+                let model = if candidate.dev_model.is_empty() {
+                    candidate.discovery_reason.as_str()
+                } else {
+                    candidate.dev_model.as_str()
+                };
+                ui.small(
+                    RichText::new(format!(
+                        "{} · {} · {} 次 · {}",
+                        Self::device_id_suffix(&candidate.device_id),
+                        model,
+                        candidate.seen_count,
+                        candidate.last_opcode
+                    ))
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+            if hovered {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::secondary_button(ui, "移除").clicked() {
+                        remove_requested = true;
+                    }
+                    if Self::secondary_button(ui, "填入").clicked() {
+                        edit_requested = true;
+                    }
+                    if Self::primary_button(ui, "导入").clicked() {
+                        import_requested = true;
+                    }
+                });
+            }
+        });
+        (import_requested, edit_requested, remove_requested)
+    }
+
+    fn render_device_editor_section(&mut self, ui: &mut egui::Ui) {
+        let title = if self.device_editor.editing_id.is_some() {
+            "编辑设备"
+        } else {
+            "新增设备"
+        };
+        let summary = if self.device_editor.name.trim().is_empty() {
+            "未命名".to_string()
+        } else {
+            self.device_editor.name.clone()
+        };
+        let editing_id = self.device_editor.editing_id;
+        let is_editing = editing_id.is_some();
+        let open = match (editing_id, self.device_editor_active_id) {
+            (Some(id), previous) if previous != Some(id) => Some(true),
+            (None, Some(_)) => Some(false),
+            _ => None,
+        };
+        self.device_editor_active_id = editing_id;
+        Self::tree_section_with_open(
+            ui,
+            "device_editor_tree",
+            title,
+            &summary,
+            is_editing,
+            open,
+            |ui| {
+                Self::field_row(ui, "名称", |ui| {
+                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.name);
+                });
+                Self::field_row(ui, "设备ID", |ui| {
+                    let response =
+                        Self::compact_text_edit(ui, 196.0, &mut self.device_editor.device_id);
+                    if response.changed() && !self.device_editor.device_id.trim().is_empty() {
+                        let (up, down) =
+                            DeviceProfile::default_topics(self.device_editor.device_id.trim());
+                        if self.device_editor.up_topic.is_empty() {
+                            self.device_editor.up_topic = up;
+                        }
+                        if self.device_editor.down_topic.is_empty() {
+                            self.device_editor.down_topic = down;
+                        }
+                    }
+                });
+                Self::field_row(ui, "上行", |ui| {
+                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.up_topic);
+                });
+                Self::field_row(ui, "下行", |ui| {
+                    Self::compact_text_edit(ui, 196.0, &mut self.device_editor.down_topic);
+                });
+                Self::field_row(ui, "Mesh", |ui| {
+                    Self::compact_widget(
+                        ui,
+                        58.0,
+                        egui::DragValue::new(&mut self.device_editor.mesh_dev_type).range(0..=255),
+                    );
+                    ui.label("目标");
+                    Self::compact_widget(
+                        ui,
+                        70.0,
+                        egui::DragValue::new(&mut self.device_editor.default_dest_addr)
+                            .range(1..=65535),
+                    );
+                });
+                ui.checkbox(&mut self.device_editor.subscribe_enabled, "订阅上行主题");
+                ui.horizontal(|ui| {
+                    if Self::primary_button(ui, "保存").clicked() {
+                        self.save_device_editor();
+                    }
+                    if Self::secondary_button(ui, "清空").clicked() {
+                        self.device_editor = DeviceEditor {
+                            mesh_dev_type: 1,
+                            default_dest_addr: 1,
+                            subscribe_enabled: true,
+                            ..Default::default()
+                        };
+                    }
+                    ui.separator();
+                    if Self::secondary_button(ui, "删除已选").clicked() {
+                        self.config
+                            .devices
+                            .retain(|device| !self.selected_devices.contains(&device.local_id));
+                        self.selected_devices.clear();
+                        self.sync_subscriptions();
+                        let _ = save_config(&self.config);
+                    }
+                });
+            },
+        );
+    }
+
+    fn tree_section(
+        ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash,
+        title: &str,
+        meta: &str,
+        default_open: bool,
+        add_body: impl FnOnce(&mut egui::Ui),
+    ) {
+        Self::tree_section_with_open(ui, id_salt, title, meta, default_open, None, add_body);
+    }
+
+    fn tree_section_with_open(
+        ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash,
+        title: &str,
+        meta: &str,
+        default_open: bool,
+        open: Option<bool>,
+        add_body: impl FnOnce(&mut egui::Ui),
+    ) {
+        let header = RichText::new(format!("{title}  {meta}"))
+            .size(12.0)
+            .strong()
+            .color(ui.visuals().strong_text_color());
+        egui::CollapsingHeader::new(header)
+            .id_salt(id_salt)
+            .default_open(default_open)
+            .open(open)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                add_body(ui);
+            });
+    }
+
+    fn tree_row(
+        ui: &mut egui::Ui,
+        selected: bool,
+        height: f32,
+        add_content: impl FnOnce(&mut egui::Ui, bool),
+    ) -> egui::Response {
+        let desired = egui::vec2(ui.available_width(), height);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        let hovered = response.hovered();
+        let fill = if selected {
+            Self::selected_tree_row_fill(ui, hovered)
+        } else if hovered {
+            ui.visuals().widgets.hovered.weak_bg_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let row_rect = rect.shrink2(egui::vec2(1.0, 1.0));
+        if fill != egui::Color32::TRANSPARENT {
+            ui.painter().rect_filled(row_rect, 3.0, fill);
+        }
+        if selected {
+            let rail_rect = egui::Rect::from_min_max(
+                egui::pos2(row_rect.left() + 1.0, row_rect.top() + 5.0),
+                egui::pos2(row_rect.left() + 3.0, row_rect.bottom() - 5.0),
+            );
+            ui.painter().rect_filled(rail_rect, 1.0, accent_color());
+            ui.painter().rect_stroke(
+                row_rect,
+                3.0,
+                Self::selected_tree_row_stroke(ui),
+                egui::StrokeKind::Inside,
+            );
+        } else if hovered {
+            ui.painter().rect_stroke(
+                row_rect,
+                3.0,
+                surface_stroke(ui.visuals().dark_mode),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let inner_rect = rect.shrink2(egui::vec2(6.0, 0.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(inner_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
+                add_content(ui, hovered);
+            },
+        );
+        response
+    }
+
+    fn selected_tree_row_fill(ui: &egui::Ui, hovered: bool) -> egui::Color32 {
+        match (ui.visuals().dark_mode, hovered) {
+            (true, true) => rgb(24, 34, 45),
+            (true, false) => rgb(18, 27, 37),
+            (false, true) => rgb(229, 240, 255),
+            (false, false) => rgb(239, 246, 255),
+        }
+    }
+
+    fn selected_tree_row_stroke(ui: &egui::Ui) -> egui::Stroke {
+        stroke(if ui.visuals().dark_mode {
+            rgb(49, 68, 91)
+        } else {
+            rgb(190, 211, 243)
+        })
+    }
+
+    fn device_row_name_color(ui: &egui::Ui, selected: bool) -> egui::Color32 {
+        if !selected {
+            return ui.visuals().strong_text_color();
+        }
+        if ui.visuals().dark_mode {
+            rgb(234, 246, 255)
+        } else {
+            rgb(12, 64, 150)
+        }
+    }
+
+    fn field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
+        ui.horizontal(|ui| {
+            ui.set_height(22.0);
+            ui.add_sized(
+                [62.0, 20.0],
+                egui::Label::new(RichText::new(label).color(ui.visuals().weak_text_color())),
+            );
+            add_field(ui);
+        });
+    }
+
+    fn action_field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
+        ui.horizontal_wrapped(|ui| {
+            ui.set_min_height(22.0);
+            ui.add_sized(
+                [72.0, 20.0],
+                egui::Label::new(RichText::new(label).color(ui.visuals().weak_text_color())),
+            );
+            add_field(ui);
+        });
+    }
+
+    fn action_value_width(ui: &egui::Ui, max_width: f32) -> f32 {
+        ui.available_width().clamp(86.0, max_width)
+    }
+
+    fn action_file_width(ui: &egui::Ui) -> f32 {
+        (ui.available_width() - 48.0).clamp(82.0, 170.0)
+    }
+
+    fn action_button_row(ui: &mut egui::Ui, add_button: impl FnOnce(&mut egui::Ui)) {
+        ui.horizontal(|ui| {
+            ui.add_space(76.0);
+            add_button(ui);
+        });
+    }
+
+    fn section_gap(ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+    }
+
+    fn inline_dim_label(ui: &mut egui::Ui, text: &str) {
+        ui.small(RichText::new(text).color(ui.visuals().weak_text_color()));
+    }
+
+    fn status_dot(ui: &mut egui::Ui, active: bool) {
+        let color = if active {
+            if ui.visuals().dark_mode {
+                rgb(68, 214, 132)
+            } else {
+                rgb(0, 137, 77)
+            }
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 18.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.5, color);
+    }
+
+    fn device_id_suffix(device_id: &str) -> String {
+        let suffix_len = device_id.chars().count().min(8);
+        let suffix = device_id
+            .chars()
+            .rev()
+            .take(suffix_len)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        if suffix.is_empty() {
+            "-".into()
+        } else {
+            suffix
+        }
+    }
+
+    fn render_central_workspace(&mut self, ui: &mut egui::Ui) {
+        Self::paint_tech_background(ui);
+        self.render_workspace_header(ui);
+        self.render_activity_overview(ui);
+
+        let filtered_log_indices = self.selected_log_indices();
+        self.render_log_workspace(ui, &filtered_log_indices);
+    }
+
+    fn render_workspace_header(&mut self, ui: &mut egui::Ui) {
+        let total_rx: u64 = self
+            .runtime_states
+            .values()
+            .map(|state| state.rx_count)
+            .sum();
+        let total_tx: u64 = self
+            .runtime_states
+            .values()
+            .map(|state| state.tx_count)
+            .sum();
+
+        ui.horizontal_wrapped(|ui| {
+            Self::section_heading(ui, "实时工作区");
+            ui.separator();
+            Self::stat_chip(ui, "设备", self.config.devices.len().to_string());
+            Self::stat_chip(ui, "已选", self.selected_devices.len().to_string());
+            Self::stat_chip(ui, "RX", total_rx.to_string());
+            Self::stat_chip(ui, "TX", total_tx.to_string());
+            Self::stat_chip(ui, "待应答", self.pending_requests.len().to_string());
+            Self::stat_chip(ui, "传输", self.transfer_snapshots.len().to_string());
+            Self::stat_chip(ui, "日志", self.logs.len().to_string());
+            ui.checkbox(&mut self.show_selected_logs_only, "仅已选设备日志");
+        });
+        ui.add_space(2.0);
+    }
+
+    fn render_activity_overview(&mut self, ui: &mut egui::Ui) {
+        let has_pending_requests = !self.pending_requests.is_empty();
+        let has_transfers = !self.transfer_snapshots.is_empty();
+        let has_recent_operations = !self.recent_operations.is_empty();
+        if !has_pending_requests && !has_transfers && !has_recent_operations {
+            return;
+        }
+
+        Self::panel_card_frame(ui).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                Self::section_heading(ui, "活动状态");
+                if has_pending_requests {
+                    Self::stat_chip(ui, "请求", self.pending_requests.len().to_string());
+                }
+                if has_transfers {
+                    Self::stat_chip(ui, "传输", self.transfer_snapshots.len().to_string());
+                }
+                if has_recent_operations {
+                    Self::stat_chip(ui, "最近", self.recent_operations.len().to_string());
+                }
+            });
+
+            if has_pending_requests {
+                ui.add_space(2.0);
+                self.render_request_status_table(ui);
+            }
+            if has_transfers {
+                ui.separator();
+                self.render_transfer_status_section(ui);
+            }
+            if has_recent_operations {
+                ui.separator();
+                self.render_recent_operations_table(ui);
+            }
+        });
+    }
+
+    fn render_request_status_table(&self, ui: &mut egui::Ui) {
+        Self::section_heading(ui, "请求状态");
+        let now = Instant::now();
+        let table_height =
+            Self::table_scroll_height(self.pending_requests.len(), REQUEST_STATUS_TABLE_HEIGHT);
+        TableBuilder::new(ui)
+            .id_salt("request-status-table")
+            .striped(true)
+            .column(Column::initial(120.0))
+            .column(Column::initial(90.0))
+            .column(Column::initial(90.0))
+            .column(Column::initial(90.0))
+            .column(Column::remainder().clip(true))
+            .min_scrolled_height(table_height)
+            .max_scroll_height(table_height)
+            .header(TABLE_ROW_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    Self::table_header_label(ui, "设备");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "请求");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "等待");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "时间戳");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "主题");
+                });
+            })
+            .body(|body| {
+                body.rows(TABLE_ROW_HEIGHT, self.pending_requests.len(), |mut row| {
+                    let request = &self.pending_requests[row.index()];
+                    row.col(|ui| {
+                        ui.label(&request.device_name);
+                    });
+                    row.col(|ui| {
+                        ui.label(format!(
+                            "0x{:02X} -> 0x{:02X}",
+                            request.opcode, request.expected_opcode
+                        ));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!(
+                            "{}ms",
+                            now.duration_since(request.sent_at).as_millis()
+                        ));
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            request
+                                .time_stamp
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(&request.topic);
+                    });
+                });
+            });
+    }
+
+    fn render_transfer_status_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            Self::section_heading(ui, "传输状态");
+            if self
+                .transfer_snapshots
+                .iter()
+                .any(|transfer| transfer.paused && !transfer.terminal)
+                && Self::secondary_button(ui, "继续待传输").clicked()
+            {
+                let ids = self
+                    .transfer_snapshots
+                    .iter()
+                    .filter(|transfer| transfer.paused && !transfer.terminal)
+                    .map(|transfer| transfer.device_local_id)
+                    .collect::<Vec<_>>();
+                self.resume_transfers_for_devices(&ids);
+            }
+            if self
+                .transfer_snapshots
+                .iter()
+                .any(|transfer| transfer.terminal && !transfer.succeeded)
+                && Self::secondary_button(ui, "重试失败").clicked()
+            {
+                let ids = self
+                    .transfer_snapshots
+                    .iter()
+                    .filter(|transfer| transfer.terminal && !transfer.succeeded)
+                    .map(|transfer| transfer.device_local_id)
+                    .collect::<Vec<_>>();
+                self.retry_failed_transfers_for_devices(&ids);
+            }
+            if self
+                .transfer_snapshots
+                .iter()
+                .any(|transfer| transfer.terminal)
+                && Self::secondary_button(ui, "清除终态").clicked()
+            {
+                self.clear_terminal_transfers();
+            }
+            if !self.transfer_snapshots.is_empty()
+                && Self::secondary_button(ui, "取消全部").clicked()
+            {
+                let ids = self
+                    .transfer_snapshots
+                    .iter()
+                    .map(|transfer| transfer.device_local_id)
+                    .collect::<Vec<_>>();
+                self.cancel_transfers_for_devices(&ids);
+            }
+        });
+
+        let mut cancel_ids = Vec::new();
+        let mut resume_ids = Vec::new();
+        let mut retry_ids = Vec::new();
+        let mut clear_ids = Vec::new();
+        let table_height =
+            Self::table_scroll_height(self.transfer_snapshots.len(), TRANSFER_STATUS_TABLE_HEIGHT);
+
+        TableBuilder::new(ui)
+            .id_salt("transfer-status-table")
+            .striped(true)
+            .column(Column::initial(120.0))
+            .column(Column::initial(76.0))
+            .column(Column::initial(86.0))
+            .column(Column::initial(72.0))
+            .column(Column::initial(58.0))
+            .column(Column::initial(70.0))
+            .column(Column::remainder().clip(true))
+            .min_scrolled_height(table_height)
+            .max_scroll_height(table_height)
+            .header(TABLE_ROW_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    Self::table_header_label(ui, "设备");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "类型");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "进度");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "等待ACK");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "重试");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "操作");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "状态 / 失败");
+                });
+            })
+            .body(|body| {
+                body.rows(
+                    TABLE_ROW_HEIGHT,
+                    self.transfer_snapshots.len(),
+                    |mut row| {
+                        let transfer = &self.transfer_snapshots[row.index()];
+                        row.col(|ui| {
+                            ui.label(&transfer.device_name);
+                        });
+                        row.col(|ui| {
+                            ui.label(transfer.kind.label());
+                        });
+                        row.col(|ui| {
+                            ui.label(transfer_snapshot_display_progress(transfer));
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                transfer
+                                    .waiting_ack_opcode
+                                    .map(|opcode| format!("0x{:02X}", opcode))
+                                    .unwrap_or_else(|| "-".into()),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{}/{}", transfer.retry_count, transfer.max_retries));
+                        });
+                        row.col(|ui| {
+                            if transfer.paused && !transfer.terminal {
+                                if Self::secondary_button(ui, "继续").clicked() {
+                                    resume_ids.push(transfer.device_local_id);
+                                }
+                            } else if transfer.terminal && !transfer.succeeded {
+                                if Self::secondary_button(ui, "重试").clicked() {
+                                    retry_ids.push(transfer.device_local_id);
+                                }
+                            } else if transfer.terminal {
+                                if Self::secondary_button(ui, "清理").clicked() {
+                                    clear_ids.push(transfer.device_local_id);
+                                }
+                            } else if Self::secondary_button(ui, "取消").clicked() {
+                                cancel_ids.push(transfer.device_local_id);
+                            }
+                        });
+                        row.col(|ui| {
+                            let status_detail = Self::transfer_status_detail(transfer);
+                            ui.label(status_detail);
+                        });
+                    },
+                );
+            });
+
+        if !cancel_ids.is_empty() {
+            self.cancel_transfers_for_devices(&cancel_ids);
+        }
+        if !resume_ids.is_empty() {
+            self.resume_transfers_for_devices(&resume_ids);
+        }
+        if !retry_ids.is_empty() {
+            self.retry_failed_transfers_for_devices(&retry_ids);
+        }
+        if !clear_ids.is_empty() {
+            self.clear_terminal_transfers_for_devices(&clear_ids);
+        }
+    }
+
+    fn transfer_status_detail(transfer: &TransferSnapshot) -> String {
+        match (
+            transfer.failure_packet_index,
+            transfer.last_failure_reason.is_empty(),
+        ) {
+            (Some(index), false) => format!(
+                "{} · #{} · {}",
+                transfer.status,
+                transfer_display_packet_number(transfer.kind, index),
+                transfer.last_failure_reason
+            ),
+            (Some(index), true) => format!(
+                "{} · #{}",
+                transfer.status,
+                transfer_display_packet_number(transfer.kind, index)
+            ),
+            (None, false) => format!("{} · {}", transfer.status, transfer.last_failure_reason),
+            (None, true) => transfer.status.clone(),
+        }
+    }
+
+    fn render_recent_operations_table(&mut self, ui: &mut egui::Ui) {
+        let mut clear_recent = false;
+        ui.horizontal(|ui| {
+            Self::section_heading(ui, "最近操作");
+            if Self::secondary_button(ui, "清空操作").clicked() {
+                clear_recent = true;
+            }
+        });
+        if clear_recent {
+            self.recent_operations.clear();
+            return;
+        }
+
+        let visible_count = self.recent_operations.len().min(20);
+        let table_height = Self::table_scroll_height(visible_count, RECENT_OPERATIONS_TABLE_HEIGHT);
+        TableBuilder::new(ui)
+            .id_salt("recent-operations-table")
+            .striped(true)
+            .column(Column::initial(170.0))
+            .column(Column::initial(120.0))
+            .column(Column::initial(110.0))
+            .column(Column::initial(80.0))
+            .column(Column::initial(80.0))
+            .column(Column::remainder().clip(true))
+            .min_scrolled_height(table_height)
+            .max_scroll_height(table_height)
+            .header(TABLE_ROW_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    Self::table_header_label(ui, "时间");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "设备");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "操作");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "状态");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "RTT");
+                });
+                header.col(|ui| {
+                    Self::table_header_label(ui, "详情");
+                });
+            })
+            .body(|body| {
+                body.rows(TABLE_ROW_HEIGHT, visible_count, |mut row| {
+                    let op_index = self.recent_operations.len() - 1 - row.index();
+                    let op = &self.recent_operations[op_index];
+                    row.col(|ui| {
+                        ui.label(&op.timestamp);
+                    });
+                    row.col(|ui| {
+                        ui.label(&op.device_name);
+                    });
+                    row.col(|ui| {
+                        ui.label(&op.opcode);
+                    });
+                    row.col(|ui| {
+                        ui.label(&op.status);
+                    });
+                    row.col(|ui| {
+                        let value = if op.rtt_ms.is_empty() {
+                            "-".to_string()
+                        } else {
+                            op.rtt_ms.clone()
+                        };
+                        ui.label(value);
+                    });
+                    row.col(|ui| {
+                        ui.label(&op.detail);
+                    });
+                });
+            });
+    }
+
+    fn render_log_workspace(&mut self, ui: &mut egui::Ui, filtered_log_indices: &[usize]) {
+        let workspace_height = ui.available_height().max(320.0);
+        let total_width = ui.available_width();
+        let gutter = ui.spacing().item_spacing.x;
+
+        if total_width < 760.0 {
+            let log_height = (workspace_height * 0.58).max(220.0);
+            self.render_message_log_panel(ui, filtered_log_indices, log_height);
+            self.render_payload_inspector(ui, (workspace_height - log_height - gutter).max(260.0));
+            return;
+        }
+
+        ui.horizontal_top(|ui| {
+            let max_left_width = (total_width - gutter - 300.0).max(360.0);
+            let left_width = (total_width * 0.68).clamp(360.0, max_left_width);
+            let right_width = (total_width - left_width - gutter).max(300.0);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, workspace_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.render_message_log_panel(ui, filtered_log_indices, workspace_height);
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_width, workspace_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.render_payload_inspector(ui, workspace_height);
+                },
+            );
+        });
+    }
+
+    fn render_message_log_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        filtered_log_indices: &[usize],
+        panel_height: f32,
+    ) {
+        Self::panel_card_frame(ui).show(ui, |ui| {
+            let mut cleared_logs = false;
+            ui.horizontal_wrapped(|ui| {
+                Self::section_heading(ui, "消息日志");
+                ui.label("筛选");
+                Self::compact_widget(
+                    ui,
+                    210.0,
+                    TextEdit::singleline(&mut self.log_filter_text)
+                        .hint_text("设备 / opcode / 状态 / 主题"),
+                );
+                if Self::secondary_button(ui, "清空日志").clicked() {
+                    self.logs.clear();
+                    self.selected_log_index = None;
+                    cleared_logs = true;
+                }
+                ui.checkbox(&mut self.follow_latest_logs, "跟随最新");
+                ui.small(format!(
+                    "{}/{}",
+                    filtered_log_indices.len(),
+                    self.logs.len()
+                ));
+            });
+            if cleared_logs {
+                return;
+            }
+
+            let log_table_height = (panel_height - 74.0).max(180.0);
+            TableBuilder::new(ui)
+                .id_salt("message-log-table")
+                .striped(true)
+                .sense(egui::Sense::click())
+                .column(Column::initial(170.0))
+                .column(Column::initial(70.0))
+                .column(Column::initial(120.0))
+                .column(Column::initial(90.0))
+                .column(Column::initial(90.0))
+                .column(Column::initial(160.0).clip(true))
+                .column(Column::remainder().clip(true))
+                .min_scrolled_height(log_table_height)
+                .max_scroll_height(log_table_height)
+                .stick_to_bottom(self.follow_latest_logs)
+                .header(TABLE_ROW_HEIGHT, |mut header| {
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "时间");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "方向");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "设备");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "操作码");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "状态");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "主题");
+                    });
+                    header.col(|ui| {
+                        Self::table_header_label(ui, "摘要");
+                    });
+                })
+                .body(|body| {
+                    body.rows(TABLE_ROW_HEIGHT, filtered_log_indices.len(), |mut row| {
+                        let log_index = filtered_log_indices[row.index()];
+                        let Some(entry) = self.logs.get(log_index) else {
+                            return;
+                        };
+                        row.set_selected(self.selected_log_index == Some(log_index));
+                        row.col(|ui| {
+                            ui.label(&entry.timestamp);
+                        });
+                        row.col(|ui| {
+                            ui.label(entry.direction.as_str());
+                        });
+                        row.col(|ui| {
+                            ui.label(&entry.device_name);
+                        });
+                        row.col(|ui| {
+                            ui.label(&entry.opcode);
+                        });
+                        row.col(|ui| {
+                            ui.label(&entry.status);
+                        });
+                        row.col(|ui| {
+                            ui.label(&entry.topic);
+                        });
+                        row.col(|ui| {
+                            ui.label(&entry.summary);
+                        });
+                        if row.response().clicked() {
+                            self.select_log_row(log_index);
+                        }
+                    });
+                });
+        });
+    }
+
+    fn render_payload_inspector(&self, ui: &mut egui::Ui, panel_height: f32) {
+        let selected_entry = self
+            .selected_log_index
+            .and_then(|index| self.logs.get(index));
+
+        Self::panel_card_frame(ui).show(ui, |ui| {
+            Self::section_heading(ui, "日志检查器");
+            let Some(entry) = selected_entry else {
+                ui.label("选择一条日志后查看解析字段和原始负载。");
+                return;
+            };
+
+            ui.horizontal_wrapped(|ui| {
+                ui.small(RichText::new(&entry.timestamp).monospace());
+                ui.separator();
+                ui.label(RichText::new(entry.direction.as_str()).strong());
+                ui.separator();
+                ui.label(&entry.device_name);
+                ui.separator();
+                ui.label(RichText::new(&entry.opcode).monospace());
+            });
+            ui.small(RichText::new(&entry.topic).color(ui.visuals().weak_text_color()));
+            ui.add_space(4.0);
+
+            Self::section_heading(ui, "解析详情");
+            let details_height = (panel_height * 0.32).clamp(120.0, 220.0);
+            if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
+                let details = decode_payload_details(&payload);
+                if details.is_empty() {
+                    ui.label("当前负载暂无结构化解析。");
+                } else {
+                    TableBuilder::new(ui)
+                        .id_salt("payload-details-table")
+                        .striped(true)
+                        .column(Column::initial(150.0))
+                        .column(Column::remainder().clip(true))
+                        .min_scrolled_height(details_height)
+                        .max_scroll_height(details_height)
+                        .body(|body| {
+                            body.rows(TABLE_ROW_HEIGHT, details.len(), |mut row| {
+                                let (key, value) = &details[row.index()];
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(key)
+                                            .monospace()
+                                            .strong()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.label(value);
+                                });
+                            });
+                        });
+                }
+            } else {
+                ui.label("当前负载不是可解析的 JSON。");
+            }
+
+            ui.separator();
+            Self::section_heading(ui, "当前负载");
+            let mut payload = entry.payload.clone();
+            let payload_height = (panel_height - details_height - 124.0).max(180.0);
+            egui::ScrollArea::vertical()
+                .id_salt("current-payload-scroll")
+                .max_height(payload_height)
+                .show(ui, |ui| {
+                    ui.add(
+                        TextEdit::multiline(&mut payload)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false),
+                    );
+                });
+        });
+    }
+
+    fn table_scroll_height(row_count: usize, max_height: f32) -> f32 {
+        let natural_height = TABLE_ROW_HEIGHT * (row_count as f32 + 1.0) + 6.0;
+        natural_height.clamp(TABLE_ROW_HEIGHT * 2.0, max_height)
+    }
+
+    fn apply_visual_style(ctx: &egui::Context, theme: UiThemeMode) {
         ctx.global_style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(4.0, 2.0);
-            style.spacing.button_padding = egui::vec2(6.0, 1.0);
-            style.spacing.interact_size = egui::vec2(32.0, 24.0);
-            style.spacing.slider_width = 160.0;
-            style.spacing.combo_width = 150.0;
-            style.spacing.indent = 8.0;
+            style.spacing.item_spacing = egui::vec2(5.0, 3.0);
+            style.spacing.button_padding = egui::vec2(5.0, 0.0);
+            style.spacing.interact_size = egui::vec2(32.0, 22.0);
+            style.spacing.slider_width = 150.0;
+            style.spacing.combo_width = 140.0;
+            style.spacing.indent = 10.0;
+            style.spacing.scroll.bar_width = 6.0;
+            style.spacing.scroll.bar_inner_margin = 2.0;
+            style.spacing.scroll.bar_outer_margin = 2.0;
 
             style.text_styles.insert(
                 egui::TextStyle::Heading,
-                egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                egui::FontId::new(15.5, egui::FontFamily::Proportional),
             );
             style.text_styles.insert(
                 egui::TextStyle::Body,
-                egui::FontId::new(12.5, egui::FontFamily::Proportional),
+                egui::FontId::new(12.0, egui::FontFamily::Proportional),
             );
             style.text_styles.insert(
                 egui::TextStyle::Button,
@@ -3712,101 +4391,172 @@ impl MeshBcTesterApp {
             );
 
             let visuals = &mut style.visuals;
-            *visuals = egui::Visuals::dark();
-            let palette = VisualPalette::dark();
+            *visuals = match theme {
+                UiThemeMode::Dark => egui::Visuals::dark(),
+                UiThemeMode::Light => egui::Visuals::light(),
+            };
+            let palette = VisualPalette::for_theme(theme);
             apply_visual_palette(visuals, palette);
-            let radius = egui::CornerRadius::same(6);
+            let radius = egui::CornerRadius::same(4);
+            visuals.button_frame = true;
+            visuals.clip_rect_margin = 0.0;
+            visuals.striped = false;
+            visuals.window_shadow = egui::epaint::Shadow {
+                offset: [0, 12],
+                blur: 36,
+                spread: 0,
+                color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+            };
+            visuals.popup_shadow = visuals.window_shadow;
+            visuals.window_corner_radius = egui::CornerRadius::same(6);
+            visuals.menu_corner_radius = egui::CornerRadius::same(6);
             visuals.widgets.noninteractive.corner_radius = radius;
             visuals.widgets.inactive.corner_radius = radius;
             visuals.widgets.hovered.corner_radius = radius;
             visuals.widgets.active.corner_radius = radius;
             visuals.widgets.open.corner_radius = radius;
-            visuals.widgets.noninteractive.fg_stroke.color = rgb(172, 194, 214);
-            visuals.widgets.inactive.fg_stroke.color = rgb(220, 236, 250);
-            visuals.widgets.hovered.fg_stroke.color = rgb(236, 247, 255);
-            visuals.widgets.active.fg_stroke.color = rgb(242, 250, 255);
-            visuals.widgets.open.fg_stroke.color = rgb(236, 247, 255);
         });
     }
 
     fn side_panel_frame(style: &egui::Style) -> egui::Frame {
         egui::Frame::side_top_panel(style)
-            .inner_margin(egui::Margin::symmetric(5, 5))
+            .inner_margin(egui::Margin::symmetric(6, 4))
             .fill(style.visuals.panel_fill)
-            .stroke(egui::Stroke::new(
-                1.0_f32,
-                style.visuals.widgets.noninteractive.bg_stroke.color,
-            ))
+            .stroke(chrome_stroke(style.visuals.dark_mode))
     }
 
-    fn top_bottom_panel_frame(style: &egui::Style) -> egui::Frame {
+    fn top_toolbar_frame(style: &egui::Style) -> egui::Frame {
         egui::Frame::side_top_panel(style)
-            .inner_margin(egui::Margin::symmetric(5, 4))
+            .inner_margin(egui::Margin::symmetric(8, 2))
             .fill(style.visuals.panel_fill)
-            .stroke(egui::Stroke::new(
-                1.0_f32,
-                style.visuals.widgets.noninteractive.bg_stroke.color,
-            ))
+            .stroke(chrome_stroke(style.visuals.dark_mode))
     }
 
     fn panel_card_frame(ui: &egui::Ui) -> egui::Frame {
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(6, 5))
+            .inner_margin(egui::Margin::symmetric(6, 4))
             .outer_margin(egui::Margin::symmetric(0, 2))
-            .corner_radius(egui::CornerRadius::same(6))
+            .corner_radius(egui::CornerRadius::same(4))
             .fill(ui.visuals().faint_bg_color)
-            .stroke(egui::Stroke::new(
-                1.0_f32,
-                ui.visuals().widgets.noninteractive.bg_stroke.color,
-            ))
-    }
-
-    fn panel_card_collapsible(
-        ui: &mut egui::Ui,
-        id_salt: impl std::hash::Hash,
-        title: impl Into<egui::WidgetText>,
-        add_body: impl FnOnce(&mut egui::Ui),
-    ) {
-        let title = RichText::new(title.into().text())
-            .size(13.0)
-            .strong()
-            .color(rgb(142, 226, 255));
-        Self::panel_card_frame(ui).show(ui, |ui| {
-            egui::CollapsingHeader::new(title)
-                .id_salt(id_salt)
-                .default_open(true)
-                .show(ui, |ui| {
-                    add_body(ui);
-                });
-        });
+            .stroke(surface_stroke(ui.visuals().dark_mode))
     }
 
     fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         ui.add(
-            egui::Button::new(text)
-                .fill(rgb(9, 96, 138))
-                .stroke(stroke(rgb(102, 216, 255))),
+            egui::Button::new(RichText::new(text).color(rgb(255, 255, 255)))
+                .fill(rgb(0, 54, 146))
+                .stroke(stroke(rgb(0, 75, 194))),
         )
     }
 
     fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+        let (fill, stroke_color) = if ui.visuals().dark_mode {
+            (rgb(28, 33, 35), rgb(38, 43, 46))
+        } else {
+            (rgb(244, 246, 247), rgb(205, 213, 219))
+        };
         ui.add(
             egui::Button::new(text)
-                .fill(rgb(14, 25, 39))
-                .stroke(stroke(rgb(45, 75, 100))),
+                .fill(fill)
+                .stroke(stroke(stroke_color)),
         )
+    }
+
+    fn theme_icon_button(ui: &mut egui::Ui, theme: UiThemeMode) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+        let pressed = response.hovered() && ui.input(|input| input.pointer.primary_down());
+        let (hover_fill, active_fill, stroke_color, icon_color) = if ui.visuals().dark_mode {
+            (
+                rgb(43, 49, 52),
+                rgb(55, 63, 66),
+                rgb(62, 70, 74),
+                rgb(218, 231, 238),
+            )
+        } else {
+            (
+                rgb(226, 232, 236),
+                rgb(214, 228, 255),
+                rgb(190, 200, 207),
+                rgb(38, 48, 54),
+            )
+        };
+        let fill = if pressed {
+            active_fill
+        } else if response.hovered() {
+            hover_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let icon_background = if fill == egui::Color32::TRANSPARENT {
+            ui.visuals().panel_fill
+        } else {
+            fill
+        };
+        let painter = ui.painter_at(rect);
+        let button_rect = rect.shrink2(egui::vec2(1.0, 1.0));
+        if fill != egui::Color32::TRANSPARENT {
+            painter.rect_filled(button_rect, 4.0, fill);
+            painter.rect_stroke(
+                button_rect,
+                4.0,
+                stroke(stroke_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        Self::paint_theme_icon(ui, rect, theme, icon_color, icon_background);
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    fn paint_theme_icon(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        theme: UiThemeMode,
+        icon_color: egui::Color32,
+        cutout_color: egui::Color32,
+    ) {
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        match theme {
+            UiThemeMode::Dark => {
+                painter.circle_stroke(center, 3.2, egui::Stroke::new(1.3_f32, icon_color));
+                for index in 0..8 {
+                    let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                    let direction = egui::vec2(angle.cos(), angle.sin());
+                    painter.line_segment(
+                        [center + direction * 5.0, center + direction * 7.0],
+                        egui::Stroke::new(1.1_f32, icon_color),
+                    );
+                }
+            }
+            UiThemeMode::Light => {
+                painter.circle_filled(center, 5.3, icon_color);
+                painter.circle_filled(center + egui::vec2(2.4, -1.4), 5.1, cutout_color);
+            }
+        }
+    }
+
+    fn theme_toggle_button_hover(theme: UiThemeMode) -> String {
+        let target = match theme {
+            UiThemeMode::Dark => "切换到浅色主题",
+            UiThemeMode::Light => "切换到深色主题",
+        };
+        format!("当前{}，{target}", theme.label())
     }
 
     fn stat_chip(ui: &mut egui::Ui, label: &str, value: String) {
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(4, 2))
+            .inner_margin(egui::Margin::symmetric(5, 1))
             .fill(ui.visuals().extreme_bg_color)
-            .stroke(stroke(ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .stroke(surface_stroke(ui.visuals().dark_mode))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.small(RichText::new(label).color(rgb(113, 160, 194)));
+                    ui.small(RichText::new(label).color(ui.visuals().weak_text_color()));
                     ui.separator();
-                    ui.label(RichText::new(value).strong().color(rgb(234, 246, 255)));
+                    ui.label(
+                        RichText::new(value)
+                            .strong()
+                            .color(ui.visuals().strong_text_color()),
+                    );
                 });
             });
     }
@@ -3814,26 +4564,34 @@ impl MeshBcTesterApp {
     fn section_heading(ui: &mut egui::Ui, text: &str) {
         ui.label(
             RichText::new(text)
-                .size(13.0)
+                .size(12.0)
                 .strong()
-                .color(rgb(142, 226, 255)),
+                .color(accent_text_color()),
+        );
+    }
+
+    fn table_header_label(ui: &mut egui::Ui, text: &str) {
+        ui.label(
+            RichText::new(text)
+                .size(11.0)
+                .strong()
+                .color(ui.visuals().weak_text_color()),
         );
     }
 
     fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, tone: ChipTone) {
-        let (fill, border, text) = match tone {
-            ChipTone::Warning => (rgb(49, 34, 7), rgb(199, 153, 61), rgb(255, 225, 150)),
-            ChipTone::Success => (rgb(8, 53, 67), rgb(89, 210, 255), rgb(219, 246, 255)),
-            ChipTone::Neutral => (rgb(24, 23, 28), rgb(84, 96, 110), rgb(200, 210, 220)),
+        let (fill, border, text) = match (tone, ui.visuals().dark_mode) {
+            (ChipTone::Warning, true) => (rgb(49, 34, 7), rgb(171, 97, 16), rgb(255, 210, 138)),
+            (ChipTone::Warning, false) => (rgb(255, 246, 225), rgb(217, 132, 29), rgb(126, 72, 9)),
         };
 
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(4, 2))
+            .inner_margin(egui::Margin::symmetric(5, 1))
             .fill(fill)
             .stroke(stroke(border))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.small(RichText::new(label).color(rgb(128, 163, 189)));
+                    ui.small(RichText::new(label).color(ui.visuals().weak_text_color()));
                     ui.separator();
                     ui.label(RichText::new(value).strong().color(text));
                 });
@@ -3843,120 +4601,15 @@ impl MeshBcTesterApp {
     fn paint_tech_background(ui: &egui::Ui) {
         let rect = ui.max_rect();
         let painter = ui.painter_at(rect);
-        let minor = egui::Color32::from_rgba_unmultiplied(82, 205, 255, 4);
-        let major = egui::Color32::from_rgba_unmultiplied(82, 205, 255, 9);
-
-        let grid = 28.0;
-        let mut x = rect.left();
-        let mut index = 0;
-        while x <= rect.right() {
-            let color = if index % 4 == 0 { major } else { minor };
-            let width = if index % 4 == 0 { 1.0_f32 } else { 0.5_f32 };
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(width, color),
-            );
-            x += grid;
-            index += 1;
-        }
-
-        let mut y = rect.top();
-        let mut row = 0;
-        while y <= rect.bottom() {
-            let color = if row % 4 == 0 { major } else { minor };
-            let width = if row % 4 == 0 { 1.0_f32 } else { 0.5_f32 };
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(width, color),
-            );
-            y += grid;
-            row += 1;
-        }
+        painter.rect_filled(rect, 0.0, ui.visuals().window_fill);
     }
 
     fn compact_widget<W: egui::Widget>(ui: &mut egui::Ui, width: f32, widget: W) -> egui::Response {
-        ui.add_sized([width, 24.0], widget)
+        ui.add_sized([width, 22.0], widget)
     }
 
     fn compact_text_edit(ui: &mut egui::Ui, width: f32, value: &mut String) -> egui::Response {
         Self::compact_widget(ui, width, TextEdit::singleline(value))
-    }
-
-    fn compact_text_edit_hint(
-        ui: &mut egui::Ui,
-        width: f32,
-        value: &mut String,
-        hint: &str,
-    ) -> egui::Response {
-        Self::compact_widget(ui, width, TextEdit::singleline(value).hint_text(hint))
-    }
-
-    fn device_secondary_summary(state: &DeviceRuntimeState) -> Option<String> {
-        let mut parts = Vec::new();
-
-        if !state.last_result.is_empty() {
-            let label = if state.last_result_label.is_empty() {
-                "结果"
-            } else {
-                state.last_result_label.as_str()
-            };
-            parts.push(format!(
-                "{}:{}",
-                label,
-                Self::truncate_for_row(&state.last_result, 24)
-            ));
-        }
-
-        for (label, value) in [
-            ("版本", state.last_version.as_str()),
-            ("型号", state.last_device_model.as_str()),
-            ("Mesh", state.last_mesh_addr.as_str()),
-            ("场景", state.last_scene_id.as_str()),
-            ("功率", state.last_power_w.as_str()),
-            ("组网", state.last_group_info.as_str()),
-            ("事件", state.last_motion_event.as_str()),
-            ("MAC", state.last_mac_addr.as_str()),
-        ] {
-            if !value.is_empty() {
-                parts.push(format!("{label}:{value}"));
-            }
-        }
-
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.into_iter().take(4).collect::<Vec<_>>().join(" · "))
-        }
-    }
-
-    fn device_selected_detail_summary(state: &DeviceRuntimeState) -> Option<String> {
-        let mut parts = Vec::new();
-
-        for (label, value) in [
-            ("模式", state.last_run_mode.as_str()),
-            ("心跳", state.last_heartbeat_interval.as_str()),
-            ("遥控组网", state.last_remote_network_enable.as_str()),
-            ("联动", state.last_group_linkage.as_str()),
-            ("联动模式", state.last_linkage_mode.as_str()),
-            ("微波", state.last_microwave_setting.as_str()),
-            ("联动组", state.last_linkage_group_state.as_str()),
-            ("能耗", state.last_energy_kwh.as_str()),
-            ("A灯", state.last_a_light_total.as_str()),
-            ("分区", state.last_partition_addr.as_str()),
-            ("车道组", state.last_lane_group_addr.as_str()),
-            ("相邻组", state.last_adjacent_group_addr.as_str()),
-            ("场景摘要", state.last_scene_summary.as_str()),
-        ] {
-            if !value.is_empty() {
-                parts.push(format!("{label}:{value}"));
-            }
-        }
-
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.into_iter().take(6).collect::<Vec<_>>().join(" · "))
-        }
     }
 
     fn truncate_for_row(text: &str, max_chars: usize) -> String {
@@ -4058,12 +4711,11 @@ fn update_discovered_device_from_payload(candidate: &mut DiscoveredDevice, paylo
         return;
     };
 
-    if let Some(src_addr) = payload.get("src_addr").and_then(Value::as_u64) {
-        if let Ok(src_addr) = u16::try_from(src_addr) {
-            if src_addr != 0 {
-                candidate.default_dest_addr = Some(src_addr);
-            }
-        }
+    if let Some(src_addr) = payload.get("src_addr").and_then(Value::as_u64)
+        && let Ok(src_addr) = u16::try_from(src_addr)
+        && src_addr != 0
+    {
+        candidate.default_dest_addr = Some(src_addr);
     }
 
     match opcode {
@@ -4076,56 +4728,55 @@ fn update_discovered_device_from_payload(candidate: &mut DiscoveredDevice, paylo
             if let Some(version) = payload.get("version").and_then(Value::as_str) {
                 candidate.version = version.to_string();
             }
-            if let Some(device_id) = payload.get("dev_id").and_then(Value::as_str) {
-                if !device_id.is_empty() {
-                    candidate.device_id = device_id.to_string();
-                    let (up_topic, down_topic) = DeviceProfile::default_topics(device_id);
-                    candidate.up_topic = up_topic;
-                    candidate.down_topic = down_topic;
-                }
+            if let Some(device_id) = payload.get("dev_id").and_then(Value::as_str)
+                && !device_id.is_empty()
+            {
+                candidate.device_id = device_id.to_string();
+                let (up_topic, down_topic) = DeviceProfile::default_topics(device_id);
+                candidate.up_topic = up_topic;
+                candidate.down_topic = down_topic;
             }
         }
         0x1B => {
-            if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                    if bytes.len() >= 3 {
-                        candidate.version = format!("0x{:02X}", bytes[2]);
-                    }
-                    if bytes.len() >= 4 {
-                        candidate.mesh_dev_type = bytes[3];
-                        if candidate.dev_model.is_empty() {
-                            candidate.suggested_name = suggested_discovered_name(
-                                &candidate.device_id,
-                                Some(match bytes[3] {
-                                    0 => "A灯",
-                                    1 => "B/C灯",
-                                    2 => "节能灯",
-                                    _ => "发现设备",
-                                }),
-                            );
-                        }
+            if let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+            {
+                if bytes.len() >= 3 {
+                    candidate.version = format!("0x{:02X}", bytes[2]);
+                }
+                if bytes.len() >= 4 {
+                    candidate.mesh_dev_type = bytes[3];
+                    if candidate.dev_model.is_empty() {
+                        candidate.suggested_name = suggested_discovered_name(
+                            &candidate.device_id,
+                            Some(match bytes[3] {
+                                0 => "A灯",
+                                1 => "B/C灯",
+                                2 => "节能灯",
+                                _ => "发现设备",
+                            }),
+                        );
                     }
                 }
             }
         }
         0x10 => {}
         0x1D => {
-            if candidate.default_dest_addr.is_none() {
-                if let Some(value) = payload.get("value").and_then(Value::as_str) {
-                    if let Ok(bytes) = crate::protocol::hex_to_bytes(value) {
-                        if bytes.len() >= 7 && matches!(bytes[0], 8 | 255) {
-                            candidate.last_summary = format!(
-                                "{} | MAC {}",
-                                candidate.last_summary,
-                                bytes[1..7]
-                                    .iter()
-                                    .map(|byte| format!("{byte:02X}"))
-                                    .collect::<Vec<_>>()
-                                    .join(":")
-                            );
-                        }
-                    }
-                }
+            if candidate.default_dest_addr.is_none()
+                && let Some(value) = payload.get("value").and_then(Value::as_str)
+                && let Ok(bytes) = crate::protocol::hex_to_bytes(value)
+                && bytes.len() >= 7
+                && matches!(bytes[0], 8 | 255)
+            {
+                candidate.last_summary = format!(
+                    "{} | MAC {}",
+                    candidate.last_summary,
+                    bytes[1..7]
+                        .iter()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(":")
+                );
             }
         }
         _ => {}
@@ -4156,50 +4807,110 @@ fn compatible_up_topic_filters(topic: &str) -> Vec<String> {
     vec![prefix.to_string(), format!("{prefix}/#")]
 }
 
+fn subscription_topics_for_devices(
+    devices: &[DeviceProfile],
+    auto_discovery_enabled: bool,
+) -> Vec<String> {
+    let mut topics = devices
+        .iter()
+        .filter(|device| device.subscribe_enabled)
+        .flat_map(|device| compatible_up_topic_filters(&device.up_topic))
+        .collect::<BTreeSet<_>>();
+
+    if auto_discovery_enabled {
+        topics.extend(
+            DISCOVERY_UP_TOPIC_FILTERS
+                .iter()
+                .map(|topic| (*topic).to_string()),
+        );
+    }
+
+    topics.into_iter().collect()
+}
+
 fn configure_chinese_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    if let Some((name, font_data)) = load_chinese_font() {
+    let proportional_font = load_font_from_candidates("zh_cn_ui", PROPORTIONAL_CJK_FONT_CANDIDATES);
+    let proportional_name = proportional_font.as_ref().map(|(name, _)| name.clone());
+    if let Some((name, font_data)) = proportional_font {
         fonts
             .font_data
-            .insert(name.clone().into(), std::sync::Arc::new(font_data));
+            .insert(name.clone(), std::sync::Arc::new(font_data));
         fonts
             .families
             .entry(FontFamily::Proportional)
             .or_default()
-            .push(name.clone().into());
+            .insert(0, name);
+    }
+
+    if let Some((name, font_data)) =
+        load_font_from_candidates("zh_cn_mono", MONOSPACE_CJK_FONT_CANDIDATES)
+    {
+        fonts
+            .font_data
+            .insert(name.clone(), std::sync::Arc::new(font_data));
         fonts
             .families
             .entry(FontFamily::Monospace)
             .or_default()
-            .push(name.into());
+            .insert(0, name);
+    } else if let Some(name) = proportional_name {
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push(name);
     }
 
     ctx.set_fonts(fonts);
 }
 
-fn load_chinese_font() -> Option<(String, FontData)> {
-    let candidates: &[(&str, u32)] = &[
-        ("assets/fonts/NotoSansSC-Regular.otf", 0),
-        ("assets/fonts/SourceHanSansCN-Regular.otf", 0),
-        ("assets/fonts/SourceHanSansSC-Regular.otf", 0),
-        ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
-        ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
-        ("/System/Library/Fonts/STHeiti Light.ttc", 0),
-        ("/System/Library/Fonts/PingFang.ttc", 0),
-        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
-        (
-            "/usr/share/fonts/opentype/noto/NotoSansCJKSC-Regular.otf",
-            0,
-        ),
-        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
-        ("C:/Windows/Fonts/msyh.ttc", 0),
-        ("C:/Windows/Fonts/msyhbd.ttc", 0),
-        ("C:/Windows/Fonts/simhei.ttf", 0),
-        ("C:/Windows/Fonts/simsun.ttc", 0),
-        ("C:/Windows/Fonts/Deng.ttf", 0),
-    ];
+const PROPORTIONAL_CJK_FONT_CANDIDATES: &[(&str, u32)] = &[
+    ("assets/fonts/SourceHanSansSC-Regular.otf", 0),
+    ("assets/fonts/SourceHanSansCN-Regular.otf", 0),
+    ("assets/fonts/NotoSansCJKsc-Regular.otf", 0),
+    ("assets/fonts/NotoSansCJKSC-Regular.otf", 0),
+    ("assets/fonts/NotoSansSC-Regular.otf", 0),
+    ("/System/Library/Fonts/PingFang.ttc", 0),
+    ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+    (
+        "/usr/share/fonts/opentype/noto/NotoSansCJKSC-Regular.otf",
+        0,
+    ),
+    (
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        0,
+    ),
+    (
+        "/usr/share/fonts/opentype/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
+        0,
+    ),
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+    ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
+    ("/System/Library/Fonts/STHeiti Light.ttc", 0),
+    ("C:/Windows/Fonts/msyh.ttc", 0),
+    ("C:/Windows/Fonts/Deng.ttf", 0),
+];
 
+const MONOSPACE_CJK_FONT_CANDIDATES: &[(&str, u32)] = &[
+    ("assets/fonts/NotoSansMonoCJKsc-Regular.otf", 0),
+    ("assets/fonts/NotoSansMonoCJKSC-Regular.otf", 0),
+    ("assets/fonts/SarasaMonoSC-Regular.ttf", 0),
+    ("assets/fonts/SarasaMonoSC-Regular.otf", 0),
+    ("assets/fonts/SarasaGothicSC-Regular.ttf", 0),
+    (
+        "/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc",
+        0,
+    ),
+    (
+        "/usr/share/fonts/opentype/noto/NotoSansMonoCJKsc-Regular.otf",
+        0,
+    ),
+];
+
+fn load_font_from_candidates(name: &str, candidates: &[(&str, u32)]) -> Option<(String, FontData)> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
@@ -4226,7 +4937,7 @@ fn load_chinese_font() -> Option<(String, FontData)> {
                     ..Default::default()
                 });
                 data.index = *index;
-                return Some(("zh_cn_ui".into(), data));
+                return Some((name.into(), data));
             }
         }
     }
@@ -4283,11 +4994,87 @@ mod tests {
         assert_eq!(index, None);
     }
 
+    #[test]
+    fn transfer_engine_settings_are_independent_by_transfer_family() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.transfer_packet_delay_ms = 25;
+        app.transfer_ack_timeout_secs = 30;
+        app.bc_ota_start_ack_timeout_secs = 45;
+        app.transfer_max_retries = 4;
+        app.voice_transfer_packet_delay_ms = 7;
+        app.voice_transfer_ack_timeout_secs = 9;
+        app.voice_transfer_max_retries = 1;
+
+        let ota = app.transfer_engine_settings(TransferKind::BcOta);
+        assert_eq!(ota.packet_delay_ms, 25);
+        assert_eq!(ota.ack_timeout_secs, 30);
+        assert_eq!(ota.bc_ota_start_ack_timeout_secs, 45);
+        assert_eq!(ota.max_retries, 4);
+
+        let voice = app.transfer_engine_settings(TransferKind::VoiceFile);
+        assert_eq!(voice.packet_delay_ms, 7);
+        assert_eq!(voice.ack_timeout_secs, 9);
+        assert_eq!(voice.bc_ota_start_ack_timeout_secs, 45);
+        assert_eq!(voice.max_retries, 1);
+    }
+
+    fn log_entry(device_id: &str, opcode: &str, summary: &str) -> LogEntry {
+        LogEntry {
+            timestamp: now_display(),
+            direction: LogDirection::Rx,
+            device_name: format!("设备{device_id}"),
+            device_id: device_id.into(),
+            topic: format!("/application/AP-C-BM/device/{device_id}/up"),
+            opcode: opcode.into(),
+            status: "接收".into(),
+            summary: summary.into(),
+            payload: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn selected_log_indices_preserve_source_indices_for_virtual_rows() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![DeviceProfile {
+            local_id: 10,
+            name: "设备A".into(),
+            device_id: "dev-a".into(),
+            up_topic: "/application/AP-C-BM/device/dev-a/up".into(),
+            down_topic: "/application/AP-C-BM/device/dev-a/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+        app.selected_devices.insert(10);
+        app.show_selected_logs_only = true;
+        app.log_filter_text = "OTA".into();
+        app.logs = vec![
+            log_entry("dev-a", "0x41", "OTA ack first"),
+            log_entry("dev-b", "0x41", "OTA ack other device"),
+            log_entry("dev-a", "0x1B", "heartbeat"),
+            log_entry("dev-a", "0x42", "OTA data"),
+        ];
+
+        assert_eq!(app.selected_log_indices(), vec![0, 3]);
+    }
+
+    #[test]
+    fn select_log_row_updates_selected_entry_and_stops_following() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.follow_latest_logs = true;
+
+        app.select_log_row(3);
+
+        assert_eq!(app.selected_log_index, Some(3));
+        assert!(!app.follow_latest_logs);
+    }
+
     fn sample_transfer() -> ActiveTransfer {
         ActiveTransfer {
             device_local_id: 1,
             device_name: "设备A".into(),
             device_id: "dev-a".into(),
+            up_topic: "topic/up".into(),
             down_topic: "topic/down".into(),
             kind: TransferKind::BcOta,
             packets: vec![
@@ -4326,6 +5113,7 @@ mod tests {
             device_local_id: 1,
             device_name: "设备A".into(),
             device_id: "dev-a".into(),
+            up_topic: "topic/up".into(),
             down_topic: "topic/down".into(),
             kind: TransferKind::AOta,
             packets: vec![
@@ -4358,6 +5146,15 @@ mod tests {
             transfer_display_total_packets(TransferKind::BcOta, transfer.packets.len()),
             1
         );
+    }
+
+    #[test]
+    fn transfer_packet_log_sampling_keeps_key_packets() {
+        assert!(should_log_transfer_packet(0, 8673));
+        assert!(should_log_transfer_packet(100, 8673));
+        assert!(should_log_transfer_packet(8672, 8673));
+        assert!(!should_log_transfer_packet(99, 8673));
+        assert!(!should_log_transfer_packet(101, 8673));
     }
 
     #[test]
@@ -4832,6 +5629,34 @@ mod tests {
                 "/application/AP-C-BM/device/34B7DA848802/up/#".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn subscription_topics_include_discovery_wildcards_when_enabled() {
+        let device = DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        };
+
+        let topics = subscription_topics_for_devices(&[device], true);
+
+        assert!(topics.contains(&"/application/AP-C-BM/device/+/up".to_string()));
+        assert!(topics.contains(&"/application/AP-C-BM/device/+/up/#".to_string()));
+        assert!(topics.contains(&"/application/AP-C-BM/device/34B7DA848802/up/#".to_string()));
+    }
+
+    #[test]
+    fn subscription_topics_skip_discovery_wildcards_when_disabled() {
+        let topics = subscription_topics_for_devices(&[], false);
+
+        assert!(!topics.contains(&"/application/AP-C-BM/device/+/up".to_string()));
+        assert!(!topics.contains(&"/application/AP-C-BM/device/+/up/#".to_string()));
     }
 
     #[test]
