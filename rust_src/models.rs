@@ -162,6 +162,90 @@ pub enum TransferKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct BytesTransferFrame {
+    pub command: u8,
+    pub message_id: u64,
+    pub protocol_version: u8,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TransferPayload {
+    Json(Value),
+    BytesFrame(BytesTransferFrame),
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferPacket {
+    pub opcode: u32,
+    pub payload: TransferPayload,
+}
+
+impl TransferPacket {
+    pub fn json(payload: Value) -> Self {
+        let opcode = payload.get("opcode").and_then(Value::as_u64).unwrap_or(0) as u32;
+        Self {
+            opcode,
+            payload: TransferPayload::Json(payload),
+        }
+    }
+
+    pub fn bytes_frame(frame: BytesTransferFrame) -> Self {
+        Self {
+            opcode: u32::from(frame.command),
+            payload: TransferPayload::BytesFrame(frame),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn json_value(&self) -> Option<&Value> {
+        match &self.payload {
+            TransferPayload::Json(payload) => Some(payload),
+            TransferPayload::BytesFrame(_) => None,
+        }
+    }
+
+    pub fn message_id(&self) -> Option<u64> {
+        match &self.payload {
+            TransferPayload::Json(payload) => payload.get("time_stamp").and_then(Value::as_u64),
+            TransferPayload::BytesFrame(frame) => Some(frame.message_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaTransferFormat {
+    Json,
+    Bytes,
+}
+
+impl OtaTransferFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Bytes => "Bytes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferAckPhase {
+    None,
+    Start,
+    Packet,
+}
+
+impl TransferAckPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Start => "start",
+            Self::Packet => "packet",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ActiveTransfer {
     pub device_local_id: u64,
     pub device_name: String,
@@ -169,10 +253,15 @@ pub struct ActiveTransfer {
     pub up_topic: String,
     pub down_topic: String,
     pub kind: TransferKind,
-    pub packets: Vec<Value>,
+    pub format: OtaTransferFormat,
+    pub packets: Vec<TransferPacket>,
+    pub packet_delay_ms: u64,
+    pub ack_timeout_secs: u64,
+    pub start_ack_timeout_secs: u64,
     pub next_index: usize,
     pub next_send_at: Instant,
     pub waiting_ack_opcode: Option<u32>,
+    pub ack_phase: TransferAckPhase,
     pub waiting_since: Option<Instant>,
     pub last_sent_index: Option<usize>,
     pub last_sent_time_stamp: Option<u64>,
@@ -192,9 +281,14 @@ pub struct TransferSnapshot {
     pub device_name: String,
     pub device_id: String,
     pub kind: TransferKind,
+    pub format: OtaTransferFormat,
     pub next_index: usize,
     pub packet_count: usize,
+    pub packet_delay_ms: u64,
+    pub ack_timeout_secs: u64,
+    pub start_ack_timeout_secs: u64,
     pub waiting_ack_opcode: Option<u32>,
+    pub ack_phase: TransferAckPhase,
     pub retry_count: u8,
     pub max_retries: u8,
     pub status: String,
@@ -212,9 +306,14 @@ impl From<&ActiveTransfer> for TransferSnapshot {
             device_name: transfer.device_name.clone(),
             device_id: transfer.device_id.clone(),
             kind: transfer.kind,
+            format: transfer.format,
             next_index: transfer.next_index,
             packet_count: transfer.packets.len(),
+            packet_delay_ms: transfer.packet_delay_ms,
+            ack_timeout_secs: transfer.ack_timeout_secs,
+            start_ack_timeout_secs: transfer.start_ack_timeout_secs,
             waiting_ack_opcode: transfer.waiting_ack_opcode,
+            ack_phase: transfer.ack_phase,
             retry_count: transfer.retry_count,
             max_retries: transfer.max_retries,
             status: transfer.status.clone(),
@@ -247,6 +346,8 @@ pub struct AppConfig {
     pub transfer_ack_timeout_secs: u64,
     #[serde(default)]
     pub bc_ota_start_ack_timeout_secs: u64,
+    #[serde(default = "default_bytes_ota_chunk_size")]
+    pub bytes_ota_chunk_size: usize,
     pub transfer_max_retries: u8,
     #[serde(default)]
     pub voice_transfer_packet_delay_ms: u64,
@@ -267,6 +368,7 @@ impl Default for AppConfig {
             transfer_packet_delay_ms: 15,
             transfer_ack_timeout_secs: 10,
             bc_ota_start_ack_timeout_secs: 20,
+            bytes_ota_chunk_size: default_bytes_ota_chunk_size(),
             transfer_max_retries: 2,
             voice_transfer_packet_delay_ms: 15,
             voice_transfer_ack_timeout_secs: 10,
@@ -274,6 +376,10 @@ impl Default for AppConfig {
             ui_theme_mode: UiThemeMode::Dark,
         }
     }
+}
+
+fn default_bytes_ota_chunk_size() -> usize {
+    1024
 }
 
 impl AppConfig {

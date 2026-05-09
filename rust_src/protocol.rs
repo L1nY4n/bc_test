@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::models::{DeviceProfile, TransferKind};
+use crate::models::{
+    BytesTransferFrame, DeviceProfile, OtaTransferFormat, TransferKind, TransferPacket,
+    TransferPayload,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
@@ -878,6 +881,10 @@ pub fn current_time_stamp() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
+fn current_time_millis() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
 pub fn bytes_to_hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02X}")).collect()
 }
@@ -1412,6 +1419,292 @@ pub fn chunk_count(data: &[u8], chunk_size: usize) -> usize {
 
 const OTA_TRANSFER_CHUNK_SIZE: usize = 200;
 const MEDIA_TRANSFER_CHUNK_SIZE: usize = 400;
+pub const DEFAULT_BYTES_OTA_CHUNK_SIZE: usize = 1024;
+pub const BYTES_OTA_QUICK_CHUNK_SIZES: [usize; 3] = [1024, 512, 256];
+const BYTES_OTA_MAX_CHUNKS: usize = 2048;
+const BYTES_OTA_MAX_CHUNK_SIZE: usize = 1024;
+const BYTES_FRAME_HEADER_SIZE: usize = 26;
+const BYTES_FRAME_PREFIX: [u8; 2] = [0xFE, 0xFE];
+const BYTES_FRAME_DEVICE_TYPE: u8 = 0x01;
+const BYTES_FRAME_MODULE_TYPE: u8 = 0x00;
+const BYTES_FRAME_MODULE_INDEX: u8 = 0x00;
+const BYTES_FRAME_COMMAND_TYPE: u8 = 0x02;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedBytesTransferFrame {
+    pub command: u8,
+    pub message_id: u64,
+    pub body: Vec<u8>,
+}
+
+pub fn build_transfer_packets_for_format(
+    kind: TransferKind,
+    format: OtaTransferFormat,
+    data: &[u8],
+    version: u8,
+    voice_name: &str,
+    bytes_chunk_size: usize,
+) -> Result<Vec<TransferPacket>, String> {
+    match format {
+        OtaTransferFormat::Json => build_transfer_packets(kind, data, version, voice_name)
+            .map(|packets| packets.into_iter().map(TransferPacket::json).collect()),
+        OtaTransferFormat::Bytes => {
+            build_bytes_ota_transfer_packets(kind, data, version, bytes_chunk_size)
+        }
+    }
+}
+
+pub fn transfer_preview_for_format(
+    kind: TransferKind,
+    format: OtaTransferFormat,
+    data: &[u8],
+    version: u8,
+    voice_name: &str,
+    bytes_chunk_size: usize,
+) -> Value {
+    match format {
+        OtaTransferFormat::Json => transfer_preview(kind, data, version, voice_name),
+        OtaTransferFormat::Bytes => {
+            bytes_ota_transfer_preview(kind, data, version, bytes_chunk_size)
+        }
+    }
+}
+
+pub fn build_bytes_ota_transfer_packets(
+    kind: TransferKind,
+    data: &[u8],
+    protocol_version: u8,
+    chunk_size: usize,
+) -> Result<Vec<TransferPacket>, String> {
+    if data.is_empty() {
+        return Err("传输数据不能为空".into());
+    }
+    validate_bytes_ota_chunk_size(chunk_size)?;
+    let Some((start_opcode, data_opcode, end_opcode)) = bytes_ota_opcodes(kind) else {
+        return Err("Bytes OTA 仅支持 A灯/BC灯 APP升级".into());
+    };
+    let chunk_total = chunk_count(data, chunk_size);
+    if chunk_total > BYTES_OTA_MAX_CHUNKS {
+        return Err(format!(
+            "Bytes OTA 数据块数 {} 超出协议上限 {}",
+            chunk_total, BYTES_OTA_MAX_CHUNKS
+        ));
+    }
+
+    let base_message_id = current_time_millis();
+    let padded_data = padded_bytes_ota_data(data, chunk_size);
+    let mut packets = Vec::with_capacity(chunk_total + 2);
+    packets.push(TransferPacket::bytes_frame(BytesTransferFrame {
+        command: start_opcode,
+        message_id: base_message_id,
+        protocol_version,
+        body: vec![1],
+    }));
+
+    for chunk_id in 0..chunk_total {
+        let chunk = &data[chunk_id * chunk_size..data.len().min((chunk_id + 1) * chunk_size)];
+        let mut body = Vec::with_capacity(2 + chunk_size);
+        body.extend_from_slice(&(chunk_id as u16).to_be_bytes());
+        body.extend_from_slice(&padded_bytes_ota_chunk(chunk, chunk_size));
+        packets.push(TransferPacket::bytes_frame(BytesTransferFrame {
+            command: data_opcode,
+            message_id: base_message_id.wrapping_add(chunk_id as u64 + 1),
+            protocol_version,
+            body,
+        }));
+    }
+
+    let mut end_body = Vec::with_capacity(6);
+    end_body.extend_from_slice(&(padded_data.len() as u32).to_be_bytes());
+    end_body.extend_from_slice(&crc16_xmodem(&padded_data).to_be_bytes());
+    packets.push(TransferPacket::bytes_frame(BytesTransferFrame {
+        command: end_opcode,
+        message_id: base_message_id.wrapping_add(chunk_total as u64 + 1),
+        protocol_version,
+        body: end_body,
+    }));
+    Ok(packets)
+}
+
+pub fn bytes_ota_transfer_preview(
+    kind: TransferKind,
+    data: &[u8],
+    protocol_version: u8,
+    chunk_size: usize,
+) -> Value {
+    let chunk_size = if validate_bytes_ota_chunk_size(chunk_size).is_ok() {
+        chunk_size
+    } else {
+        DEFAULT_BYTES_OTA_CHUNK_SIZE
+    };
+    let chunk_total = data.len().div_ceil(chunk_size);
+    let padded_total_size = chunk_total * chunk_size;
+    let check_sum = crc16_xmodem(&padded_bytes_ota_data(data, chunk_size));
+    let (start_opcode, data_opcode, end_opcode) = bytes_ota_opcodes(kind).unwrap_or((0, 0, 0));
+    json!({
+        "format": "bytes",
+        "opcode": start_opcode,
+        "data_opcode": data_opcode,
+        "end_opcode": end_opcode,
+        "protocol_version": protocol_version,
+        "ota_pack_count": chunk_total,
+        "ota_total_size": data.len(),
+        "ota_padded_total_size": padded_total_size,
+        "chunk_size": chunk_size,
+        "check_sum": check_sum,
+    })
+}
+
+pub fn render_transfer_packet_payload(
+    packet: &TransferPacket,
+    device_id: &str,
+) -> Result<Vec<u8>, String> {
+    match &packet.payload {
+        TransferPayload::Json(payload) => Ok(payload.to_string().into_bytes()),
+        TransferPayload::BytesFrame(frame) => render_bytes_transfer_frame(frame, device_id),
+    }
+}
+
+pub fn render_bytes_transfer_frame(
+    frame: &BytesTransferFrame,
+    device_id: &str,
+) -> Result<Vec<u8>, String> {
+    let frame_len = BYTES_FRAME_HEADER_SIZE + frame.body.len();
+    if frame_len > u16::MAX as usize {
+        return Err("Bytes MQTT帧过长，无法编码长度字段".into());
+    }
+
+    let mut payload = Vec::with_capacity(frame_len + 2);
+    payload.extend_from_slice(&BYTES_FRAME_PREFIX);
+    payload.extend_from_slice(&(frame_len as u16).to_be_bytes());
+    payload.push(frame.protocol_version);
+    payload.push(BYTES_FRAME_DEVICE_TYPE);
+    payload.extend_from_slice(&device_id_frame_bytes(device_id)?);
+    payload.push(BYTES_FRAME_MODULE_TYPE);
+    payload.push(BYTES_FRAME_MODULE_INDEX);
+    payload.push(BYTES_FRAME_COMMAND_TYPE);
+    payload.push(frame.command);
+    payload.extend_from_slice(&frame.message_id.to_be_bytes());
+    payload.extend_from_slice(&frame.body);
+    let checksum = crc16_xmodem(&payload);
+    payload.extend_from_slice(&checksum.to_be_bytes());
+    Ok(payload)
+}
+
+pub fn decode_bytes_transfer_frame(payload: &[u8]) -> Option<DecodedBytesTransferFrame> {
+    if payload.len() < BYTES_FRAME_HEADER_SIZE + 2 {
+        return None;
+    }
+    if payload.get(0..2)? != BYTES_FRAME_PREFIX {
+        return None;
+    }
+    let frame_len = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+    if frame_len < BYTES_FRAME_HEADER_SIZE || payload.len() != frame_len + 2 {
+        return None;
+    }
+    let expected_crc = u16::from_be_bytes([payload[frame_len], payload[frame_len + 1]]);
+    if crc16_xmodem(&payload[..frame_len]) != expected_crc {
+        return None;
+    }
+    let message_id = u64::from_be_bytes(payload[18..26].try_into().ok()?);
+    Some(DecodedBytesTransferFrame {
+        command: payload[17],
+        message_id,
+        body: payload[BYTES_FRAME_HEADER_SIZE..frame_len].to_vec(),
+    })
+}
+
+pub fn decode_bytes_transfer_ack_payload(payload: &[u8]) -> Option<Value> {
+    let frame = decode_bytes_transfer_frame(payload)?;
+    let return_code = frame.body.first().copied().unwrap_or(0xFF);
+    let value = if return_code == 0 {
+        "Execute OK"
+    } else {
+        "Execute Error"
+    };
+    let mut payload = json!({
+        "opcode": frame.command,
+        "value": value,
+        "return_code": return_code,
+        "time_stamp": frame.message_id,
+    });
+    if matches!(frame.command, 0xC3 | 0xC9) && frame.body.len() >= 3 {
+        payload["ota_data_index"] = json!(u16::from_be_bytes([frame.body[1], frame.body[2]]));
+    }
+    Some(payload)
+}
+
+fn bytes_ota_opcodes(kind: TransferKind) -> Option<(u8, u8, u8)> {
+    match kind {
+        TransferKind::BcOta => Some((0xC0, 0xC2, 0xC4)),
+        TransferKind::AOta => Some((0xC6, 0xC8, 0xCA)),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => None,
+    }
+}
+
+pub fn build_bytes_control_packet(
+    command: u8,
+    body: Vec<u8>,
+    protocol_version: u8,
+) -> TransferPacket {
+    TransferPacket::bytes_frame(BytesTransferFrame {
+        command,
+        message_id: current_time_millis(),
+        protocol_version,
+        body,
+    })
+}
+
+pub fn validate_bytes_ota_chunk_size(chunk_size: usize) -> Result<(), String> {
+    if chunk_size == 0 {
+        return Err("Bytes OTA 分包长度必须大于 0。".into());
+    }
+    if chunk_size > BYTES_OTA_MAX_CHUNK_SIZE {
+        return Err(format!(
+            "Bytes OTA 分包长度不能超过 {} 字节。",
+            BYTES_OTA_MAX_CHUNK_SIZE
+        ));
+    }
+    Ok(())
+}
+
+fn padded_bytes_ota_chunk(chunk: &[u8], chunk_size: usize) -> Vec<u8> {
+    let mut padded = chunk.to_vec();
+    padded.resize(chunk_size, 0xFF);
+    padded
+}
+
+fn padded_bytes_ota_data(data: &[u8], chunk_size: usize) -> Vec<u8> {
+    let mut padded = data.to_vec();
+    let padded_len = chunk_count(data, chunk_size) * chunk_size;
+    padded.resize(padded_len, 0xFF);
+    padded
+}
+
+fn device_id_frame_bytes(device_id: &str) -> Result<[u8; 8], String> {
+    let trimmed = device_id.trim();
+    if trimmed.is_empty() {
+        return Err("Bytes OTA 设备ID不能为空，需填写十六进制设备ID。".into());
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("Bytes OTA 设备ID必须只包含十六进制字符。".into());
+    }
+    if !trimmed.len().is_multiple_of(2) {
+        return Err("Bytes OTA 设备ID十六进制长度必须为偶数。".into());
+    }
+    let bytes = hex_to_bytes(trimmed)?;
+    if bytes.len() > 8 {
+        return Err("Bytes OTA 设备ID最多只能编码为8字节。".into());
+    }
+    Ok(right_aligned_8(&bytes))
+}
+
+fn right_aligned_8(bytes: &[u8]) -> [u8; 8] {
+    let mut output = [0; 8];
+    let copy_len = bytes.len().min(8);
+    output[8 - copy_len..].copy_from_slice(&bytes[bytes.len() - copy_len..]);
+    output
+}
 
 pub fn build_transfer_packets(
     kind: TransferKind,
@@ -1727,6 +2020,143 @@ mod tests {
         assert_eq!(value.len(), OTA_TRANSFER_CHUNK_SIZE * 2);
         assert!(value.starts_with("6B"));
         assert!(value[2..].chars().all(|ch| ch == '0'));
+    }
+
+    #[test]
+    fn build_bytes_bc_ota_frames_follow_document_layout() {
+        let data = vec![0x5A; DEFAULT_BYTES_OTA_CHUNK_SIZE + 1];
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            &data,
+            1,
+            "",
+            DEFAULT_BYTES_OTA_CHUNK_SIZE,
+        )
+        .unwrap();
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0].opcode, 0xC0);
+        assert_eq!(packets[1].opcode, 0xC2);
+        assert_eq!(packets[3].opcode, 0xC4);
+
+        let start = render_transfer_packet_payload(&packets[0], "34B7DA848802").unwrap();
+        assert_eq!(&start[0..2], &[0xFE, 0xFE]);
+        assert_eq!(u16::from_be_bytes([start[2], start[3]]), 27);
+        assert_eq!(start[4], 1);
+        assert_eq!(&start[6..14], &[0, 0, 0x34, 0xB7, 0xDA, 0x84, 0x88, 0x02]);
+        assert_eq!(start[16], 0x02);
+        assert_eq!(start[17], 0xC0);
+        assert_eq!(start[26], 1);
+        let start_crc = u16::from_be_bytes([start[start.len() - 2], start[start.len() - 1]]);
+        assert_eq!(start_crc, crc16_xmodem(&start[..start.len() - 2]));
+
+        let data_frame = render_transfer_packet_payload(&packets[2], "34B7DA848802").unwrap();
+        assert_eq!(data_frame[17], 0xC2);
+        assert_eq!(u16::from_be_bytes([data_frame[26], data_frame[27]]), 1);
+        assert_eq!(data_frame[28], 0x5A);
+        assert!(
+            data_frame[29..26 + 2 + DEFAULT_BYTES_OTA_CHUNK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0xFF)
+        );
+
+        let end = render_transfer_packet_payload(&packets[3], "34B7DA848802").unwrap();
+        assert_eq!(end[17], 0xC4);
+        assert_eq!(
+            u32::from_be_bytes([end[26], end[27], end[28], end[29]]),
+            (DEFAULT_BYTES_OTA_CHUNK_SIZE * 2) as u32
+        );
+        let mut padded = data.clone();
+        padded.resize(DEFAULT_BYTES_OTA_CHUNK_SIZE * 2, 0xFF);
+        assert_eq!(
+            u16::from_be_bytes([end[30], end[31]]),
+            crc16_xmodem(&padded)
+        );
+    }
+
+    #[test]
+    fn build_bytes_a_ota_uses_a_light_opcodes() {
+        let packets = build_transfer_packets_for_format(
+            TransferKind::AOta,
+            OtaTransferFormat::Bytes,
+            b"abc",
+            1,
+            "",
+            DEFAULT_BYTES_OTA_CHUNK_SIZE,
+        )
+        .unwrap();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|packet| packet.opcode)
+                .collect::<Vec<_>>(),
+            vec![0xC6, 0xC8, 0xCA]
+        );
+    }
+
+    #[test]
+    fn build_bytes_ota_honors_custom_chunk_size() {
+        let data = vec![0xA5; 513];
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            &data,
+            1,
+            "",
+            256,
+        )
+        .unwrap();
+        assert_eq!(packets.len(), 5);
+
+        let first_data = render_transfer_packet_payload(&packets[1], "34B7DA848802").unwrap();
+        assert_eq!(first_data[17], 0xC2);
+        assert_eq!(first_data.len(), 26 + 2 + 256 + 2);
+
+        let end = render_transfer_packet_payload(&packets[4], "34B7DA848802").unwrap();
+        assert_eq!(
+            u32::from_be_bytes([end[26], end[27], end[28], end[29]]),
+            768
+        );
+    }
+
+    #[test]
+    fn build_bytes_control_packet_builds_reset_command() {
+        let packet = build_bytes_control_packet(0x4C, Vec::new(), 1);
+        let payload = render_transfer_packet_payload(&packet, "34B7DA848802").unwrap();
+
+        assert_eq!(packet.opcode, 0x4C);
+        assert_eq!(payload[17], 0x4C);
+        assert_eq!(u16::from_be_bytes([payload[2], payload[3]]), 26);
+    }
+
+    #[test]
+    fn decode_bytes_transfer_ack_payload_maps_status_and_index() {
+        let frame = BytesTransferFrame {
+            command: 0xC3,
+            message_id: 42,
+            protocol_version: 1,
+            body: vec![0, 0, 7],
+        };
+        let payload = render_bytes_transfer_frame(&frame, "34B7DA848802").unwrap();
+        let decoded = decode_bytes_transfer_ack_payload(&payload).unwrap();
+
+        assert_eq!(decoded["opcode"], 0xC3);
+        assert_eq!(decoded["value"], "Execute OK");
+        assert_eq!(decoded["return_code"], 0);
+        assert_eq!(decoded["time_stamp"], 42);
+        assert_eq!(decoded["ota_data_index"], 7);
+    }
+
+    #[test]
+    fn render_bytes_transfer_frame_rejects_non_hex_device_id() {
+        let frame = BytesTransferFrame {
+            command: 0xC0,
+            message_id: 42,
+            protocol_version: 1,
+            body: vec![1],
+        };
+        let error = render_bytes_transfer_frame(&frame, "dev-a").unwrap_err();
+        assert!(error.contains("十六进制"));
     }
 
     #[test]

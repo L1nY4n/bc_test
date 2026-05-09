@@ -7,12 +7,13 @@ use rumqttc::{Client, QoS};
 use serde_json::Value;
 
 use crate::models::{
-    ActiveTransfer, DeviceProfile, LogDirection, LogEntry, OperationRecord, TransferKind,
-    TransferSnapshot, now_display,
+    ActiveTransfer, DeviceProfile, LogDirection, LogEntry, OperationRecord, OtaTransferFormat,
+    TransferAckPhase, TransferKind, TransferPacket, TransferPayload, TransferSnapshot, now_display,
 };
 use crate::mqtt::MqttEvent;
 use crate::protocol::{
-    classify_execution_result, redact_json, response_can_omit_timestamp, summarize_payload,
+    bytes_to_hex, classify_execution_result, decode_bytes_transfer_ack_payload, redact_json,
+    render_transfer_packet_payload, response_can_omit_timestamp, summarize_payload,
 };
 
 const TRANSFER_ENGINE_TICK_MS: u64 = 5;
@@ -30,8 +31,9 @@ pub enum TransferEngineCommand {
     SetPublisher(Option<Client>),
     QueueTransfer {
         devices: Vec<DeviceProfile>,
-        packets: Vec<Value>,
+        packets: Vec<TransferPacket>,
         kind: TransferKind,
+        format: OtaTransferFormat,
         settings: TransferEngineSettings,
     },
     CancelDevices(Vec<u64>),
@@ -114,9 +116,6 @@ struct TransferEngineWorker {
     active_transfers: Vec<ActiveTransfer>,
     publisher: Option<Client>,
     current_generation: Option<u64>,
-    packet_delay_ms: u64,
-    ack_timeout_secs: u64,
-    bc_ota_start_ack_timeout_secs: u64,
 }
 
 impl TransferEngineWorker {
@@ -132,9 +131,6 @@ impl TransferEngineWorker {
             active_transfers: Vec::new(),
             publisher: None,
             current_generation: None,
-            packet_delay_ms: 15,
-            ack_timeout_secs: 10,
-            bc_ota_start_ack_timeout_secs: 20,
         }
     }
 
@@ -173,12 +169,10 @@ impl TransferEngineWorker {
                 devices,
                 packets,
                 kind,
+                format,
                 settings,
             } => {
-                self.packet_delay_ms = settings.packet_delay_ms;
-                self.ack_timeout_secs = settings.ack_timeout_secs;
-                self.bc_ota_start_ack_timeout_secs = settings.bc_ota_start_ack_timeout_secs;
-                self.queue_transfer(devices, packets, kind, settings.max_retries);
+                self.queue_transfer(devices, packets, kind, format, settings);
             }
             TransferEngineCommand::CancelDevices(device_ids) => {
                 self.cancel_transfers_for_devices(&device_ids);
@@ -203,9 +197,10 @@ impl TransferEngineWorker {
     fn queue_transfer(
         &mut self,
         devices: Vec<DeviceProfile>,
-        packets: Vec<Value>,
+        packets: Vec<TransferPacket>,
         kind: TransferKind,
-        max_retries: u8,
+        format: OtaTransferFormat,
+        settings: TransferEngineSettings,
     ) {
         for device in devices {
             if self
@@ -233,7 +228,7 @@ impl TransferEngineWorker {
                 format!(
                     "{} 已排队，共{}包",
                     kind.label(),
-                    transfer_display_total_packets(kind, packets.len())
+                    transfer_display_total_packets(kind, format, packets.len())
                 ),
             );
             self.active_transfers.push(ActiveTransfer {
@@ -243,15 +238,20 @@ impl TransferEngineWorker {
                 up_topic: device.up_topic.clone(),
                 down_topic: device.down_topic.clone(),
                 kind,
+                format,
                 packets: packets.clone(),
+                packet_delay_ms: settings.packet_delay_ms,
+                ack_timeout_secs: settings.ack_timeout_secs,
+                start_ack_timeout_secs: settings.bc_ota_start_ack_timeout_secs,
                 next_index: 0,
                 next_send_at: Instant::now(),
                 waiting_ack_opcode: None,
+                ack_phase: TransferAckPhase::None,
                 waiting_since: None,
                 last_sent_index: None,
                 last_sent_time_stamp: None,
                 retry_count: 0,
-                max_retries,
+                max_retries: settings.max_retries,
                 status: "已排队".into(),
                 terminal: false,
                 succeeded: false,
@@ -295,11 +295,15 @@ impl TransferEngineWorker {
                 generation,
                 topic,
                 payload,
+                payload_bytes,
             } => {
                 if self.current_generation != Some(generation) {
                     return;
                 }
-                let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                let Some(payload) = serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .or_else(|| decode_bytes_transfer_ack_payload(&payload_bytes))
+                else {
                     return;
                 };
                 self.resolve_transfer_ack(&topic, &payload);
@@ -325,24 +329,28 @@ impl TransferEngineWorker {
             let packet_count = self.active_transfers[index].packets.len();
             let packet = self.active_transfers[index].packets[packet_index].clone();
             let down_topic = self.active_transfers[index].down_topic.clone();
-            let opcode = packet.get("opcode").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let publish_result = self.publish_json(&down_topic, &packet);
+            let device_id = self.active_transfers[index].device_id.clone();
+            let opcode = packet.opcode;
+            let publish_payload = transfer_publish_payload(&packet, &device_id);
+            let publish_result = publish_payload
+                .as_ref()
+                .map_err(ToString::to_string)
+                .and_then(|payload| self.publish_bytes(&down_topic, payload));
 
             match publish_result {
                 Ok(()) => {
-                    if should_log_transfer_packet(packet_index, packet_count) {
-                        self.emit_transfer_packet_log(index, opcode, &packet);
+                    if should_log_transfer_packet(packet_index, packet_count)
+                        && let Ok(payload) = publish_payload
+                    {
+                        self.emit_transfer_packet_log(index, opcode, &packet, &payload);
                     }
                     self.active_transfers[index].last_sent_index = Some(packet_index);
-                    self.active_transfers[index].last_sent_time_stamp =
-                        packet.get("time_stamp").and_then(Value::as_u64);
+                    self.active_transfers[index].last_sent_time_stamp = packet.message_id();
                     self.active_transfers[index].next_index += 1;
                     let display_completed =
                         transfer_display_completed_packets(&self.active_transfers[index]);
-                    let display_total = transfer_display_total_packets(
-                        self.active_transfers[index].kind,
-                        self.active_transfers[index].packets.len(),
-                    );
+                    let display_total =
+                        transfer_display_total_packets_for_transfer(&self.active_transfers[index]);
                     self.active_transfers[index].status =
                         format!("发送中 {}/{}", display_completed, display_total);
                     self.emit_device_result(
@@ -361,6 +369,11 @@ impl TransferEngineWorker {
                         self.active_transfers[index].next_index,
                         self.active_transfers[index].packets.len(),
                     ) {
+                        self.active_transfers[index].ack_phase = transfer_ack_phase_for_packet(
+                            self.active_transfers[index].kind,
+                            self.active_transfers[index].format,
+                            packet_index,
+                        );
                         self.active_transfers[index].waiting_ack_opcode = Some(expected_ack);
                         self.active_transfers[index].waiting_since = Some(now);
                         self.active_transfers[index].status =
@@ -371,8 +384,8 @@ impl TransferEngineWorker {
                             format!("传输等待ACK 0x{:02X}", expected_ack),
                         );
                     } else {
-                        self.active_transfers[index].next_send_at =
-                            now + Duration::from_millis(self.packet_delay_ms);
+                        self.active_transfers[index].next_send_at = now
+                            + Duration::from_millis(self.active_transfers[index].packet_delay_ms);
                     }
                     changed = true;
                 }
@@ -393,24 +406,24 @@ impl TransferEngineWorker {
         }
     }
 
-    fn publish_json(&self, topic: &str, payload: &Value) -> Result<(), String> {
+    fn publish_bytes(&self, topic: &str, payload: &[u8]) -> Result<(), String> {
         let client = self
             .publisher
             .as_ref()
             .ok_or_else(|| "MQTT 客户端未连接".to_string())?;
         client
-            .publish(
-                topic,
-                QoS::AtMostOnce,
-                false,
-                payload.to_string().into_bytes(),
-            )
+            .publish(topic, QoS::AtMostOnce, false, payload)
             .map_err(|err| err.to_string())
     }
 
-    fn emit_transfer_packet_log(&self, index: usize, opcode: u32, payload: &Value) {
+    fn emit_transfer_packet_log(
+        &self,
+        index: usize,
+        opcode: u32,
+        packet: &TransferPacket,
+        payload: &[u8],
+    ) {
         let transfer = &self.active_transfers[index];
-        let redacted = redact_json(payload);
         self.emit_log(LogEntry {
             timestamp: now_display(),
             direction: LogDirection::Tx,
@@ -419,8 +432,8 @@ impl TransferEngineWorker {
             topic: transfer.down_topic.clone(),
             opcode: format!("0x{opcode:02X}"),
             status: "TRANSFER".into(),
-            summary: summarize_payload(&redacted),
-            payload: compact_transfer_payload_log(&redacted),
+            summary: summarize_transfer_packet(packet),
+            payload: compact_transfer_payload_log(packet, payload),
         });
     }
 
@@ -460,6 +473,37 @@ impl TransferEngineWorker {
             return;
         }
 
+        if let Some(expected_index) =
+            bytes_ota_data_ack_expected_index(&self.active_transfers[position], opcode)
+        {
+            let actual_index = payload.get("ota_data_index").and_then(Value::as_u64);
+            if actual_index != Some(u64::from(expected_index)) {
+                let retry_from = self.active_transfers[position]
+                    .last_sent_index
+                    .unwrap_or(self.active_transfers[position].next_index.saturating_sub(1));
+                let reason = match actual_index {
+                    Some(actual_index) => format!(
+                        "Bytes OTA 数据ACK索引不匹配，期望{}，实际{}",
+                        expected_index, actual_index
+                    ),
+                    None => "Bytes OTA 数据ACK缺少索引".into(),
+                };
+                self.retry_or_fail_transfer(position, retry_from, reason);
+                let transfer = &self.active_transfers[position];
+                self.emit_device_result(
+                    transfer.device_local_id,
+                    if transfer.next_index >= transfer.packets.len() {
+                        "失败"
+                    } else {
+                        "重试"
+                    },
+                    transfer.status.clone(),
+                );
+                self.emit_snapshot();
+                return;
+            }
+        }
+
         if let Some((status, summary)) = classify_execution_result(payload)
             && status == "错误"
         {
@@ -472,6 +516,7 @@ impl TransferEngineWorker {
             transfer.status = format!("ACK失败: {summary}");
             transfer.next_index = transfer.packets.len();
             transfer.waiting_ack_opcode = None;
+            transfer.ack_phase = TransferAckPhase::None;
             transfer.waiting_since = None;
             transfer.terminal = true;
             transfer.succeeded = false;
@@ -510,6 +555,7 @@ impl TransferEngineWorker {
                     transfer.status = "设备拒绝继续传输".into();
                     transfer.next_index = transfer.packets.len();
                     transfer.waiting_ack_opcode = None;
+                    transfer.ack_phase = TransferAckPhase::None;
                     transfer.waiting_since = None;
                     transfer.terminal = true;
                     transfer.succeeded = false;
@@ -552,9 +598,11 @@ impl TransferEngineWorker {
         let (device_local_id, label, text) = {
             let transfer = &mut self.active_transfers[position];
             transfer.waiting_ack_opcode = None;
+            transfer.ack_phase = TransferAckPhase::None;
             transfer.waiting_since = None;
             transfer.paused = false;
-            transfer.next_send_at = Instant::now() + Duration::from_millis(self.packet_delay_ms);
+            transfer.next_send_at =
+                Instant::now() + Duration::from_millis(transfer.packet_delay_ms);
             if matches!(opcode, 0x41 | 0x44) {
                 transfer.status = "已获同意，继续发送".into();
                 (transfer.device_local_id, "传输", "已获同意，继续发送")
@@ -607,6 +655,7 @@ impl TransferEngineWorker {
                 let device_local_id = {
                     let transfer = &mut self.active_transfers[position];
                     transfer.waiting_ack_opcode = None;
+                    transfer.ack_phase = TransferAckPhase::None;
                     transfer.waiting_since = None;
                     transfer.paused = false;
                     transfer.next_send_at = now;
@@ -619,6 +668,7 @@ impl TransferEngineWorker {
                 let device_local_id = {
                     let transfer = &mut self.active_transfers[position];
                     transfer.waiting_ack_opcode = None;
+                    transfer.ack_phase = TransferAckPhase::None;
                     transfer.waiting_since = None;
                     transfer.paused = false;
                     transfer.next_send_at = now;
@@ -631,6 +681,7 @@ impl TransferEngineWorker {
                 let device_local_id = {
                     let transfer = &mut self.active_transfers[position];
                     transfer.waiting_ack_opcode = None;
+                    transfer.ack_phase = TransferAckPhase::None;
                     transfer.waiting_since = None;
                     transfer.paused = false;
                     transfer.next_send_at = now;
@@ -659,13 +710,10 @@ impl TransferEngineWorker {
     }
 
     fn transfer_ack_timeout_for(&self, transfer: &ActiveTransfer) -> Duration {
-        let timeout_secs = if transfer.kind == TransferKind::BcOta
-            && transfer.waiting_ack_opcode == Some(0x41)
-            && transfer.last_sent_index == Some(0)
-        {
-            self.bc_ota_start_ack_timeout_secs
+        let timeout_secs = if transfer.ack_phase == TransferAckPhase::Start {
+            transfer.start_ack_timeout_secs
         } else {
-            self.ack_timeout_secs
+            transfer.ack_timeout_secs
         };
         Duration::from_secs(timeout_secs)
     }
@@ -703,7 +751,12 @@ impl TransferEngineWorker {
 
     fn retry_or_fail_transfer(&mut self, index: usize, retry_packet_index: usize, reason: String) {
         let transfer = &mut self.active_transfers[index];
-        apply_transfer_retry_state(transfer, retry_packet_index, reason, self.packet_delay_ms);
+        apply_transfer_retry_state(
+            transfer,
+            retry_packet_index,
+            reason,
+            transfer.packet_delay_ms,
+        );
     }
 
     fn cancel_transfers_for_devices(&mut self, device_ids: &[u64]) {
@@ -714,6 +767,7 @@ impl TransferEngineWorker {
                 transfer.terminal = true;
                 transfer.succeeded = false;
                 transfer.waiting_ack_opcode = None;
+                transfer.ack_phase = TransferAckPhase::None;
                 transfer.waiting_since = None;
                 transfer.status = "已取消".into();
                 transfer.paused = false;
@@ -764,6 +818,7 @@ impl TransferEngineWorker {
                 transfer.status = "重新排队".into();
                 transfer.next_index = transfer.last_sent_index.unwrap_or(0);
                 transfer.waiting_ack_opcode = None;
+                transfer.ack_phase = TransferAckPhase::None;
                 transfer.waiting_since = None;
                 transfer.next_send_at = Instant::now();
                 transfer.retry_count = 0;
@@ -817,6 +872,7 @@ impl TransferEngineWorker {
             let resume_index = transfer_resume_index_after_disconnect(transfer);
             transfer.next_index = resume_index;
             transfer.waiting_ack_opcode = None;
+            transfer.ack_phase = TransferAckPhase::None;
             transfer.waiting_since = None;
             transfer.paused = true;
             transfer.next_send_at = Instant::now();
@@ -840,7 +896,7 @@ impl TransferEngineWorker {
     }
 
     fn resume_transfers_after_reconnect(&mut self) {
-        let resume_at = Instant::now() + Duration::from_millis(self.packet_delay_ms);
+        let now = Instant::now();
         let mut results = Vec::new();
         for transfer in &mut self.active_transfers {
             if transfer.terminal || !transfer.paused {
@@ -848,8 +904,9 @@ impl TransferEngineWorker {
             }
             transfer.paused = false;
             transfer.waiting_ack_opcode = None;
+            transfer.ack_phase = TransferAckPhase::None;
             transfer.waiting_since = None;
-            transfer.next_send_at = resume_at;
+            transfer.next_send_at = now + Duration::from_millis(transfer.packet_delay_ms);
             transfer.status = format!(
                 "连接已恢复，从第{}包继续",
                 transfer_display_packet_number(transfer.kind, transfer.next_index)
@@ -983,20 +1040,55 @@ impl TransferEngineWorker {
     }
 }
 
-fn compact_transfer_payload_log(payload: &Value) -> String {
-    let mut redacted = redact_json(payload);
-    if let Some(object) = redacted.as_object_mut()
-        && let Some(value) = object.get_mut("value")
-        && let Some(text) = value.as_str()
-    {
-        let abbreviated = if text.len() > 32 {
-            format!("{}...(len={})", &text[..32], text.len())
-        } else {
-            text.to_string()
-        };
-        *value = Value::String(abbreviated);
+fn summarize_transfer_packet(packet: &TransferPacket) -> String {
+    match &packet.payload {
+        TransferPayload::Json(payload) => summarize_payload(&redact_json(payload)),
+        TransferPayload::BytesFrame(frame) => format!(
+            "Bytes OTA帧 opcode=0x{:02X} body={} bytes",
+            frame.command,
+            frame.body.len()
+        ),
     }
-    serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
+}
+
+fn compact_transfer_payload_log(packet: &TransferPacket, payload_bytes: &[u8]) -> String {
+    match &packet.payload {
+        TransferPayload::Json(payload) => {
+            let mut redacted = redact_json(payload);
+            if let Some(object) = redacted.as_object_mut()
+                && let Some(value) = object.get_mut("value")
+                && let Some(text) = value.as_str()
+            {
+                let abbreviated = if text.len() > 32 {
+                    format!("{}...(len={})", &text[..32], text.len())
+                } else {
+                    text.to_string()
+                };
+                *value = Value::String(abbreviated);
+            }
+            serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| payload.to_string())
+        }
+        TransferPayload::BytesFrame(frame) => {
+            let preview_len = payload_bytes.len().min(32);
+            let preview = bytes_to_hex(&payload_bytes[..preview_len]);
+            let suffix = if payload_bytes.len() > preview_len {
+                format!("...(len={})", payload_bytes.len())
+            } else {
+                String::new()
+            };
+            format!(
+                "bytes opcode=0x{:02X} body_len={} payload={}{}",
+                frame.command,
+                frame.body.len(),
+                preview,
+                suffix
+            )
+        }
+    }
+}
+
+fn transfer_publish_payload(packet: &TransferPacket, device_id: &str) -> Result<Vec<u8>, String> {
+    render_transfer_packet_payload(packet, device_id)
 }
 
 fn normalized_topic_prefix(topic: &str) -> &str {
@@ -1022,8 +1114,20 @@ pub(crate) fn transfer_expected_ack_opcode(
     packet_count: usize,
 ) -> Option<u32> {
     match kind {
-        TransferKind::BcOta => matches!(opcode, 0x40 | 0x42).then_some(0x41),
-        TransferKind::AOta => (opcode == 0x43).then_some(0x44),
+        TransferKind::BcOta => match opcode {
+            0x40 | 0x42 => Some(0x41),
+            0xC0 => Some(0xC1),
+            0xC2 => Some(0xC3),
+            0xC4 => Some(0xC5),
+            _ => None,
+        },
+        TransferKind::AOta => match opcode {
+            0x43 => Some(0x44),
+            0xC6 => Some(0xC7),
+            0xC8 => Some(0xC9),
+            0xCA => Some(0xCB),
+            _ => None,
+        },
         TransferKind::VoiceFile => {
             if opcode == 0x54 {
                 Some(0x55)
@@ -1070,15 +1174,28 @@ pub(crate) fn transfer_resume_index_after_disconnect(transfer: &ActiveTransfer) 
     }
 }
 
-pub(crate) fn transfer_display_total_packets(kind: TransferKind, packet_count: usize) -> usize {
-    match kind {
-        TransferKind::BcOta | TransferKind::AOta => packet_count.saturating_sub(1),
-        TransferKind::VoiceFile | TransferKind::RealtimeVoice => packet_count,
+pub(crate) fn transfer_display_total_packets(
+    kind: TransferKind,
+    format: OtaTransferFormat,
+    packet_count: usize,
+) -> usize {
+    match (kind, format) {
+        (TransferKind::BcOta | TransferKind::AOta, OtaTransferFormat::Bytes) => {
+            packet_count.saturating_sub(2)
+        }
+        (TransferKind::BcOta | TransferKind::AOta, OtaTransferFormat::Json) => {
+            packet_count.saturating_sub(1)
+        }
+        (TransferKind::VoiceFile | TransferKind::RealtimeVoice, _) => packet_count,
     }
 }
 
+fn transfer_display_total_packets_for_transfer(transfer: &ActiveTransfer) -> usize {
+    transfer_display_total_packets(transfer.kind, transfer.format, transfer.packets.len())
+}
+
 pub(crate) fn transfer_display_completed_packets(transfer: &ActiveTransfer) -> usize {
-    let total = transfer_display_total_packets(transfer.kind, transfer.packets.len());
+    let total = transfer_display_total_packets_for_transfer(transfer);
     match transfer.kind {
         TransferKind::BcOta | TransferKind::AOta => {
             transfer.next_index.saturating_sub(1).min(total)
@@ -1092,6 +1209,32 @@ pub(crate) fn transfer_display_packet_number(kind: TransferKind, packet_index: u
         TransferKind::BcOta | TransferKind::AOta => packet_index.max(1),
         TransferKind::VoiceFile | TransferKind::RealtimeVoice => packet_index + 1,
     }
+}
+
+pub(crate) fn transfer_ack_phase_for_packet(
+    kind: TransferKind,
+    format: OtaTransferFormat,
+    packet_index: usize,
+) -> TransferAckPhase {
+    match (kind, format, packet_index) {
+        (TransferKind::BcOta, OtaTransferFormat::Json | OtaTransferFormat::Bytes, 0) => {
+            TransferAckPhase::Start
+        }
+        (TransferKind::AOta, OtaTransferFormat::Bytes, 0) => TransferAckPhase::Start,
+        _ => TransferAckPhase::Packet,
+    }
+}
+
+pub(crate) fn bytes_ota_data_ack_expected_index(
+    transfer: &ActiveTransfer,
+    response_opcode: u32,
+) -> Option<u16> {
+    if transfer.format != OtaTransferFormat::Bytes || !matches!(response_opcode, 0xC3 | 0xC9) {
+        return None;
+    }
+    let sent_packet_index = transfer.last_sent_index?;
+    let data_index = sent_packet_index.checked_sub(1)?;
+    u16::try_from(data_index).ok()
 }
 
 pub(crate) fn should_log_transfer_packet(packet_index: usize, packet_count: usize) -> bool {
@@ -1112,6 +1255,7 @@ pub(crate) fn apply_transfer_retry_state(
         transfer.retry_count += 1;
         transfer.next_index = retry_packet_index;
         transfer.waiting_ack_opcode = None;
+        transfer.ack_phase = TransferAckPhase::None;
         transfer.waiting_since = None;
         transfer.paused = false;
         transfer.next_send_at = Instant::now()
@@ -1127,6 +1271,7 @@ pub(crate) fn apply_transfer_retry_state(
         transfer.status = reason;
         transfer.next_index = transfer.packets.len();
         transfer.waiting_ack_opcode = None;
+        transfer.ack_phase = TransferAckPhase::None;
         transfer.waiting_since = None;
         transfer.paused = false;
     }
@@ -1135,6 +1280,8 @@ pub(crate) fn apply_transfer_retry_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{BytesTransferFrame, OtaTransferFormat};
+    use crate::protocol::{build_transfer_packets_for_format, render_bytes_transfer_frame};
 
     fn worker_with_events() -> (TransferEngineWorker, Receiver<TransferEngineEvent>) {
         let (_command_tx, command_rx) = mpsc::channel();
@@ -1158,13 +1305,18 @@ mod tests {
             up_topic: "/application/AP-C-BM/device/dev-a/up".into(),
             down_topic: "/application/AP-C-BM/device/dev-a/down".into(),
             kind: TransferKind::BcOta,
+            format: OtaTransferFormat::Json,
             packets: vec![
-                serde_json::json!({"opcode": 0x40}),
-                serde_json::json!({"opcode": 0x42}),
+                TransferPacket::json(serde_json::json!({"opcode": 0x40})),
+                TransferPacket::json(serde_json::json!({"opcode": 0x42})),
             ],
+            packet_delay_ms: 15,
+            ack_timeout_secs: 10,
+            start_ack_timeout_secs: 20,
             next_index: 1,
             next_send_at: Instant::now(),
             waiting_ack_opcode: Some(0x41),
+            ack_phase: TransferAckPhase::Start,
             waiting_since: Some(Instant::now()),
             last_sent_index: Some(0),
             last_sent_time_stamp: None,
@@ -1183,6 +1335,7 @@ mod tests {
         let mut transfer = sample_transfer();
         transfer.next_index = transfer.packets.len();
         transfer.last_sent_index = Some(transfer.packets.len() - 1);
+        transfer.ack_phase = TransferAckPhase::Packet;
         transfer
     }
 
@@ -1302,41 +1455,218 @@ mod tests {
 
     #[test]
     fn engine_bc_ota_start_and_data_ack_timeouts_are_split() {
-        let mut worker = worker();
-        worker.ack_timeout_secs = 10;
-        worker.bc_ota_start_ack_timeout_secs = 20;
+        let worker = worker();
 
-        let start_transfer = sample_transfer();
+        let mut start_transfer = sample_transfer();
+        start_transfer.ack_timeout_secs = 10;
+        start_transfer.start_ack_timeout_secs = 20;
         assert_eq!(
             worker.transfer_ack_timeout_for(&start_transfer),
             Duration::from_secs(20)
         );
 
         let mut data_transfer = sample_transfer();
+        data_transfer.ack_timeout_secs = 10;
+        data_transfer.start_ack_timeout_secs = 20;
         data_transfer.last_sent_index = Some(1);
         data_transfer.next_index = 2;
+        data_transfer.ack_phase = TransferAckPhase::Packet;
         assert_eq!(
             worker.transfer_ack_timeout_for(&data_transfer),
             Duration::from_secs(10)
         );
+
+        let mut a_bytes_start = sample_transfer();
+        a_bytes_start.kind = TransferKind::AOta;
+        a_bytes_start.format = OtaTransferFormat::Bytes;
+        a_bytes_start.waiting_ack_opcode = Some(0xC7);
+        a_bytes_start.ack_phase =
+            transfer_ack_phase_for_packet(TransferKind::AOta, OtaTransferFormat::Bytes, 0);
+        a_bytes_start.last_sent_index = Some(0);
+        a_bytes_start.ack_timeout_secs = 10;
+        a_bytes_start.start_ack_timeout_secs = 20;
+        assert_eq!(
+            worker.transfer_ack_timeout_for(&a_bytes_start),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn transfer_snapshot_preserves_timing_and_ack_phase() {
+        let transfer = sample_transfer();
+        let snapshot = TransferSnapshot::from(&transfer);
+
+        assert_eq!(snapshot.packet_delay_ms, 15);
+        assert_eq!(snapshot.ack_timeout_secs, 10);
+        assert_eq!(snapshot.start_ack_timeout_secs, 20);
+        assert_eq!(snapshot.ack_phase, TransferAckPhase::Start);
+    }
+
+    #[test]
+    fn bytes_ota_packets_wait_for_binary_ack_opcodes() {
+        assert_eq!(
+            transfer_expected_ack_opcode(TransferKind::BcOta, 0xC0, 1, 3),
+            Some(0xC1)
+        );
+        assert_eq!(
+            transfer_expected_ack_opcode(TransferKind::BcOta, 0xC2, 2, 3),
+            Some(0xC3)
+        );
+        assert_eq!(
+            transfer_expected_ack_opcode(TransferKind::BcOta, 0xC4, 3, 3),
+            Some(0xC5)
+        );
+    }
+
+    #[test]
+    fn transfer_publish_payload_preserves_json_and_bytes_payload_shapes() {
+        let json_packet = TransferPacket::json(serde_json::json!({"opcode": 0x40, "value": 1}));
+        assert_eq!(
+            transfer_publish_payload(&json_packet, "34B7DA848802").unwrap(),
+            serde_json::json!({"opcode": 0x40, "value": 1})
+                .to_string()
+                .into_bytes()
+        );
+
+        let bytes_packet = TransferPacket::bytes_frame(BytesTransferFrame {
+            command: 0xC0,
+            message_id: 42,
+            protocol_version: 1,
+            body: vec![1],
+        });
+        let payload = transfer_publish_payload(&bytes_packet, "34B7DA848802").unwrap();
+        assert_eq!(&payload[0..2], &[0xFE, 0xFE]);
+        assert_eq!(payload[17], 0xC0);
+        assert_eq!(payload[26], 1);
+        assert!(!payload.starts_with(b"{"));
+    }
+
+    #[test]
+    fn transfer_publish_payload_rejects_malformed_bytes_device_id() {
+        let bytes_packet = TransferPacket::bytes_frame(BytesTransferFrame {
+            command: 0xC0,
+            message_id: 42,
+            protocol_version: 1,
+            body: vec![1],
+        });
+        let error = transfer_publish_payload(&bytes_packet, "dev-a").unwrap_err();
+        assert!(error.contains("十六进制"));
+    }
+
+    #[test]
+    fn engine_decodes_bytes_ota_ack_from_mqtt_payload_bytes() {
+        let mut worker = worker();
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            b"abc",
+            1,
+            "",
+            1024,
+        )
+        .unwrap();
+        let first_message_id = packets[0].message_id().unwrap();
+        worker.active_transfers.push(ActiveTransfer {
+            packets,
+            waiting_ack_opcode: Some(0xC1),
+            ack_phase: TransferAckPhase::Start,
+            waiting_since: Some(Instant::now()),
+            last_sent_index: Some(0),
+            last_sent_time_stamp: Some(first_message_id),
+            ..sample_transfer()
+        });
+        worker.current_generation = Some(1);
+        let ack_payload = render_bytes_transfer_frame(
+            &BytesTransferFrame {
+                command: 0xC1,
+                message_id: first_message_id,
+                protocol_version: 1,
+                body: vec![0],
+            },
+            "34B7DA848802",
+        )
+        .unwrap();
+
+        worker.handle_mqtt_event(MqttEvent::Message {
+            generation: 1,
+            topic: "/application/AP-C-BM/device/dev-a/up/gen/0".into(),
+            payload: String::from_utf8_lossy(&ack_payload).to_string(),
+            payload_bytes: ack_payload,
+        });
+
+        let transfer = &worker.active_transfers[0];
+        assert!(transfer.waiting_ack_opcode.is_none());
+        assert_eq!(transfer.status, "收到ACK");
+    }
+
+    #[test]
+    fn engine_retries_bytes_ota_data_ack_with_mismatched_index() {
+        let mut worker = worker();
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            &[1, 2, 3],
+            1,
+            "",
+            1024,
+        )
+        .unwrap();
+        let data_message_id = packets[1].message_id().unwrap();
+        worker.active_transfers.push(ActiveTransfer {
+            packets,
+            format: OtaTransferFormat::Bytes,
+            next_index: 2,
+            waiting_ack_opcode: Some(0xC3),
+            ack_phase: TransferAckPhase::Packet,
+            waiting_since: Some(Instant::now()),
+            last_sent_index: Some(1),
+            last_sent_time_stamp: Some(data_message_id),
+            ..sample_transfer()
+        });
+        worker.current_generation = Some(1);
+        let ack_payload = render_bytes_transfer_frame(
+            &BytesTransferFrame {
+                command: 0xC3,
+                message_id: data_message_id,
+                protocol_version: 1,
+                body: vec![0, 0, 1],
+            },
+            "34B7DA848802",
+        )
+        .unwrap();
+
+        worker.handle_mqtt_event(MqttEvent::Message {
+            generation: 1,
+            topic: "/application/AP-C-BM/device/dev-a/up/gen/0".into(),
+            payload: String::from_utf8_lossy(&ack_payload).to_string(),
+            payload_bytes: ack_payload,
+        });
+
+        let transfer = &worker.active_transfers[0];
+        assert_eq!(transfer.retry_count, 1);
+        assert_eq!(transfer.next_index, 1);
+        assert!(transfer.status.contains("索引不匹配"));
     }
 
     #[test]
     fn engine_collect_transfer_timeouts_respects_start_timeout_split() {
         let mut worker = worker();
-        worker.ack_timeout_secs = 1;
-        worker.bc_ota_start_ack_timeout_secs = 20;
         let old_wait = Instant::now() - Duration::from_secs(2);
 
         let mut start_transfer = sample_transfer();
+        start_transfer.ack_timeout_secs = 1;
+        start_transfer.start_ack_timeout_secs = 20;
         start_transfer.waiting_since = Some(old_wait);
         let mut data_transfer = sample_transfer();
+        data_transfer.ack_timeout_secs = 1;
+        data_transfer.start_ack_timeout_secs = 20;
         data_transfer.device_local_id = 2;
         data_transfer.device_name = "设备B".into();
         data_transfer.device_id = "dev-b".into();
         data_transfer.up_topic = "/application/AP-C-BM/device/dev-b/up".into();
         data_transfer.last_sent_index = Some(1);
         data_transfer.next_index = 2;
+        data_transfer.ack_phase = TransferAckPhase::Packet;
         data_transfer.waiting_since = Some(old_wait);
         worker.active_transfers.push(start_transfer);
         worker.active_transfers.push(data_transfer);
@@ -1363,6 +1693,9 @@ mod tests {
             generation: 1,
             topic: "/application/AP-C-BM/device/dev-a/up/gen/0".into(),
             payload: serde_json::json!({"opcode": 0x41, "value": 3}).to_string(),
+            payload_bytes: serde_json::json!({"opcode": 0x41, "value": 3})
+                .to_string()
+                .into_bytes(),
         });
         assert_eq!(worker.active_transfers[0].waiting_ack_opcode, Some(0x41));
 
@@ -1370,6 +1703,9 @@ mod tests {
             generation: 2,
             topic: "/application/AP-C-BM/device/dev-a/up/gen/0".into(),
             payload: serde_json::json!({"opcode": 0x41, "value": 3}).to_string(),
+            payload_bytes: serde_json::json!({"opcode": 0x41, "value": 3})
+                .to_string()
+                .into_bytes(),
         });
         assert!(worker.active_transfers[0].waiting_ack_opcode.is_none());
         assert_eq!(
@@ -1404,6 +1740,7 @@ mod tests {
         paused.device_id = "dev-b".into();
         paused.paused = true;
         paused.waiting_ack_opcode = None;
+        paused.ack_phase = TransferAckPhase::None;
         paused.status = "连接断开，等待重连后续传".into();
 
         worker.active_transfers.push(sample_transfer());
@@ -1477,6 +1814,9 @@ mod tests {
             generation: 1,
             topic: "/application/AP-C-BM/device/dev-a/up/gen/0".into(),
             payload: serde_json::json!({"opcode": 0x41, "value": 3}).to_string(),
+            payload_bytes: serde_json::json!({"opcode": 0x41, "value": 3})
+                .to_string()
+                .into_bytes(),
         });
 
         let events = drain_events(&events_rx);
@@ -1504,7 +1844,11 @@ mod tests {
         let (mut worker, events_rx) = worker_with_events();
         let mut transfer = sample_transfer();
         transfer.packets = (0..512)
-            .map(|index| serde_json::json!({"opcode": 0x42, "value": format!("{index:04X}")}))
+            .map(|index| {
+                TransferPacket::json(
+                    serde_json::json!({"opcode": 0x42, "value": format!("{index:04X}")}),
+                )
+            })
             .collect();
         transfer.next_index = 128;
         worker.active_transfers.push(transfer);

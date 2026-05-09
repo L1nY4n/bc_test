@@ -28,6 +28,7 @@ pub enum MqttEvent {
         generation: u64,
         topic: String,
         payload: String,
+        payload_bytes: Vec<u8>,
     },
 }
 
@@ -154,6 +155,7 @@ impl MqttRuntime {
                             generation,
                             topic: publish.topic,
                             payload,
+                            payload_bytes: payload_bytes.to_vec(),
                         },
                     );
                 }
@@ -260,12 +262,16 @@ impl MqttRuntime {
     }
 
     pub fn publish_json(&mut self, topic: &str, payload: &str) -> Result<(), String> {
+        self.publish_bytes(topic, payload.as_bytes())
+    }
+
+    pub fn publish_bytes(&mut self, topic: &str, payload: &[u8]) -> Result<(), String> {
         let client = self
             .client
             .as_ref()
             .ok_or_else(|| "MQTT 客户端未连接".to_string())?;
         client
-            .publish(topic, QoS::AtMostOnce, false, payload.as_bytes())
+            .publish(topic, QoS::AtMostOnce, false, payload)
             .map_err(|err| err.to_string())
     }
 
