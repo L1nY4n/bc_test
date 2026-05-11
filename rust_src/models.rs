@@ -1,7 +1,15 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Instant;
+use std::collections::hash_map::DefaultHasher;
+use std::env;
+use std::hash::{Hash, Hasher};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub const BROKER_CLIENT_ID_PREFIX: &str = "mesh-bc-tester-rs";
+static GENERATED_CLIENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerProfile {
@@ -10,7 +18,10 @@ pub struct BrokerProfile {
     pub port: u16,
     pub username: String,
     pub password: String,
+    #[serde(default)]
     pub client_id: String,
+    #[serde(default)]
+    pub auto_client_id: bool,
     pub keepalive_secs: u16,
     pub use_tls: bool,
 }
@@ -23,11 +34,60 @@ impl Default for BrokerProfile {
             port: 1883,
             username: String::new(),
             password: String::new(),
-            client_id: "mesh-bc-tester-rs".into(),
+            client_id: generated_broker_client_id(),
+            auto_client_id: true,
             keepalive_secs: 60,
             use_tls: false,
         }
     }
+}
+
+impl BrokerProfile {
+    pub fn ensure_runtime_client_id(&mut self) -> bool {
+        let trimmed = self.client_id.trim();
+        if self.auto_client_id || is_legacy_or_blank_client_id(trimmed) {
+            self.regenerate_auto_client_id();
+            return true;
+        }
+
+        if trimmed.len() != self.client_id.len() {
+            self.client_id = trimmed.to_owned();
+            return true;
+        }
+
+        false
+    }
+
+    pub fn regenerate_auto_client_id(&mut self) {
+        self.client_id = generated_broker_client_id();
+        self.auto_client_id = true;
+    }
+}
+
+pub fn generated_broker_client_id() -> String {
+    let counter = GENERATED_CLIENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    (
+        env::var("USER").unwrap_or_default(),
+        env::var("USERNAME").unwrap_or_default(),
+        env::var("HOSTNAME").unwrap_or_default(),
+        env::var("COMPUTERNAME").unwrap_or_default(),
+        env::var("HOME").unwrap_or_default(),
+        process::id(),
+        timestamp,
+        counter,
+    )
+        .hash(&mut hasher);
+    let suffix = hasher.finish() & 0xFFFF_FFFF_FFFF;
+    format!("{BROKER_CLIENT_ID_PREFIX}-{suffix:012x}")
+}
+
+fn is_legacy_or_blank_client_id(client_id: &str) -> bool {
+    client_id.is_empty() || client_id == BROKER_CLIENT_ID_PREFIX
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +408,8 @@ pub struct AppConfig {
     pub bc_ota_start_ack_timeout_secs: u64,
     #[serde(default = "default_bytes_ota_chunk_size")]
     pub bytes_ota_chunk_size: usize,
+    #[serde(default)]
+    pub bytes_ota_app_crc_override: String,
     pub transfer_max_retries: u8,
     #[serde(default)]
     pub voice_transfer_packet_delay_ms: u64,
@@ -369,6 +431,7 @@ impl Default for AppConfig {
             transfer_ack_timeout_secs: 10,
             bc_ota_start_ack_timeout_secs: 20,
             bytes_ota_chunk_size: default_bytes_ota_chunk_size(),
+            bytes_ota_app_crc_override: String::new(),
             transfer_max_retries: 2,
             voice_transfer_packet_delay_ms: 15,
             voice_transfer_ack_timeout_secs: 10,
@@ -421,7 +484,7 @@ pub fn now_display() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::now_display;
+    use super::*;
 
     #[test]
     fn now_display_keeps_three_millisecond_digits() {
@@ -430,5 +493,49 @@ mod tests {
         assert_eq!(value.len(), "2026-04-30 15:16:17.123".len());
         assert_eq!(&value[19..20], ".");
         assert!(value[20..].chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn default_broker_uses_auto_unique_client_id() {
+        let broker = BrokerProfile::default();
+
+        assert!(broker.auto_client_id);
+        assert!(broker.client_id.starts_with(BROKER_CLIENT_ID_PREFIX));
+        assert_ne!(broker.client_id, BROKER_CLIENT_ID_PREFIX);
+    }
+
+    #[test]
+    fn runtime_client_id_regenerates_blank_and_legacy_values() {
+        let mut blank = BrokerProfile {
+            client_id: "   ".into(),
+            auto_client_id: false,
+            ..BrokerProfile::default()
+        };
+        let mut legacy = BrokerProfile {
+            client_id: BROKER_CLIENT_ID_PREFIX.into(),
+            auto_client_id: false,
+            ..BrokerProfile::default()
+        };
+
+        assert!(blank.ensure_runtime_client_id());
+        assert!(legacy.ensure_runtime_client_id());
+        assert!(blank.auto_client_id);
+        assert!(legacy.auto_client_id);
+        assert_ne!(blank.client_id, BROKER_CLIENT_ID_PREFIX);
+        assert_ne!(legacy.client_id, BROKER_CLIENT_ID_PREFIX);
+    }
+
+    #[test]
+    fn runtime_client_id_preserves_manual_values() {
+        let mut broker = BrokerProfile {
+            client_id: " custom-client ".into(),
+            auto_client_id: false,
+            ..BrokerProfile::default()
+        };
+
+        assert!(broker.ensure_runtime_client_id());
+        assert!(!broker.auto_client_id);
+        assert_eq!(broker.client_id, "custom-client");
+        assert!(!broker.ensure_runtime_client_id());
     }
 }

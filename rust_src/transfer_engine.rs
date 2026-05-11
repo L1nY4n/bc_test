@@ -1563,6 +1563,7 @@ mod tests {
             1,
             "",
             1024,
+            None,
         )
         .unwrap();
         let first_message_id = packets[0].message_id().unwrap();
@@ -1609,6 +1610,7 @@ mod tests {
             1,
             "",
             1024,
+            None,
         )
         .unwrap();
         let data_message_id = packets[1].message_id().unwrap();

@@ -23,8 +23,8 @@ use crate::protocol::{
     build_bytes_control_packet, build_command_payload, build_transfer_packets_for_format,
     bytes_to_hex, classify_execution_result, command_by_key, current_time_stamp,
     decode_bytes_transfer_ack_payload, decode_bytes_transfer_frame, decode_payload_details,
-    expected_response_opcode, hex_to_bytes, parse_opcode, redact_json,
-    render_transfer_packet_payload, response_can_omit_timestamp, summarize_payload,
+    expected_response_opcode, hex_to_bytes, parse_bytes_ota_app_crc_override, parse_opcode,
+    redact_json, render_transfer_packet_payload, response_can_omit_timestamp, summarize_payload,
     transfer_preview_for_format, validate_bytes_ota_chunk_size,
 };
 use crate::store::{load_config, save_config};
@@ -70,6 +70,7 @@ pub struct MeshBcTesterApp {
     transfer_ack_timeout_secs: u64,
     bc_ota_start_ack_timeout_secs: u64,
     bytes_ota_chunk_size: usize,
+    bytes_ota_app_crc_override: String,
     transfer_max_retries: u8,
     voice_transfer_packet_delay_ms: u64,
     voice_transfer_ack_timeout_secs: u64,
@@ -187,6 +188,7 @@ const MENU_FIELD_LABEL_WIDTH: f32 = 62.0;
 const ACTION_FIELD_LABEL_WIDTH: f32 = 72.0;
 const ACTION_BUTTON_INDENT_WIDTH: f32 = 76.0;
 const DISCOVERED_ROW_ACTION_SLOT_WIDTH: f32 = 138.0;
+const DEVICE_TREE_ROW_HEIGHT: f32 = 54.0;
 const DEVICE_ROW_CONTENT_CLICK_INSET: f32 = 46.0;
 const DISCOVERED_ROW_CONTENT_CLICK_INSET: f32 = 14.0;
 const REQUEST_STATUS_TABLE_HEIGHT: f32 = 90.0;
@@ -213,6 +215,7 @@ impl MeshBcTesterApp {
         if config.next_device_id == 0 {
             config.next_device_id = 1;
         }
+        config.broker.ensure_runtime_client_id();
         let broker_editor = config.broker.clone();
         let transfer_packet_delay_ms = if config.transfer_packet_delay_ms == 0 {
             TRANSFER_PACKET_DELAY_MS
@@ -235,6 +238,8 @@ impl MeshBcTesterApp {
             } else {
                 DEFAULT_BYTES_OTA_CHUNK_SIZE
             };
+        let bytes_ota_app_crc_override =
+            normalize_crc_override_text(&config.bytes_ota_app_crc_override);
         let transfer_max_retries = if config.transfer_max_retries == 0 {
             TRANSFER_MAX_RETRIES
         } else {
@@ -310,6 +315,7 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs,
             bc_ota_start_ack_timeout_secs,
             bytes_ota_chunk_size,
+            bytes_ota_app_crc_override,
             transfer_max_retries,
             voice_transfer_packet_delay_ms,
             voice_transfer_ack_timeout_secs,
@@ -746,11 +752,13 @@ impl MeshBcTesterApp {
     }
 
     fn connect(&mut self) {
+        self.broker_editor.ensure_runtime_client_id();
         self.config.broker = self.broker_editor.clone();
         self.config.transfer_packet_delay_ms = self.transfer_packet_delay_ms;
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
+        self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -1646,6 +1654,17 @@ impl MeshBcTesterApp {
             self.system_notice = err;
             return;
         }
+        let bytes_app_crc_override = if transfer_format == OtaTransferFormat::Bytes {
+            match parse_bytes_ota_app_crc_override(&self.bytes_ota_app_crc_override) {
+                Ok(override_value) => override_value,
+                Err(err) => {
+                    self.system_notice = err;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let preview = transfer_preview_for_format(
             kind,
             transfer_format,
@@ -1653,6 +1672,7 @@ impl MeshBcTesterApp {
             version,
             &voice_name,
             bytes_chunk_size,
+            bytes_app_crc_override,
         );
         let packets = match build_transfer_packets_for_format(
             kind,
@@ -1661,6 +1681,7 @@ impl MeshBcTesterApp {
             version,
             &voice_name,
             bytes_chunk_size,
+            bytes_app_crc_override,
         ) {
             Ok(packets) => packets,
             Err(err) => {
@@ -1677,14 +1698,18 @@ impl MeshBcTesterApp {
             }
         }
         if self.should_confirm_transfer(devices.len(), packets.len()) {
+            let crc_override_label = bytes_app_crc_override
+                .map(|value| format!("，APP CRC覆盖：0x{value:04X}"))
+                .unwrap_or_default();
             self.pending_confirmation = Some(PendingConfirmation {
                 title: "确认发起传输".into(),
                 detail: format!(
-                    "类型：{}，目标设备：{} 台，文件大小：{} 字节，分包：{}",
+                    "类型：{}，目标设备：{} 台，文件大小：{} 字节，分包：{}{}",
                     kind.label(),
                     devices.len(),
                     bytes.len(),
-                    transfer_display_total_packets(kind, transfer_format, packets.len())
+                    transfer_display_total_packets(kind, transfer_format, packets.len()),
+                    crc_override_label,
                 ),
                 action: PendingAction::TransferQueue {
                     devices,
@@ -2640,6 +2665,7 @@ impl MeshBcTesterApp {
                 "port": self.broker_editor.port,
                 "username": self.broker_editor.username,
                 "client_id": self.broker_editor.client_id,
+                "auto_client_id": self.broker_editor.auto_client_id,
                 "keepalive_secs": self.broker_editor.keepalive_secs,
                 "use_tls": self.broker_editor.use_tls,
             },
@@ -2649,6 +2675,7 @@ impl MeshBcTesterApp {
                     "ack_timeout_secs": self.transfer_ack_timeout_secs,
                     "bc_ota_start_ack_timeout_secs": self.bc_ota_start_ack_timeout_secs,
                     "bytes_ota_chunk_size": self.bytes_ota_chunk_size,
+                    "bytes_ota_app_crc_override": self.bytes_ota_app_crc_override,
                     "max_retries": self.transfer_max_retries,
                     },
                     "voice": {
@@ -2729,6 +2756,7 @@ impl MeshBcTesterApp {
             transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
             bc_ota_start_ack_timeout_secs: BC_OTA_START_ACK_TIMEOUT_SECS,
             bytes_ota_chunk_size: DEFAULT_BYTES_OTA_CHUNK_SIZE,
+            bytes_ota_app_crc_override: String::new(),
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             voice_transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
             voice_transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
@@ -2869,6 +2897,7 @@ impl eframe::App for MeshBcTesterApp {
         self.config.transfer_ack_timeout_secs = self.transfer_ack_timeout_secs;
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
+        self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -3330,6 +3359,40 @@ fn accent_text_color() -> egui::Color32 {
     accent_color()
 }
 
+fn warning_colors(dark_mode: bool) -> (egui::Color32, egui::Color32, egui::Color32) {
+    if dark_mode {
+        (rgb(49, 34, 7), rgb(171, 97, 16), rgb(255, 210, 138))
+    } else {
+        (rgb(255, 246, 225), rgb(217, 132, 29), rgb(126, 72, 9))
+    }
+}
+
+fn warning_text_color(ui: &egui::Ui) -> egui::Color32 {
+    let (_, _, text) = warning_colors(ui.visuals().dark_mode);
+    text
+}
+
+fn normalize_crc_override_text(value: &str) -> String {
+    let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(4)
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
+}
+
+fn normalize_crc_override_text_in_place(value: &mut String) {
+    let normalized = normalize_crc_override_text(value);
+    if *value != normalized {
+        *value = normalized;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct VisualPalette {
     panel_fill: egui::Color32,
@@ -3498,7 +3561,17 @@ impl MeshBcTesterApp {
                         );
                     });
                     Self::field_row(ui, "客户端", |ui| {
-                        Self::compact_text_edit(ui, 170.0, &mut self.broker_editor.client_id);
+                        let auto_changed = ui
+                            .checkbox(&mut self.broker_editor.auto_client_id, "自动")
+                            .on_hover_text("连接时使用自动生成的唯一 MQTT Client ID")
+                            .changed();
+                        if auto_changed && self.broker_editor.auto_client_id {
+                            self.broker_editor.regenerate_auto_client_id();
+                        }
+                        ui.add_enabled_ui(!self.broker_editor.auto_client_id, |ui| {
+                            Self::compact_text_edit(ui, 126.0, &mut self.broker_editor.client_id)
+                                .on_hover_text(self.broker_editor.client_id.as_str());
+                        });
                     });
                     Self::field_row(ui, "Keepalive", |ui| {
                         Self::compact_widget(
@@ -3812,6 +3885,22 @@ impl MeshBcTesterApp {
                         ui.selectable_value(&mut self.bytes_ota_chunk_size, size, size.to_string());
                     }
                 });
+                Self::action_field_row(ui, "APP CRC", |ui| {
+                    let response = Self::warning_text_edit(
+                        ui,
+                        82.0,
+                        &mut self.bytes_ota_app_crc_override,
+                        "如 2DF3",
+                    );
+                    if response.changed() {
+                        normalize_crc_override_text_in_place(&mut self.bytes_ota_app_crc_override);
+                    }
+                    response
+                        .on_hover_text("可选：填入2字节CRC十六进制值，覆盖0xC4/0xCA自动计算值。");
+                    if !self.bytes_ota_app_crc_override.trim().is_empty() {
+                        ui.small(RichText::new("覆盖").strong().color(warning_text_color(ui)));
+                    }
+                });
                 Self::action_button_row(ui, |ui| {
                     if Self::secondary_button(ui, "取消升级").clicked() {
                         self.queue_bytes_ota_cancel_command();
@@ -4019,7 +4108,7 @@ impl MeshBcTesterApp {
             ui,
             ("device", device.local_id),
             selected,
-            34.0,
+            DEVICE_TREE_ROW_HEIGHT,
             0.0,
             DEVICE_ROW_CONTENT_CLICK_INSET,
             |ui, _row_hovered| {
@@ -4027,36 +4116,67 @@ impl MeshBcTesterApp {
                     // Apply after drawing so row response stays presentation-only.
                 }
                 Self::status_dot(ui, state.online);
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width().max(80.0));
-                    ui.label(
-                        RichText::new(&device.name)
-                            .strong()
-                            .color(Self::device_row_name_color(ui, selected)),
-                    );
-                    let rtt = if state.last_rtt_ms.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}ms", state.last_rtt_ms)
-                    };
-                    let last = if state.last_result.is_empty() {
-                        state.last_opcode.as_str()
-                    } else {
-                        state.last_result.as_str()
-                    };
-                    ui.small(
-                        RichText::new(format!(
-                            "{} · RX {} TX {} 待{}{} · {}",
+                let content_width = ui.available_width().max(1.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, DEVICE_TREE_ROW_HEIGHT - 6.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 1.0);
+                        ui.set_width(content_width);
+                        ui.add_sized(
+                            [content_width, 16.0],
+                            egui::Label::new(
+                                RichText::new(&device.name)
+                                    .strong()
+                                    .color(Self::device_row_name_color(ui, selected)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&device.name);
+
+                        let rtt = if state.last_rtt_ms.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}ms", state.last_rtt_ms)
+                        };
+                        let meta = format!(
+                            "{} · RX {} TX {} 待{}{}",
                             Self::device_id_suffix(&device.device_id),
                             state.rx_count,
                             state.tx_count,
                             state.pending_count,
                             rtt,
-                            Self::truncate_for_row(last, 18),
-                        ))
-                        .color(Self::device_row_meta_color(ui, selected)),
-                    );
-                });
+                        );
+                        ui.add_sized(
+                            [content_width, 14.0],
+                            egui::Label::new(
+                                RichText::new(meta)
+                                    .small()
+                                    .color(Self::device_row_meta_color(ui, selected)),
+                            )
+                            .truncate(),
+                        );
+
+                        let last = if state.last_result.is_empty() {
+                            state.last_opcode.as_str()
+                        } else {
+                            state.last_result.as_str()
+                        };
+                        if !last.is_empty() {
+                            let last_display = Self::compact_device_status(last);
+                            ui.add_sized(
+                                [content_width, 14.0],
+                                egui::Label::new(
+                                    RichText::new(last_display)
+                                        .small()
+                                        .color(Self::device_row_status_color(ui, selected)),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(last);
+                        }
+                    },
+                );
             },
         );
         response.context_menu(|ui| {
@@ -4434,6 +4554,17 @@ impl MeshBcTesterApp {
         } else {
             rgb(57, 91, 145)
         }
+    }
+
+    fn device_row_status_color(ui: &egui::Ui, selected: bool) -> egui::Color32 {
+        if selected {
+            return accent_text_color();
+        }
+        ui.visuals().text_color()
+    }
+
+    fn compact_device_status(text: &str) -> String {
+        Self::truncate_for_row(text.trim(), 28)
     }
 
     fn field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
@@ -4990,7 +5121,7 @@ impl MeshBcTesterApp {
             }
 
             let log_table_height = (panel_height - 74.0).max(180.0);
-            TableBuilder::new(ui)
+            let mut table = TableBuilder::new(ui)
                 .id_salt("message-log-table")
                 .striped(true)
                 .sense(egui::Sense::click())
@@ -5003,7 +5134,12 @@ impl MeshBcTesterApp {
                 .column(Column::remainder().clip(true))
                 .min_scrolled_height(log_table_height)
                 .max_scroll_height(log_table_height)
-                .stick_to_bottom(self.follow_latest_logs)
+                .animate_scrolling(false);
+            if self.follow_latest_logs && !filtered_log_indices.is_empty() {
+                table =
+                    table.scroll_to_row(filtered_log_indices.len() - 1, Some(egui::Align::BOTTOM));
+            }
+            table
                 .header(TABLE_ROW_HEIGHT, |mut header| {
                     header.col(|ui| {
                         Self::table_header_label(ui, "时间");
@@ -5429,8 +5565,7 @@ impl MeshBcTesterApp {
 
     fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, tone: ChipTone) {
         let (fill, border, text) = match (tone, ui.visuals().dark_mode) {
-            (ChipTone::Warning, true) => (rgb(49, 34, 7), rgb(171, 97, 16), rgb(255, 210, 138)),
-            (ChipTone::Warning, false) => (rgb(255, 246, 225), rgb(217, 132, 29), rgb(126, 72, 9)),
+            (ChipTone::Warning, dark_mode) => warning_colors(dark_mode),
         };
 
         egui::Frame::group(ui.style())
@@ -5459,6 +5594,27 @@ impl MeshBcTesterApp {
 
     fn compact_text_edit(ui: &mut egui::Ui, width: f32, value: &mut String) -> egui::Response {
         Self::compact_widget(ui, width, TextEdit::singleline(value))
+    }
+
+    fn warning_text_edit(
+        ui: &mut egui::Ui,
+        width: f32,
+        value: &mut String,
+        hint: &str,
+    ) -> egui::Response {
+        let (fill, border, text) = warning_colors(ui.visuals().dark_mode);
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(3, 0))
+            .fill(fill)
+            .stroke(stroke(border))
+            .show(ui, |ui| {
+                ui.visuals_mut().override_text_color = Some(text);
+                ui.add_sized(
+                    [width, COMPACT_CONTROL_HEIGHT],
+                    TextEdit::singleline(value).hint_text(hint),
+                )
+            })
+            .inner
     }
 
     fn truncate_for_row(text: &str, max_chars: usize) -> String {

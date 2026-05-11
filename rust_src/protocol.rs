@@ -913,7 +913,11 @@ pub fn hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn crc16_xmodem(data: &[u8]) -> u16 {
-    let mut crc = 0u16;
+    crc16_xmodem_with_initial(data, 0x0000)
+}
+
+fn crc16_xmodem_with_initial(data: &[u8], initial: u16) -> u16 {
+    let mut crc = initial;
     for byte in data {
         crc ^= u16::from(*byte) << 8;
         for _ in 0..8 {
@@ -925,6 +929,10 @@ pub fn crc16_xmodem(data: &[u8]) -> u16 {
         }
     }
     crc
+}
+
+fn bytes_ota_app_checksum(data: &[u8]) -> u16 {
+    crc16_xmodem(data)
 }
 
 pub fn crc16_modbus(data: &[u8]) -> u16 {
@@ -1459,13 +1467,18 @@ pub fn build_transfer_packets_for_format(
     version: u8,
     voice_name: &str,
     bytes_chunk_size: usize,
+    bytes_app_crc_override: Option<u16>,
 ) -> Result<Vec<TransferPacket>, String> {
     match format {
         OtaTransferFormat::Json => build_transfer_packets(kind, data, version, voice_name)
             .map(|packets| packets.into_iter().map(TransferPacket::json).collect()),
-        OtaTransferFormat::Bytes => {
-            build_bytes_ota_transfer_packets(kind, data, version, bytes_chunk_size)
-        }
+        OtaTransferFormat::Bytes => build_bytes_ota_transfer_packets(
+            kind,
+            data,
+            version,
+            bytes_chunk_size,
+            bytes_app_crc_override,
+        ),
     }
 }
 
@@ -1476,12 +1489,17 @@ pub fn transfer_preview_for_format(
     version: u8,
     voice_name: &str,
     bytes_chunk_size: usize,
+    bytes_app_crc_override: Option<u16>,
 ) -> Value {
     match format {
         OtaTransferFormat::Json => transfer_preview(kind, data, version, voice_name),
-        OtaTransferFormat::Bytes => {
-            bytes_ota_transfer_preview(kind, data, version, bytes_chunk_size)
-        }
+        OtaTransferFormat::Bytes => bytes_ota_transfer_preview(
+            kind,
+            data,
+            version,
+            bytes_chunk_size,
+            bytes_app_crc_override,
+        ),
     }
 }
 
@@ -1490,6 +1508,7 @@ pub fn build_bytes_ota_transfer_packets(
     data: &[u8],
     protocol_version: u8,
     chunk_size: usize,
+    app_crc_override: Option<u16>,
 ) -> Result<Vec<TransferPacket>, String> {
     if data.is_empty() {
         return Err("传输数据不能为空".into());
@@ -1531,7 +1550,11 @@ pub fn build_bytes_ota_transfer_packets(
 
     let mut end_body = Vec::with_capacity(6);
     end_body.extend_from_slice(&(padded_data.len() as u32).to_be_bytes());
-    end_body.extend_from_slice(&crc16_xmodem(&padded_data).to_be_bytes());
+    end_body.extend_from_slice(
+        &app_crc_override
+            .unwrap_or_else(|| bytes_ota_app_checksum(&padded_data))
+            .to_be_bytes(),
+    );
     packets.push(TransferPacket::bytes_frame(BytesTransferFrame {
         command: end_opcode,
         message_id: base_message_id.wrapping_add(chunk_total as u64 + 1),
@@ -1546,6 +1569,7 @@ pub fn bytes_ota_transfer_preview(
     data: &[u8],
     protocol_version: u8,
     chunk_size: usize,
+    app_crc_override: Option<u16>,
 ) -> Value {
     let chunk_size = if validate_bytes_ota_chunk_size(chunk_size).is_ok() {
         chunk_size
@@ -1554,7 +1578,8 @@ pub fn bytes_ota_transfer_preview(
     };
     let chunk_total = data.len().div_ceil(chunk_size);
     let padded_total_size = chunk_total * chunk_size;
-    let check_sum = crc16_xmodem(&padded_bytes_ota_data(data, chunk_size));
+    let computed_check_sum = bytes_ota_app_checksum(&padded_bytes_ota_data(data, chunk_size));
+    let check_sum = app_crc_override.unwrap_or(computed_check_sum);
     let (start_opcode, data_opcode, end_opcode) = bytes_ota_opcodes(kind).unwrap_or((0, 0, 0));
     json!({
         "format": "bytes",
@@ -1567,7 +1592,22 @@ pub fn bytes_ota_transfer_preview(
         "ota_padded_total_size": padded_total_size,
         "chunk_size": chunk_size,
         "check_sum": check_sum,
+        "computed_check_sum": computed_check_sum,
+        "check_sum_override": app_crc_override,
     })
+}
+
+pub fn parse_bytes_ota_app_crc_override(value: &str) -> Result<Option<u16>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() != 4 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("Bytes OTA APP CRC覆盖值必须是2字节CRC十六进制值，例如2DF3。".into());
+    }
+    u16::from_str_radix(value, 16)
+        .map(Some)
+        .map_err(|err| err.to_string())
 }
 
 pub fn render_transfer_packet_payload(
@@ -1895,6 +1935,7 @@ mod tests {
     #[test]
     fn crc_vector() {
         assert_eq!(crc16_xmodem(b"123456789"), 0x31C3);
+        assert_eq!(crc16_xmodem_with_initial(b"123456789", 0xFFFF), 0x29B1);
         assert_eq!(crc16_modbus(b"123456789"), 0x4B37);
     }
 
@@ -2067,6 +2108,7 @@ mod tests {
             1,
             "",
             DEFAULT_BYTES_OTA_CHUNK_SIZE,
+            None,
         )
         .unwrap();
         assert_eq!(packets.len(), 4);
@@ -2105,7 +2147,7 @@ mod tests {
         padded.resize(DEFAULT_BYTES_OTA_CHUNK_SIZE * 2, 0xFF);
         assert_eq!(
             u16::from_be_bytes([end[30], end[31]]),
-            crc16_xmodem(&padded)
+            bytes_ota_app_checksum(&padded)
         );
     }
 
@@ -2118,6 +2160,7 @@ mod tests {
             1,
             "",
             DEFAULT_BYTES_OTA_CHUNK_SIZE,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2130,6 +2173,32 @@ mod tests {
     }
 
     #[test]
+    fn build_bytes_ota_uses_manual_app_crc_override() {
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            b"abc",
+            1,
+            "",
+            DEFAULT_BYTES_OTA_CHUNK_SIZE,
+            Some(0x2DF3),
+        )
+        .unwrap();
+
+        let end = render_transfer_packet_payload(&packets[2], "34B7DA848802").unwrap();
+        assert_eq!(end[17], 0xC4);
+        assert_eq!(u16::from_be_bytes([end[30], end[31]]), 0x2DF3);
+    }
+
+    #[test]
+    fn parse_bytes_ota_app_crc_override_requires_four_hex_digits() {
+        assert_eq!(parse_bytes_ota_app_crc_override(""), Ok(None));
+        assert_eq!(parse_bytes_ota_app_crc_override("2DF3"), Ok(Some(0x2DF3)));
+        assert!(parse_bytes_ota_app_crc_override("2DF").is_err());
+        assert!(parse_bytes_ota_app_crc_override("2DFX").is_err());
+    }
+
+    #[test]
     fn build_bytes_ota_honors_custom_chunk_size() {
         let data = vec![0xA5; 513];
         let packets = build_transfer_packets_for_format(
@@ -2139,6 +2208,7 @@ mod tests {
             1,
             "",
             256,
+            None,
         )
         .unwrap();
         assert_eq!(packets.len(), 5);
