@@ -22,9 +22,10 @@ use crate::protocol::{
     BYTES_OTA_QUICK_CHUNK_SIZES, COMMANDS, DEFAULT_BYTES_OTA_CHUNK_SIZE, FieldKind,
     build_bytes_control_packet, build_command_payload, build_transfer_packets_for_format,
     bytes_to_hex, classify_execution_result, command_by_key, current_time_stamp,
-    decode_bytes_transfer_ack_payload, decode_payload_details, expected_response_opcode,
-    parse_opcode, redact_json, render_transfer_packet_payload, response_can_omit_timestamp,
-    summarize_payload, transfer_preview_for_format, validate_bytes_ota_chunk_size,
+    decode_bytes_transfer_ack_payload, decode_bytes_transfer_frame, decode_payload_details,
+    expected_response_opcode, hex_to_bytes, parse_opcode, redact_json,
+    render_transfer_packet_payload, response_can_omit_timestamp, summarize_payload,
+    transfer_preview_for_format, validate_bytes_ota_chunk_size,
 };
 use crate::store::{load_config, save_config};
 use crate::transfer_engine::{
@@ -2918,6 +2919,235 @@ fn display_mqtt_payload(payload: &str, payload_bytes: &[u8]) -> String {
     }
 }
 
+const BYTES_FRAME_HEADER_BYTES: usize = 26;
+
+#[derive(Debug)]
+struct LogBytesPayload {
+    bytes: Vec<u8>,
+    full_length: Option<usize>,
+    truncated: bool,
+    command_hint: Option<u8>,
+    body_len_hint: Option<usize>,
+}
+
+fn decode_log_bytes_frame_details(entry: &LogEntry) -> Option<Vec<(String, String)>> {
+    let logged = parse_log_bytes_payload(&entry.payload)?;
+    if !logged.truncated
+        && let Some(details) = decode_full_log_bytes_frame_details(&logged.bytes)
+    {
+        return Some(details);
+    }
+    decode_compact_log_bytes_frame_details(&logged)
+}
+
+fn parse_log_bytes_payload(payload: &str) -> Option<LogBytesPayload> {
+    if let Ok(bytes) = hex_to_bytes(payload) {
+        return Some(LogBytesPayload {
+            bytes,
+            full_length: None,
+            truncated: false,
+            command_hint: None,
+            body_len_hint: None,
+        });
+    }
+
+    let text = payload.trim();
+    let (_, payload_part) = text.split_once("payload=")?;
+    let (payload_hex, full_length, truncated) =
+        if let Some((preview, suffix)) = payload_part.trim().split_once("...(len=") {
+            let full_length = suffix
+                .split(')')
+                .next()
+                .and_then(|value| value.parse::<usize>().ok());
+            (preview.trim(), full_length, true)
+        } else {
+            (payload_part.trim(), None, false)
+        };
+
+    let bytes = hex_to_bytes(payload_hex).ok()?;
+    if bytes.get(0..2) != Some(&[0xFE, 0xFE]) {
+        return None;
+    }
+    Some(LogBytesPayload {
+        bytes,
+        full_length,
+        truncated,
+        command_hint: parse_hex_u8_field(text, "opcode=0x"),
+        body_len_hint: parse_usize_field(text, "body_len="),
+    })
+}
+
+fn parse_hex_u8_field(text: &str, key: &str) -> Option<u8> {
+    let (_, tail) = text.split_once(key)?;
+    let token = tail
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| ch == ',' || ch == ';');
+    u8::from_str_radix(token, 16).ok()
+}
+
+fn parse_usize_field(text: &str, key: &str) -> Option<usize> {
+    let (_, tail) = text.split_once(key)?;
+    let token = tail
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| ch == ',' || ch == ';');
+    token.parse::<usize>().ok()
+}
+
+fn decode_full_log_bytes_frame_details(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let frame = decode_bytes_transfer_frame(bytes)?;
+    let frame_len = u16::from_be_bytes([*bytes.get(2)?, *bytes.get(3)?]);
+    let crc_bytes = bytes.get(bytes.len().checked_sub(2)?..bytes.len())?;
+    let crc = u16::from_be_bytes([crc_bytes[0], crc_bytes[1]]);
+    let mut details = vec![
+        ("帧格式".into(), "Bytes MQTT".into()),
+        ("帧头".into(), bytes_to_hex(bytes.get(0..2)?)),
+        ("长度字段".into(), frame_len.to_string()),
+        ("协议版本".into(), bytes.get(4)?.to_string()),
+        ("设备ID字段".into(), bytes_to_hex(bytes.get(6..14)?)),
+        ("操作码".into(), format!("0x{:02X}", frame.command)),
+        ("消息ID".into(), frame.message_id.to_string()),
+        ("Body长度".into(), frame.body.len().to_string()),
+    ];
+    push_bytes_command_details(&mut details, frame.command, &frame.body);
+    details.push((
+        "CRC字节".into(),
+        format!("{} (Modbus=0x{crc:04X})", bytes_to_hex(crc_bytes)),
+    ));
+    details.push(("CRC校验".into(), "通过".into()));
+    Some(details)
+}
+
+fn decode_compact_log_bytes_frame_details(
+    logged: &LogBytesPayload,
+) -> Option<Vec<(String, String)>> {
+    let bytes = &logged.bytes;
+    let frame_len = if bytes.len() >= 4 {
+        Some(u16::from_be_bytes([bytes[2], bytes[3]]) as usize)
+    } else {
+        None
+    };
+    let command = logged.command_hint.or_else(|| bytes.get(17).copied())?;
+    let body_len = logged
+        .body_len_hint
+        .or_else(|| frame_len.and_then(|len| len.checked_sub(BYTES_FRAME_HEADER_BYTES)));
+    let body_preview = if bytes.len() > BYTES_FRAME_HEADER_BYTES {
+        &bytes[BYTES_FRAME_HEADER_BYTES..]
+    } else {
+        &[]
+    };
+
+    let mut details = vec![("帧格式".into(), "Bytes MQTT".into())];
+    if let Some(prefix) = bytes.get(0..2) {
+        details.push(("帧头".into(), bytes_to_hex(prefix)));
+    }
+    if let Some(frame_len) = frame_len {
+        details.push(("长度字段".into(), frame_len.to_string()));
+    }
+    details.push(("操作码".into(), format!("0x{command:02X}")));
+    if bytes.len() >= 26 {
+        let message_id = u64::from_be_bytes(bytes[18..26].try_into().ok()?);
+        details.push(("消息ID".into(), message_id.to_string()));
+    }
+    if let Some(body_len) = body_len {
+        details.push(("Body长度".into(), body_len.to_string()));
+    }
+    push_bytes_command_details(&mut details, command, body_preview);
+    if logged.truncated {
+        let length_text = logged
+            .full_length
+            .map(|full_length| format!("预览 {} 字节 / 完整 {} 字节", bytes.len(), full_length))
+            .unwrap_or_else(|| format!("预览 {} 字节", bytes.len()));
+        details.push(("负载保存".into(), length_text));
+    }
+    Some(details)
+}
+
+fn push_bytes_command_details(details: &mut Vec<(String, String)>, command: u8, body: &[u8]) {
+    if let Some(label) = bytes_command_label(command) {
+        details.push(("命令类型".into(), label.into()));
+    }
+    match command {
+        0xC0 | 0xC6 => {
+            if let Some(action) = body.first().map(|value| match value {
+                0 => "取消升级".to_string(),
+                1 => "开始升级".to_string(),
+                value => format!("未知动作({value})"),
+            }) {
+                details.push(("升级动作".into(), action));
+            }
+        }
+        0xC2 | 0xC8 if body.len() >= 2 => {
+            let index = u16::from_be_bytes([body[0], body[1]]);
+            details.push(("数据块索引".into(), index.to_string()));
+            details.push((
+                "数据字节数".into(),
+                body.len().saturating_sub(2).to_string(),
+            ));
+        }
+        0xC4 | 0xCA if body.len() >= 6 => {
+            let total_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let checksum = u16::from_be_bytes([body[4], body[5]]);
+            details.push(("升级总长度".into(), total_len.to_string()));
+            details.push(("升级数据CRC".into(), format!("0x{checksum:04X}")));
+        }
+        _ => {}
+    }
+}
+
+fn bytes_command_label(command: u8) -> Option<&'static str> {
+    match command {
+        0x4C => Some("B/C灯复位"),
+        0xC0 => Some("BC灯APP升级控制"),
+        0xC1 => Some("BC灯APP升级控制应答"),
+        0xC2 => Some("BC灯APP升级数据"),
+        0xC3 => Some("BC灯APP升级数据应答"),
+        0xC4 => Some("BC灯APP升级结束"),
+        0xC5 => Some("BC灯APP升级结束应答"),
+        0xC6 => Some("A灯APP升级控制"),
+        0xC7 => Some("A灯APP升级控制应答"),
+        0xC8 => Some("A灯APP升级数据"),
+        0xC9 => Some("A灯APP升级数据应答"),
+        0xCA => Some("A灯APP升级结束"),
+        0xCB => Some("A灯APP升级结束应答"),
+        _ => None,
+    }
+}
+
+fn render_payload_details_table(
+    ui: &mut egui::Ui,
+    details: &[(String, String)],
+    details_height: f32,
+) {
+    let height = MeshBcTesterApp::table_scroll_height(details.len(), details_height);
+    TableBuilder::new(ui)
+        .striped(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::exact(96.0))
+        .column(Column::remainder())
+        .max_scroll_height(height)
+        .header(TABLE_ROW_HEIGHT, |mut header| {
+            header.col(|ui| {
+                ui.strong("字段");
+            });
+            header.col(|ui| {
+                ui.strong("值");
+            });
+        })
+        .body(|body| {
+            body.rows(TABLE_ROW_HEIGHT, details.len(), |mut row| {
+                let (key, value) = &details[row.index()];
+                row.col(|ui| {
+                    ui.label(key);
+                });
+                row.col(|ui| {
+                    ui.label(RichText::new(value).monospace());
+                });
+            });
+        });
+}
+
 #[cfg(test)]
 fn transfer_expected_ack_opcode(
     kind: TransferKind,
@@ -4859,42 +5089,31 @@ impl MeshBcTesterApp {
 
             Self::section_heading(ui, "解析详情");
             let details_height = (panel_height * 0.32).clamp(120.0, 220.0);
-            if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
+            if let Some(details) = decode_log_bytes_frame_details(entry) {
+                render_payload_details_table(ui, &details, details_height);
+            } else if let Ok(payload) = serde_json::from_str::<Value>(&entry.payload) {
                 let details = decode_payload_details(&payload);
                 if details.is_empty() {
                     ui.label("当前负载暂无结构化解析。");
                 } else {
-                    TableBuilder::new(ui)
-                        .id_salt("payload-details-table")
-                        .striped(true)
-                        .column(Column::initial(150.0))
-                        .column(Column::remainder().clip(true))
-                        .min_scrolled_height(details_height)
-                        .max_scroll_height(details_height)
-                        .body(|body| {
-                            body.rows(TABLE_ROW_HEIGHT, details.len(), |mut row| {
-                                let (key, value) = &details[row.index()];
-                                row.col(|ui| {
-                                    ui.label(
-                                        RichText::new(key)
-                                            .monospace()
-                                            .strong()
-                                            .color(ui.visuals().weak_text_color()),
-                                    );
-                                });
-                                row.col(|ui| {
-                                    ui.label(value);
-                                });
-                            });
-                        });
+                    render_payload_details_table(ui, &details, details_height);
                 }
             } else {
                 ui.label("当前负载不是可解析的 JSON。");
             }
 
             ui.separator();
-            Self::section_heading(ui, "当前负载");
-            let mut payload = entry.payload.clone();
+            ui.horizontal_wrapped(|ui| {
+                Self::section_heading(ui, "当前负载");
+                ui.small(
+                    RichText::new(format!("Payload / {} bytes", entry.payload.len()))
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if Self::secondary_button(ui, "复制").clicked() {
+                    ui.ctx().copy_text(entry.payload.clone());
+                }
+            });
+            let mut payload = entry.payload.as_str();
             let payload_height = (panel_height - details_height - 124.0).max(180.0);
             egui::ScrollArea::vertical()
                 .id_salt("current-payload-scroll")
@@ -4903,8 +5122,7 @@ impl MeshBcTesterApp {
                     ui.add(
                         TextEdit::multiline(&mut payload)
                             .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
+                            .desired_width(f32::INFINITY),
                     );
                 });
         });
@@ -5661,6 +5879,67 @@ mod tests {
             summary: summary.into(),
             payload: "{}".into(),
         }
+    }
+
+    fn detail_value<'a>(details: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        details
+            .iter()
+            .find(|(detail_key, _)| detail_key == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn expected_modbus_crc_detail(payload: &[u8]) -> String {
+        let crc = crate::protocol::crc16_modbus(&payload[..payload.len() - 2]);
+        format!("{} (Modbus=0x{crc:04X})", bytes_to_hex(&crc.to_be_bytes()))
+    }
+
+    #[test]
+    fn log_inspector_decodes_bytes_ota_start_hex_payload() {
+        let packet = build_bytes_control_packet(0xC0, vec![1], 1);
+        let payload = render_transfer_packet_payload(&packet, "34B7DA848802").unwrap();
+        let mut entry = log_entry("34B7DA848802", "0xC0", "Bytes OTA start");
+        entry.direction = LogDirection::Tx;
+        entry.topic = "/application/AP-C-BM/device/34B7DA848802/down".into();
+        entry.payload = bytes_to_hex(&payload);
+
+        let details = decode_log_bytes_frame_details(&entry).unwrap();
+
+        assert_eq!(detail_value(&details, "帧格式"), Some("Bytes MQTT"));
+        assert_eq!(detail_value(&details, "操作码"), Some("0xC0"));
+        assert_eq!(detail_value(&details, "命令类型"), Some("BC灯APP升级控制"));
+        assert_eq!(detail_value(&details, "升级动作"), Some("开始升级"));
+        let expected_crc = expected_modbus_crc_detail(&payload);
+        assert_eq!(
+            detail_value(&details, "CRC字节"),
+            Some(expected_crc.as_str())
+        );
+        assert_eq!(detail_value(&details, "CRC校验"), Some("通过"));
+    }
+
+    #[test]
+    fn log_inspector_decodes_compact_transfer_bytes_payload() {
+        let packet = build_bytes_control_packet(0xC0, vec![1], 1);
+        let payload = render_transfer_packet_payload(&packet, "34B7DA848802").unwrap();
+        let mut entry = log_entry("34B7DA848802", "0xC0", "Bytes OTA start");
+        entry.direction = LogDirection::Tx;
+        entry.topic = "/application/AP-C-BM/device/34B7DA848802/down".into();
+        entry.payload = format!(
+            "bytes opcode=0xC0 body_len=1 payload={}",
+            bytes_to_hex(&payload)
+        );
+
+        let details = decode_log_bytes_frame_details(&entry).unwrap();
+
+        assert_eq!(detail_value(&details, "帧格式"), Some("Bytes MQTT"));
+        assert_eq!(detail_value(&details, "操作码"), Some("0xC0"));
+        assert_eq!(detail_value(&details, "命令类型"), Some("BC灯APP升级控制"));
+        assert_eq!(detail_value(&details, "升级动作"), Some("开始升级"));
+        let expected_crc = expected_modbus_crc_detail(&payload);
+        assert_eq!(
+            detail_value(&details, "CRC字节"),
+            Some(expected_crc.as_str())
+        );
+        assert_eq!(detail_value(&details, "CRC校验"), Some("通过"));
     }
 
     #[test]

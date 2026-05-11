@@ -927,6 +927,21 @@ pub fn crc16_xmodem(data: &[u8]) -> u16 {
     crc
 }
 
+pub fn crc16_modbus(data: &[u8]) -> u16 {
+    let mut crc = 0xFFFFu16;
+    for byte in data {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            if crc & 0x0001 != 0 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc
+}
+
 pub fn parse_opcode(text: &str) -> Result<u32, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1586,7 +1601,7 @@ pub fn render_bytes_transfer_frame(
     payload.push(frame.command);
     payload.extend_from_slice(&frame.message_id.to_be_bytes());
     payload.extend_from_slice(&frame.body);
-    let checksum = crc16_xmodem(&payload);
+    let checksum = crc16_modbus(&payload);
     payload.extend_from_slice(&checksum.to_be_bytes());
     Ok(payload)
 }
@@ -1603,7 +1618,7 @@ pub fn decode_bytes_transfer_frame(payload: &[u8]) -> Option<DecodedBytesTransfe
         return None;
     }
     let expected_crc = u16::from_be_bytes([payload[frame_len], payload[frame_len + 1]]);
-    if crc16_xmodem(&payload[..frame_len]) != expected_crc {
+    if crc16_modbus(&payload[..frame_len]) != expected_crc {
         return None;
     }
     let message_id = u64::from_be_bytes(payload[18..26].try_into().ok()?);
@@ -1880,6 +1895,26 @@ mod tests {
     #[test]
     fn crc_vector() {
         assert_eq!(crc16_xmodem(b"123456789"), 0x31C3);
+        assert_eq!(crc16_modbus(b"123456789"), 0x4B37);
+    }
+
+    #[test]
+    fn bytes_frame_outer_crc_uses_modbus_high_byte_first() {
+        let frame = BytesTransferFrame {
+            command: 0xC0,
+            message_id: 0x0000_019E_15A6_3018,
+            protocol_version: 1,
+            body: vec![1],
+        };
+        let payload = render_bytes_transfer_frame(&frame, "34B7DA848802").unwrap();
+
+        assert_eq!(
+            bytes_to_hex(&payload),
+            "FEFE001B0101000034B7DA848802000002C00000019E15A63018012989"
+        );
+        assert_eq!(crc16_modbus(&payload[..payload.len() - 2]), 0x2989);
+        assert_eq!(&payload[payload.len() - 2..], &[0x29, 0x89]);
+        assert!(decode_bytes_transfer_frame(&payload).is_some());
     }
 
     #[test]
@@ -2048,7 +2083,7 @@ mod tests {
         assert_eq!(start[17], 0xC0);
         assert_eq!(start[26], 1);
         let start_crc = u16::from_be_bytes([start[start.len() - 2], start[start.len() - 1]]);
-        assert_eq!(start_crc, crc16_xmodem(&start[..start.len() - 2]));
+        assert_eq!(start_crc, crc16_modbus(&start[..start.len() - 2]));
 
         let data_frame = render_transfer_packet_payload(&packets[2], "34B7DA848802").unwrap();
         assert_eq!(data_frame[17], 0xC2);
