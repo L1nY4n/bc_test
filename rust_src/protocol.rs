@@ -1444,7 +1444,7 @@ const OTA_TRANSFER_CHUNK_SIZE: usize = 200;
 const MEDIA_TRANSFER_CHUNK_SIZE: usize = 400;
 pub const DEFAULT_BYTES_OTA_CHUNK_SIZE: usize = 1024;
 pub const BYTES_OTA_QUICK_CHUNK_SIZES: [usize; 3] = [1024, 512, 256];
-const BYTES_OTA_MAX_CHUNKS: usize = 2048;
+const BYTES_OTA_MAX_INDEXED_CHUNKS: usize = (u16::MAX as usize) + 1;
 const BYTES_OTA_MAX_CHUNK_SIZE: usize = 1024;
 const BYTES_FRAME_HEADER_SIZE: usize = 26;
 const BYTES_FRAME_PREFIX: [u8; 2] = [0xFE, 0xFE];
@@ -1518,10 +1518,10 @@ pub fn build_bytes_ota_transfer_packets(
         return Err("Bytes OTA 仅支持 A灯/BC灯 APP升级".into());
     };
     let chunk_total = chunk_count(data, chunk_size);
-    if chunk_total > BYTES_OTA_MAX_CHUNKS {
+    if chunk_total > BYTES_OTA_MAX_INDEXED_CHUNKS {
         return Err(format!(
-            "Bytes OTA 数据块数 {} 超出协议上限 {}",
-            chunk_total, BYTES_OTA_MAX_CHUNKS
+            "Bytes OTA 数据块数 {} 超出分包索引上限 {}，请增大包长或减小固件大小。",
+            chunk_total, BYTES_OTA_MAX_INDEXED_CHUNKS
         ));
     }
 
@@ -2221,6 +2221,31 @@ mod tests {
         assert_eq!(
             u32::from_be_bytes([end[26], end[27], end[28], end[29]]),
             768
+        );
+    }
+
+    #[test]
+    fn build_bytes_ota_allows_more_than_legacy_chunk_limit() {
+        let data = vec![0xA5; 3402 * 512];
+        let packets = build_transfer_packets_for_format(
+            TransferKind::BcOta,
+            OtaTransferFormat::Bytes,
+            &data,
+            1,
+            "",
+            512,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(packets.len(), 3404);
+        let last_data = render_transfer_packet_payload(&packets[3402], "34B7DA848802").unwrap();
+        assert_eq!(last_data[17], 0xC2);
+        assert_eq!(u16::from_be_bytes([last_data[26], last_data[27]]), 3401);
+        let end = render_transfer_packet_payload(&packets[3403], "34B7DA848802").unwrap();
+        assert_eq!(
+            u32::from_be_bytes([end[26], end[27], end[28], end[29]]),
+            (3402 * 512) as u32
         );
     }
 
