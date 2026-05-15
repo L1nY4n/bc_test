@@ -76,6 +76,7 @@ pub struct MeshBcTesterApp {
     voice_transfer_ack_timeout_secs: u64,
     voice_transfer_max_retries: u8,
     system_notice: String,
+    system_notice_tone: ChipTone,
     needs_connection_recovery: bool,
     pending_confirmation: Option<PendingConfirmation>,
     pending_file_dialog: Option<PendingFileDialog>,
@@ -129,9 +130,28 @@ struct BytesCommandItem {
     label: String,
 }
 
-#[derive(Clone, Copy)]
+struct TreeRowResponse {
+    response: egui::Response,
+    secondary_clicked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChipTone {
+    Info,
+    Success,
     Warning,
+    Error,
+}
+
+impl ChipTone {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Info => "提示",
+            Self::Success => "成功",
+            Self::Warning => "注意",
+            Self::Error => "失败",
+        }
+    }
 }
 
 enum PendingAction {
@@ -182,7 +202,6 @@ const COMPACT_LABEL_HEIGHT: f32 = 20.0;
 const COMPACT_ICON_BUTTON_SIZE: egui::Vec2 = egui::vec2(28.0, 24.0);
 const TABLE_ROW_HEIGHT: f32 = COMPACT_CONTROL_HEIGHT;
 const TOP_TOOLBAR_HEIGHT: f32 = 34.0;
-const TOP_TOOLBAR_NOTICE_HEIGHT: f32 = 24.0;
 const TOP_STATUS_WIDTH: f32 = 160.0;
 const MENU_FIELD_LABEL_WIDTH: f32 = 62.0;
 const ACTION_FIELD_LABEL_WIDTH: f32 = 72.0;
@@ -321,6 +340,7 @@ impl MeshBcTesterApp {
             voice_transfer_ack_timeout_secs,
             voice_transfer_max_retries,
             system_notice: String::new(),
+            system_notice_tone: ChipTone::Info,
             needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
@@ -354,6 +374,52 @@ impl MeshBcTesterApp {
     fn set_device_result(state: &mut DeviceRuntimeState, label: &str, text: String) {
         state.last_result_label = label.to_string();
         state.last_result = text;
+    }
+
+    fn set_notice(&mut self, tone: ChipTone, text: impl Into<String>) {
+        self.system_notice = text.into();
+        self.system_notice_tone = tone;
+    }
+
+    fn set_success_notice(&mut self, text: impl Into<String>) {
+        self.set_notice(ChipTone::Success, text);
+    }
+
+    fn set_warning_notice(&mut self, text: impl Into<String>) {
+        self.set_notice(ChipTone::Warning, text);
+    }
+
+    fn set_error_notice(&mut self, text: impl Into<String>) {
+        self.set_notice(ChipTone::Error, text);
+    }
+
+    fn clear_notice(&mut self) {
+        self.system_notice.clear();
+        self.system_notice_tone = ChipTone::Info;
+    }
+
+    fn set_transfer_notice(&mut self, device_local_id: u64, label: &str, text: &str) {
+        if !text.contains("OTA") && !text.contains("升级") {
+            return;
+        }
+        let device_name = self
+            .config
+            .devices
+            .iter()
+            .find(|device| device.local_id == device_local_id)
+            .map(|device| device.name.as_str())
+            .unwrap_or("设备");
+        let notice = format!("{device_name}: {text}");
+        if label == "成功" || text.contains("成功") {
+            self.set_success_notice(notice);
+        } else if label == "失败"
+            || label == "错误"
+            || text.contains("失败")
+            || text.contains("超时")
+            || text.contains("错误")
+        {
+            self.set_error_notice(notice);
+        }
     }
 
     fn selected_device_refs(&self) -> Vec<&DeviceProfile> {
@@ -514,12 +580,13 @@ impl MeshBcTesterApp {
                     label,
                     text,
                 } => {
+                    self.set_transfer_notice(device_local_id, &label, &text);
                     if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
                         Self::set_device_result(state, &label, text);
                     }
                 }
                 TransferEngineEvent::SystemNotice(text) => {
-                    self.system_notice = text;
+                    self.set_warning_notice(text);
                 }
             }
         }
@@ -934,7 +1001,7 @@ impl MeshBcTesterApp {
     fn ensure_selected_devices(&mut self) -> Option<Vec<DeviceProfile>> {
         let devices = self.selected_devices_owned();
         if devices.is_empty() {
-            self.system_notice = "请先选择至少一个设备。".into();
+            self.set_warning_notice("请先选择至少一个设备。");
             return None;
         }
         Some(devices)
@@ -967,7 +1034,7 @@ impl MeshBcTesterApp {
             if let Err(err) =
                 self.send_payload_to_device(&device, &payload, "preset", None, true, true)
             {
-                self.system_notice = err;
+                self.set_error_notice(err);
                 return;
             }
         }
@@ -978,7 +1045,7 @@ impl MeshBcTesterApp {
             if let Err(err) =
                 self.send_payload_to_device(&device, &payload, "raw", expected_override, true, true)
             {
-                self.system_notice = err;
+                self.set_error_notice(err);
                 return;
             }
         }
@@ -998,7 +1065,7 @@ impl MeshBcTesterApp {
                 item.expected_opcode,
                 &item.label,
             ) {
-                self.system_notice = err;
+                self.set_error_notice(err);
                 return;
             }
             completed_device_ids.push(device_local_id);
@@ -1359,7 +1426,7 @@ impl MeshBcTesterApp {
         self.config.devices.push(device);
         self.sync_subscriptions();
         let _ = save_config(&self.config);
-        self.system_notice = format!("已从主动上报导入设备资源: {}", candidate.device_id);
+        self.set_success_notice(format!("已从主动上报导入设备资源: {}", candidate.device_id));
     }
 
     fn load_discovered_device_into_editor(&mut self, device_id: &str) {
@@ -1385,7 +1452,7 @@ impl MeshBcTesterApp {
 
     fn save_device_editor(&mut self) {
         if let Err(err) = self.validate_device_editor() {
-            self.system_notice = err;
+            self.set_error_notice(err);
             return;
         }
 
@@ -1597,7 +1664,7 @@ impl MeshBcTesterApp {
             .collect::<Vec<_>>();
         for item in &items {
             if let Err(err) = render_transfer_packet_payload(&item.packet, &item.device.device_id) {
-                self.system_notice = format!("{}: {err}", item.device.name);
+                self.set_error_notice(format!("{}: {err}", item.device.name));
                 return;
             }
         }
@@ -1620,24 +1687,24 @@ impl MeshBcTesterApp {
         voice_name: String,
     ) {
         if file_path.trim().is_empty() {
-            self.system_notice = "请先选择传输文件。".into();
+            self.set_warning_notice("请先选择传输文件。");
             return;
         }
         let path = PathBuf::from(&file_path);
         let Ok(bytes) = fs::read(&path) else {
-            self.system_notice = "读取传输文件失败。".into();
+            self.set_error_notice("读取传输文件失败。");
             return;
         };
         if bytes.is_empty() {
-            self.system_notice = "传输文件不能为空。".into();
+            self.set_warning_notice("传输文件不能为空。");
             return;
         }
         if bytes.len() > MAX_TRANSFER_BYTES {
-            self.system_notice = format!(
+            self.set_error_notice(format!(
                 "传输文件过大：{} 字节，当前上限 {} 字节。",
                 bytes.len(),
                 MAX_TRANSFER_BYTES
-            );
+            ));
             return;
         }
         let Some(devices) = self.ensure_selected_devices() else {
@@ -1651,14 +1718,14 @@ impl MeshBcTesterApp {
         if transfer_format == OtaTransferFormat::Bytes
             && let Err(err) = validate_bytes_ota_chunk_size(bytes_chunk_size)
         {
-            self.system_notice = err;
+            self.set_error_notice(err);
             return;
         }
         let bytes_app_crc_override = if transfer_format == OtaTransferFormat::Bytes {
             match parse_bytes_ota_app_crc_override(&self.bytes_ota_app_crc_override) {
                 Ok(override_value) => override_value,
                 Err(err) => {
-                    self.system_notice = err;
+                    self.set_error_notice(err);
                     return;
                 }
             }
@@ -1685,14 +1752,14 @@ impl MeshBcTesterApp {
         ) {
             Ok(packets) => packets,
             Err(err) => {
-                self.system_notice = err;
+                self.set_error_notice(err);
                 return;
             }
         };
         if transfer_format == OtaTransferFormat::Bytes {
             for device in &devices {
                 if let Err(err) = render_transfer_packet_payload(&packets[0], &device.device_id) {
-                    self.system_notice = format!("{}: {err}", device.name);
+                    self.set_error_notice(format!("{}: {err}", device.name));
                     return;
                 }
             }
@@ -1904,7 +1971,7 @@ impl MeshBcTesterApp {
                         if let Some(state) = self.runtime_states.get_mut(&device_local_id) {
                             Self::set_device_result(state, "错误", format!("传输发送失败: {err}"));
                         }
-                        self.system_notice = err;
+                        self.set_error_notice(err);
                     }
                 }
             } else {
@@ -2459,7 +2526,7 @@ impl MeshBcTesterApp {
         F: FnOnce() -> Option<PathBuf> + Send + 'static,
     {
         if self.pending_file_dialog.is_some() {
-            self.system_notice = "已有文件对话框正在等待结果。".into();
+            self.set_warning_notice("已有文件对话框正在等待结果。");
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -2490,7 +2557,7 @@ impl MeshBcTesterApp {
                 self.pending_file_dialog = Some(pending);
             }
             Err(TryRecvError::Disconnected) => {
-                self.system_notice = "文件对话框已中断。".into();
+                self.set_error_notice("文件对话框已中断。");
             }
         }
     }
@@ -2695,14 +2762,14 @@ impl MeshBcTesterApp {
         match serde_json::to_string_pretty(&evidence) {
             Ok(text) => match fs::write(path, text) {
                 Ok(()) => {
-                    self.system_notice = format!("已导出测试证据: {}", path.display());
+                    self.set_success_notice(format!("已导出测试证据: {}", path.display()));
                 }
                 Err(err) => {
-                    self.system_notice = format!("导出失败: {err}");
+                    self.set_error_notice(format!("导出失败: {err}"));
                 }
             },
             Err(err) => {
-                self.system_notice = format!("序列化导出内容失败: {err}");
+                self.set_error_notice(format!("序列化导出内容失败: {err}"));
             }
         }
     }
@@ -2762,6 +2829,7 @@ impl MeshBcTesterApp {
             voice_transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
             voice_transfer_max_retries: TRANSFER_MAX_RETRIES,
             system_notice: String::new(),
+            system_notice_tone: ChipTone::Info,
             needs_connection_recovery: false,
             pending_confirmation: None,
             pending_file_dialog: None,
@@ -2851,17 +2919,11 @@ impl eframe::App for MeshBcTesterApp {
         let panel_style = ctx.global_style();
         let panel_style = panel_style.as_ref();
 
-        let top_panel = egui::Panel::top("top_bar").frame(Self::top_toolbar_frame(panel_style));
-        let top_panel = if self.system_notice.is_empty() {
-            top_panel.exact_size(TOP_TOOLBAR_HEIGHT)
-        } else {
-            top_panel.min_size(TOP_TOOLBAR_HEIGHT + TOP_TOOLBAR_NOTICE_HEIGHT)
-        };
+        let top_panel = egui::Panel::top("top_bar")
+            .frame(Self::top_toolbar_frame(panel_style))
+            .exact_size(TOP_TOOLBAR_HEIGHT);
         top_panel.show_inside(ui, |ui| {
             self.render_top_toolbar(ui);
-            if !self.system_notice.is_empty() {
-                Self::status_chip(ui, "提示", &self.system_notice, ChipTone::Warning);
-            }
         });
 
         egui::Panel::left("devices_panel")
@@ -3367,6 +3429,18 @@ fn warning_colors(dark_mode: bool) -> (egui::Color32, egui::Color32, egui::Color
     }
 }
 
+fn notice_colors(tone: ChipTone, dark_mode: bool) -> (egui::Color32, egui::Color32, egui::Color32) {
+    match (tone, dark_mode) {
+        (ChipTone::Info, true) => (rgb(16, 36, 58), rgb(50, 99, 157), rgb(139, 196, 255)),
+        (ChipTone::Info, false) => (rgb(232, 242, 255), rgb(80, 132, 201), rgb(23, 82, 151)),
+        (ChipTone::Success, true) => (rgb(12, 48, 32), rgb(36, 130, 84), rgb(128, 229, 166)),
+        (ChipTone::Success, false) => (rgb(228, 250, 237), rgb(48, 151, 91), rgb(20, 105, 55)),
+        (ChipTone::Warning, dark_mode) => warning_colors(dark_mode),
+        (ChipTone::Error, true) => (rgb(64, 22, 24), rgb(177, 61, 68), rgb(255, 151, 156)),
+        (ChipTone::Error, false) => (rgb(255, 235, 236), rgb(198, 71, 78), rgb(143, 35, 42)),
+    }
+}
+
 fn warning_text_color(ui: &egui::Ui) -> egui::Color32 {
     let (_, _, text) = warning_colors(ui.visuals().dark_mode);
     text
@@ -3604,6 +3678,19 @@ impl MeshBcTesterApp {
                     )
                     .truncate(),
                 );
+                let notice_room =
+                    (ui.available_width() - COMPACT_ICON_BUTTON_SIZE.x - 14.0).max(0.0);
+                if !self.system_notice.is_empty() && notice_room >= 180.0 {
+                    let notice_width = notice_room.min(560.0);
+                    if Self::notice_chip(
+                        ui,
+                        notice_width,
+                        self.system_notice_tone,
+                        &self.system_notice,
+                    ) {
+                        self.clear_notice();
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let hover = Self::theme_toggle_button_hover(self.config.ui_theme_mode);
                     if Self::theme_icon_button(ui, self.config.ui_theme_mode)
@@ -3713,7 +3800,7 @@ impl MeshBcTesterApp {
                             for device in devices {
                                 match build_command_payload(spec, &device, &self.command_form) {
                                     Ok(payload) => items.push((device, payload)),
-                                    Err(err) => self.system_notice = err,
+                                    Err(err) => self.set_error_notice(err),
                                 }
                             }
                             if self.should_confirm_preset_send(spec.key, items.len()) {
@@ -3768,12 +3855,12 @@ impl MeshBcTesterApp {
         match serde_json::from_str::<Value>(&self.raw_json_text) {
             Ok(payload @ Value::Object(_)) => {
                 let Some(opcode) = payload.get("opcode") else {
-                    self.system_notice = "原始 JSON 必须包含 opcode 字段".into();
+                    self.set_warning_notice("原始 JSON 必须包含 opcode 字段");
                     return;
                 };
                 let opcode_text = opcode.to_string().replace('"', "");
                 if parse_opcode(&opcode_text).is_err() {
-                    self.system_notice = "opcode 必须是十进制整数或 0x 十六进制字符串".into();
+                    self.set_warning_notice("opcode 必须是十进制整数或 0x 十六进制字符串");
                     return;
                 }
                 let expected_override = if self.raw_expected_opcode.trim().is_empty() {
@@ -3782,7 +3869,7 @@ impl MeshBcTesterApp {
                     match parse_opcode(&self.raw_expected_opcode) {
                         Ok(opcode) => Some(opcode),
                         Err(err) => {
-                            self.system_notice = format!("期望应答操作码无效: {err}");
+                            self.set_error_notice(format!("期望应答操作码无效: {err}"));
                             return;
                         }
                     }
@@ -3796,7 +3883,7 @@ impl MeshBcTesterApp {
                     match self.normalize_raw_payload_for_device(payload.clone(), &device) {
                         Ok(normalized) => items.push((device, normalized, expected_override)),
                         Err(err) => {
-                            self.system_notice = err;
+                            self.set_error_notice(err);
                             return;
                         }
                     }
@@ -3815,8 +3902,8 @@ impl MeshBcTesterApp {
                     self.execute_raw_send(items);
                 }
             }
-            Ok(_) => self.system_notice = "原始负载必须是 JSON 对象".into(),
-            Err(err) => self.system_notice = err.to_string(),
+            Ok(_) => self.set_warning_notice("原始负载必须是 JSON 对象"),
+            Err(err) => self.set_error_notice(err.to_string()),
         }
     }
 
@@ -4104,7 +4191,7 @@ impl MeshBcTesterApp {
         let mut checked = selected;
         let mut edit_requested = false;
         let mut delete_requested = false;
-        let response = Self::tree_row(
+        let row_response = Self::tree_row(
             ui,
             ("device", device.local_id),
             selected,
@@ -4179,7 +4266,7 @@ impl MeshBcTesterApp {
                 );
             },
         );
-        response.context_menu(|ui| {
+        row_response.response.context_menu(|ui| {
             if ui.button("编辑").clicked() {
                 edit_requested = true;
                 ui.close();
@@ -4199,7 +4286,10 @@ impl MeshBcTesterApp {
         }
         if delete_requested {
             self.delete_device(device.local_id);
-        } else if edit_requested || response.double_clicked() {
+        } else if edit_requested
+            || row_response.response.double_clicked()
+            || (row_response.secondary_clicked && !row_response.response.context_menu_opened())
+        {
             self.open_device_editor(device);
         }
     }
@@ -4450,7 +4540,7 @@ impl MeshBcTesterApp {
         action_slot_width: f32,
         content_click_inset: f32,
         add_content: impl FnOnce(&mut egui::Ui, bool),
-    ) -> egui::Response {
+    ) -> TreeRowResponse {
         let desired = egui::vec2(ui.available_width(), height);
         let (rect, row_response) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let inner_rect = rect.shrink2(egui::vec2(6.0, 0.0));
@@ -4472,6 +4562,7 @@ impl MeshBcTesterApp {
             ui.id().with(("tree-row-content", id_salt)),
             egui::Sense::click(),
         );
+        let secondary_clicked = Self::secondary_clicked_in_rect(ui, non_action_rect);
         let content_hovered = ui.rect_contains_pointer(non_action_rect);
         let row_hovered = row_response.hovered() || ui.rect_contains_pointer(rect);
         let fill = if selected {
@@ -4514,7 +4605,20 @@ impl MeshBcTesterApp {
                 add_content(ui, row_hovered);
             },
         );
-        content_response
+        TreeRowResponse {
+            response: content_response,
+            secondary_clicked,
+        }
+    }
+
+    fn secondary_clicked_in_rect(ui: &egui::Ui, rect: egui::Rect) -> bool {
+        ui.ctx().input(|input| {
+            input.pointer.secondary_clicked()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|pos| rect.contains(pos))
+        })
     }
 
     fn selected_tree_row_fill(ui: &egui::Ui, hovered: bool) -> egui::Color32 {
@@ -5280,6 +5384,12 @@ impl MeshBcTesterApp {
             style.spacing.scroll.bar_width = 6.0;
             style.spacing.scroll.bar_inner_margin = 2.0;
             style.spacing.scroll.bar_outer_margin = 2.0;
+            #[cfg(debug_assertions)]
+            {
+                // The live log tail intentionally reuses screen slots for newer rows.
+                // Keep real duplicate-id warnings, but suppress this debug-only false positive.
+                style.debug.warn_if_rect_changes_id = false;
+            }
 
             style.text_styles.insert(
                 egui::TextStyle::Heading,
@@ -5563,23 +5673,31 @@ impl MeshBcTesterApp {
         );
     }
 
-    fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, tone: ChipTone) {
-        let (fill, border, text) = match (tone, ui.visuals().dark_mode) {
-            (ChipTone::Warning, dark_mode) => warning_colors(dark_mode),
-        };
-
+    fn notice_chip(ui: &mut egui::Ui, width: f32, tone: ChipTone, value: &str) -> bool {
+        let (fill, border, text) = notice_colors(tone, ui.visuals().dark_mode);
+        let mut clear_requested = false;
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::symmetric(5, 1))
             .fill(fill)
             .stroke(stroke(border))
             .show(ui, |ui| {
+                ui.set_width(width);
                 ui.set_min_height(COMPACT_CONTROL_HEIGHT);
                 ui.horizontal(|ui| {
-                    ui.small(RichText::new(label).color(ui.visuals().weak_text_color()));
+                    ui.small(RichText::new(tone.label()).strong().color(text));
                     ui.separator();
-                    ui.label(RichText::new(value).strong().color(text));
+                    let text_width = (ui.available_width() - 24.0).max(64.0);
+                    ui.add_sized(
+                        [text_width, COMPACT_LABEL_HEIGHT],
+                        egui::Label::new(RichText::new(value).strong().color(text)).truncate(),
+                    )
+                    .on_hover_text(value);
+                    if ui.small_button("×").on_hover_text("关闭提示").clicked() {
+                        clear_requested = true;
+                    }
                 });
             });
+        clear_requested
     }
 
     fn paint_tech_background(ui: &egui::Ui) {
@@ -6021,6 +6139,78 @@ mod tests {
         assert_eq!(voice.ack_timeout_secs, 9);
         assert_eq!(voice.bc_ota_start_ack_timeout_secs, 45);
         assert_eq!(voice.max_retries, 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn visual_style_suppresses_log_tail_rect_id_debug_overlay() {
+        let ctx = egui::Context::default();
+
+        MeshBcTesterApp::apply_visual_style(&ctx, UiThemeMode::Dark);
+
+        assert!(!ctx.global_style().debug.warn_if_rect_changes_id);
+    }
+
+    fn raw_secondary_click(pos: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn secondary_clicked_in_rect_tracks_whole_row_hit_area() {
+        let ctx = egui::Context::default();
+        let hit_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(80.0, 48.0));
+        let mut clicked_inside = false;
+        let _ = ctx.run_ui(raw_secondary_click(egui::pos2(12.0, 16.0)), |ui| {
+            clicked_inside = MeshBcTesterApp::secondary_clicked_in_rect(ui, hit_rect);
+        });
+
+        let mut clicked_outside = true;
+        let _ = ctx.run_ui(raw_secondary_click(egui::pos2(120.0, 16.0)), |ui| {
+            clicked_outside = MeshBcTesterApp::secondary_clicked_in_rect(ui, hit_rect);
+        });
+
+        assert!(clicked_inside);
+        assert!(!clicked_outside);
+    }
+
+    #[test]
+    fn ota_transfer_result_updates_top_notice() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![DeviceProfile {
+            local_id: 1,
+            name: "BC灯".into(),
+            device_id: "34B7DA848802".into(),
+            up_topic: "/application/AP-C-BM/device/34B7DA848802/up".into(),
+            down_topic: "/application/AP-C-BM/device/34B7DA848802/down".into(),
+            mesh_dev_type: 1,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }];
+
+        app.set_transfer_notice(1, "成功", "BC OTA升级成功");
+        assert_eq!(app.system_notice_tone, ChipTone::Success);
+        assert_eq!(app.system_notice, "BC灯: BC OTA升级成功");
+
+        app.set_transfer_notice(1, "失败", "BC OTA升级失败");
+        assert_eq!(app.system_notice_tone, ChipTone::Error);
+        assert_eq!(app.system_notice, "BC灯: BC OTA升级失败");
     }
 
     fn log_entry(device_id: &str, opcode: &str, summary: &str) -> LogEntry {
