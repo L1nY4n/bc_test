@@ -191,6 +191,8 @@ enum PendingFileDialogKind {
 const TRANSFER_PACKET_DELAY_MS: u64 = 15;
 const TRANSFER_ACK_TIMEOUT_SECS: u64 = 10;
 const BC_OTA_START_ACK_TIMEOUT_SECS: u64 = 20;
+const BC_OTA_FIRMWARE_PREFIX: &str = "AP_C_BM";
+const A_OTA_FIRMWARE_PREFIX: &str = "AP_A_BM";
 const TRANSFER_MAX_RETRIES: u8 = 2;
 const MAX_TRANSFER_BYTES: usize = 10 * 1024 * 1024;
 const DEVICE_OFFLINE_TIMEOUT_SECS: u64 = 120;
@@ -1695,6 +1697,10 @@ impl MeshBcTesterApp {
             self.set_warning_notice("请先选择传输文件。");
             return;
         }
+        if let Err(err) = validate_ota_firmware_file_name(kind, &file_path) {
+            self.set_error_notice(err);
+            return;
+        }
         let path = PathBuf::from(&file_path);
         let Ok(bytes) = fs::read(&path) else {
             self.set_error_notice("读取传输文件失败。");
@@ -2568,6 +2574,12 @@ impl MeshBcTesterApp {
             Ok(Some(path)) => match pending.kind {
                 PendingFileDialogKind::OtaTransferFile => {
                     self.ota_transfer_file = path.display().to_string();
+                    if let Err(err) = validate_ota_firmware_file_name(
+                        self.ota_transfer_kind,
+                        &self.ota_transfer_file,
+                    ) {
+                        self.set_error_notice(err);
+                    }
                 }
                 PendingFileDialogKind::VoiceTransferFile => {
                     self.voice_transfer_file = path.display().to_string();
@@ -3393,6 +3405,55 @@ fn transfer_display_progress(transfer: &ActiveTransfer) -> String {
     )
 }
 
+fn expected_ota_firmware_prefix(kind: TransferKind) -> Option<&'static str> {
+    match kind {
+        TransferKind::BcOta => Some(BC_OTA_FIRMWARE_PREFIX),
+        TransferKind::AOta => Some(A_OTA_FIRMWARE_PREFIX),
+        TransferKind::VoiceFile | TransferKind::RealtimeVoice => None,
+    }
+}
+
+fn ota_firmware_prefix_label(prefix: &str) -> &'static str {
+    match prefix {
+        BC_OTA_FIRMWARE_PREFIX => "C灯",
+        A_OTA_FIRMWARE_PREFIX => "A灯",
+        _ => "未知类型",
+    }
+}
+
+fn validate_ota_firmware_file_name(kind: TransferKind, file_path: &str) -> Result<(), String> {
+    let Some(expected_prefix) = expected_ota_firmware_prefix(kind) else {
+        return Ok(());
+    };
+    let trimmed_path = file_path.trim();
+    if trimmed_path.is_empty() {
+        return Ok(());
+    }
+    let file_name = Path::new(trimmed_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed_path);
+    if file_name.starts_with(expected_prefix) {
+        return Ok(());
+    }
+    if let Some(actual_prefix) = [BC_OTA_FIRMWARE_PREFIX, A_OTA_FIRMWARE_PREFIX]
+        .into_iter()
+        .find(|prefix| file_name.starts_with(prefix))
+    {
+        return Err(format!(
+            "当前升级类型为{}，但固件文件名以{}开头（{}）。请切换升级类型或选择以{}开头的固件，避免烧录错误固件导致设备变砖。",
+            kind.label(),
+            actual_prefix,
+            ota_firmware_prefix_label(actual_prefix),
+            expected_prefix
+        ));
+    }
+    Err(format!(
+        "OTA固件文件名必须以{}（C灯）或{}（A灯）开头，当前文件：{}。已禁止发起升级，避免烧录错误固件导致设备变砖。",
+        BC_OTA_FIRMWARE_PREFIX, A_OTA_FIRMWARE_PREFIX, file_name
+    ))
+}
+
 fn transfer_snapshot_display_progress(transfer: &TransferSnapshot) -> String {
     let total =
         transfer_display_total_packets(transfer.kind, transfer.format, transfer.packet_count);
@@ -3980,6 +4041,16 @@ impl MeshBcTesterApp {
                 if Self::secondary_button(ui, "浏览").clicked() {
                     self.pick_ota_transfer_file();
                 }
+                if let Err(err) =
+                    validate_ota_firmware_file_name(self.ota_transfer_kind, &self.ota_transfer_file)
+                {
+                    ui.small(
+                        RichText::new("文件名错误")
+                            .strong()
+                            .color(warning_text_color(ui)),
+                    )
+                    .on_hover_text(err);
+                }
             });
             Self::action_field_row(ui, "参数", |ui| {
                 let version_label = match self.ota_transfer_format {
@@ -4073,7 +4144,20 @@ impl MeshBcTesterApp {
                     OtaTransferFormat::Json => "发起 JSON 升级",
                     OtaTransferFormat::Bytes => "发起 Bytes 升级",
                 };
-                if Self::primary_button(ui, button_label).clicked() {
+                let file_name_error = validate_ota_firmware_file_name(
+                    self.ota_transfer_kind,
+                    &self.ota_transfer_file,
+                )
+                .err();
+                let start_clicked = if let Some(err) = file_name_error {
+                    ui.add_enabled_ui(false, |ui| Self::primary_button(ui, button_label))
+                        .inner
+                        .on_hover_text(err)
+                        .clicked()
+                } else {
+                    Self::primary_button(ui, button_label).clicked()
+                };
+                if start_clicked {
                     self.start_transfer(
                         self.ota_transfer_kind,
                         self.ota_transfer_file.clone(),
@@ -6190,6 +6274,42 @@ mod tests {
         assert_eq!(voice.max_retries, 1);
     }
 
+    #[test]
+    fn ota_firmware_file_name_must_match_upgrade_kind() {
+        assert!(
+            validate_ota_firmware_file_name(TransferKind::BcOta, "/tmp/AP_C_BM_v1.bin").is_ok()
+        );
+        assert!(validate_ota_firmware_file_name(TransferKind::AOta, "/tmp/AP_A_BM_v1.bin").is_ok());
+        assert!(validate_ota_firmware_file_name(TransferKind::VoiceFile, "/tmp/voice.bin").is_ok());
+
+        let wrong_kind =
+            validate_ota_firmware_file_name(TransferKind::BcOta, "/tmp/AP_A_BM_v1.bin")
+                .unwrap_err();
+        assert!(wrong_kind.contains("当前升级类型为BC灯 OTA"));
+        assert!(wrong_kind.contains("AP_C_BM"));
+
+        let missing_prefix =
+            validate_ota_firmware_file_name(TransferKind::AOta, "/tmp/firmware.bin").unwrap_err();
+        assert!(missing_prefix.contains("AP_C_BM"));
+        assert!(missing_prefix.contains("AP_A_BM"));
+    }
+
+    #[test]
+    fn start_transfer_blocks_invalid_ota_firmware_file_name_before_reading_file() {
+        let mut app = MeshBcTesterApp::new_for_test();
+
+        app.start_transfer(
+            TransferKind::BcOta,
+            "/tmp/firmware.bin".into(),
+            1,
+            String::new(),
+        );
+
+        assert_eq!(app.system_notice_tone, ChipTone::Error);
+        assert!(app.system_notice.contains("OTA固件文件名必须以"));
+        assert!(app.pending_confirmation.is_none());
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn visual_style_suppresses_log_tail_rect_id_debug_overlay() {
@@ -7153,12 +7273,31 @@ mod tests {
             kind: PendingFileDialogKind::OtaTransferFile,
             rx,
         });
-        tx.send(Some(PathBuf::from("/tmp/firmware.bin"))).unwrap();
+        tx.send(Some(PathBuf::from("/tmp/AP_C_BM_firmware.bin")))
+            .unwrap();
 
         app.poll_pending_file_dialog();
 
-        assert_eq!(app.ota_transfer_file, "/tmp/firmware.bin");
+        assert_eq!(app.ota_transfer_file, "/tmp/AP_C_BM_firmware.bin");
         assert!(app.pending_file_dialog.is_none());
+    }
+
+    #[test]
+    fn pending_ota_file_dialog_warns_on_invalid_firmware_name() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.pending_file_dialog = Some(PendingFileDialog {
+            kind: PendingFileDialogKind::OtaTransferFile,
+            rx,
+        });
+        tx.send(Some(PathBuf::from("/tmp/AP_A_BM_firmware.bin")))
+            .unwrap();
+
+        app.poll_pending_file_dialog();
+
+        assert_eq!(app.ota_transfer_file, "/tmp/AP_A_BM_firmware.bin");
+        assert_eq!(app.system_notice_tone, ChipTone::Error);
+        assert!(app.system_notice.contains("当前升级类型为BC灯 OTA"));
     }
 
     #[test]
