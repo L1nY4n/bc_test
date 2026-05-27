@@ -410,6 +410,8 @@ pub struct AppConfig {
     pub bytes_ota_chunk_size: usize,
     #[serde(default)]
     pub bytes_ota_app_crc_override: String,
+    #[serde(default = "default_bytes_a_ota_app_version")]
+    pub bytes_a_ota_app_version: String,
     pub transfer_max_retries: u8,
     #[serde(default)]
     pub voice_transfer_packet_delay_ms: u64,
@@ -432,6 +434,7 @@ impl Default for AppConfig {
             bc_ota_start_ack_timeout_secs: 20,
             bytes_ota_chunk_size: default_bytes_ota_chunk_size(),
             bytes_ota_app_crc_override: String::new(),
+            bytes_a_ota_app_version: default_bytes_a_ota_app_version(),
             transfer_max_retries: 2,
             voice_transfer_packet_delay_ms: 15,
             voice_transfer_ack_timeout_secs: 10,
@@ -443,6 +446,10 @@ impl Default for AppConfig {
 
 fn default_bytes_ota_chunk_size() -> usize {
     1024
+}
+
+fn default_bytes_a_ota_app_version() -> String {
+    "0000".into()
 }
 
 impl AppConfig {

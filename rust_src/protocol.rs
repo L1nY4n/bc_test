@@ -1460,14 +1460,30 @@ pub struct DecodedBytesTransferFrame {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TransferFormatOptions {
+    pub bytes_chunk_size: usize,
+    pub bytes_app_crc_override: Option<u16>,
+    pub bytes_a_app_version: Option<u16>,
+}
+
+impl Default for TransferFormatOptions {
+    fn default() -> Self {
+        Self {
+            bytes_chunk_size: DEFAULT_BYTES_OTA_CHUNK_SIZE,
+            bytes_app_crc_override: None,
+            bytes_a_app_version: None,
+        }
+    }
+}
+
 pub fn build_transfer_packets_for_format(
     kind: TransferKind,
     format: OtaTransferFormat,
     data: &[u8],
     version: u8,
     voice_name: &str,
-    bytes_chunk_size: usize,
-    bytes_app_crc_override: Option<u16>,
+    options: TransferFormatOptions,
 ) -> Result<Vec<TransferPacket>, String> {
     match format {
         OtaTransferFormat::Json => build_transfer_packets(kind, data, version, voice_name)
@@ -1476,8 +1492,9 @@ pub fn build_transfer_packets_for_format(
             kind,
             data,
             version,
-            bytes_chunk_size,
-            bytes_app_crc_override,
+            options.bytes_chunk_size,
+            options.bytes_app_crc_override,
+            options.bytes_a_app_version,
         ),
     }
 }
@@ -1488,8 +1505,7 @@ pub fn transfer_preview_for_format(
     data: &[u8],
     version: u8,
     voice_name: &str,
-    bytes_chunk_size: usize,
-    bytes_app_crc_override: Option<u16>,
+    options: TransferFormatOptions,
 ) -> Value {
     match format {
         OtaTransferFormat::Json => transfer_preview(kind, data, version, voice_name),
@@ -1497,8 +1513,9 @@ pub fn transfer_preview_for_format(
             kind,
             data,
             version,
-            bytes_chunk_size,
-            bytes_app_crc_override,
+            options.bytes_chunk_size,
+            options.bytes_app_crc_override,
+            options.bytes_a_app_version,
         ),
     }
 }
@@ -1509,6 +1526,7 @@ pub fn build_bytes_ota_transfer_packets(
     protocol_version: u8,
     chunk_size: usize,
     app_crc_override: Option<u16>,
+    a_app_version: Option<u16>,
 ) -> Result<Vec<TransferPacket>, String> {
     if data.is_empty() {
         return Err("传输数据不能为空".into());
@@ -1548,13 +1566,16 @@ pub fn build_bytes_ota_transfer_packets(
         }));
     }
 
-    let mut end_body = Vec::with_capacity(6);
+    let mut end_body = Vec::with_capacity(if kind == TransferKind::AOta { 8 } else { 6 });
     end_body.extend_from_slice(&(padded_data.len() as u32).to_be_bytes());
     end_body.extend_from_slice(
         &app_crc_override
             .unwrap_or_else(|| bytes_ota_app_checksum(&padded_data))
             .to_be_bytes(),
     );
+    if kind == TransferKind::AOta {
+        end_body.extend_from_slice(&a_app_version.unwrap_or_default().to_be_bytes());
+    }
     packets.push(TransferPacket::bytes_frame(BytesTransferFrame {
         command: end_opcode,
         message_id: base_message_id.wrapping_add(chunk_total as u64 + 1),
@@ -1570,6 +1591,7 @@ pub fn bytes_ota_transfer_preview(
     protocol_version: u8,
     chunk_size: usize,
     app_crc_override: Option<u16>,
+    a_app_version: Option<u16>,
 ) -> Value {
     let chunk_size = if validate_bytes_ota_chunk_size(chunk_size).is_ok() {
         chunk_size
@@ -1594,6 +1616,7 @@ pub fn bytes_ota_transfer_preview(
         "check_sum": check_sum,
         "computed_check_sum": computed_check_sum,
         "check_sum_override": app_crc_override,
+        "a_app_version": if kind == TransferKind::AOta { a_app_version } else { None },
     })
 }
 
@@ -1604,6 +1627,19 @@ pub fn parse_bytes_ota_app_crc_override(value: &str) -> Result<Option<u16>, Stri
     }
     if value.len() != 4 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err("Bytes OTA APP CRC覆盖值必须是2字节CRC十六进制值，例如2DF3。".into());
+    }
+    u16::from_str_radix(value, 16)
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+pub fn parse_bytes_a_ota_app_version(value: &str) -> Result<Option<u16>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() != 4 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("A灯 Bytes OTA 版本必须是2字节十六进制值，例如0102。".into());
     }
     u16::from_str_radix(value, 16)
         .map(Some)
@@ -2107,8 +2143,7 @@ mod tests {
             &data,
             1,
             "",
-            DEFAULT_BYTES_OTA_CHUNK_SIZE,
-            None,
+            TransferFormatOptions::default(),
         )
         .unwrap();
         assert_eq!(packets.len(), 4);
@@ -2139,6 +2174,7 @@ mod tests {
 
         let end = render_transfer_packet_payload(&packets[3], "34B7DA848802").unwrap();
         assert_eq!(end[17], 0xC4);
+        assert_eq!(u16::from_be_bytes([end[2], end[3]]), 32);
         assert_eq!(
             u32::from_be_bytes([end[26], end[27], end[28], end[29]]),
             (DEFAULT_BYTES_OTA_CHUNK_SIZE * 2) as u32
@@ -2159,8 +2195,10 @@ mod tests {
             b"abc",
             1,
             "",
-            DEFAULT_BYTES_OTA_CHUNK_SIZE,
-            None,
+            TransferFormatOptions {
+                bytes_a_app_version: Some(0x0102),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2170,6 +2208,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0xC6, 0xC8, 0xCA]
         );
+        let end = render_transfer_packet_payload(&packets[2], "34B7DA848802").unwrap();
+        assert_eq!(end[17], 0xCA);
+        assert_eq!(u16::from_be_bytes([end[2], end[3]]), 34);
+        assert_eq!(u16::from_be_bytes([end[32], end[33]]), 0x0102);
     }
 
     #[test]
@@ -2180,8 +2222,10 @@ mod tests {
             b"abc",
             1,
             "",
-            DEFAULT_BYTES_OTA_CHUNK_SIZE,
-            Some(0x2DF3),
+            TransferFormatOptions {
+                bytes_app_crc_override: Some(0x2DF3),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2199,6 +2243,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_bytes_a_ota_app_version_requires_four_hex_digits() {
+        assert_eq!(parse_bytes_a_ota_app_version(""), Ok(None));
+        assert_eq!(parse_bytes_a_ota_app_version("0102"), Ok(Some(0x0102)));
+        assert!(parse_bytes_a_ota_app_version("102").is_err());
+        assert!(parse_bytes_a_ota_app_version("01XZ").is_err());
+    }
+
+    #[test]
     fn build_bytes_ota_honors_custom_chunk_size() {
         let data = vec![0xA5; 513];
         let packets = build_transfer_packets_for_format(
@@ -2207,8 +2259,10 @@ mod tests {
             &data,
             1,
             "",
-            256,
-            None,
+            TransferFormatOptions {
+                bytes_chunk_size: 256,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(packets.len(), 5);
@@ -2233,8 +2287,10 @@ mod tests {
             &data,
             1,
             "",
-            512,
-            None,
+            TransferFormatOptions {
+                bytes_chunk_size: 512,
+                ..Default::default()
+            },
         )
         .unwrap();
 

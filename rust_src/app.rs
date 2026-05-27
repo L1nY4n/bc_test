@@ -20,12 +20,13 @@ use crate::models::{
 use crate::mqtt::{MqttEvent, MqttRuntime};
 use crate::protocol::{
     BYTES_OTA_QUICK_CHUNK_SIZES, COMMANDS, DEFAULT_BYTES_OTA_CHUNK_SIZE, FieldKind,
-    build_bytes_control_packet, build_command_payload, build_transfer_packets_for_format,
-    bytes_to_hex, classify_execution_result, command_by_key, current_time_stamp,
-    decode_bytes_transfer_ack_payload, decode_bytes_transfer_frame, decode_payload_details,
-    expected_response_opcode, hex_to_bytes, parse_bytes_ota_app_crc_override, parse_opcode,
-    redact_json, render_transfer_packet_payload, response_can_omit_timestamp, summarize_payload,
-    transfer_preview_for_format, validate_bytes_ota_chunk_size,
+    TransferFormatOptions, build_bytes_control_packet, build_command_payload,
+    build_transfer_packets_for_format, bytes_to_hex, classify_execution_result, command_by_key,
+    current_time_stamp, decode_bytes_transfer_ack_payload, decode_bytes_transfer_frame,
+    decode_payload_details, expected_response_opcode, hex_to_bytes, parse_bytes_a_ota_app_version,
+    parse_bytes_ota_app_crc_override, parse_opcode, redact_json, render_transfer_packet_payload,
+    response_can_omit_timestamp, summarize_payload, transfer_preview_for_format,
+    validate_bytes_ota_chunk_size,
 };
 use crate::store::{load_config, save_config};
 use crate::transfer_engine::{
@@ -71,6 +72,7 @@ pub struct MeshBcTesterApp {
     bc_ota_start_ack_timeout_secs: u64,
     bytes_ota_chunk_size: usize,
     bytes_ota_app_crc_override: String,
+    bytes_a_ota_app_version: String,
     transfer_max_retries: u8,
     voice_transfer_packet_delay_ms: u64,
     voice_transfer_ack_timeout_secs: u64,
@@ -259,6 +261,7 @@ impl MeshBcTesterApp {
             };
         let bytes_ota_app_crc_override =
             normalize_crc_override_text(&config.bytes_ota_app_crc_override);
+        let bytes_a_ota_app_version = normalize_hex_2byte_text(&config.bytes_a_ota_app_version);
         let transfer_max_retries = if config.transfer_max_retries == 0 {
             TRANSFER_MAX_RETRIES
         } else {
@@ -335,6 +338,7 @@ impl MeshBcTesterApp {
             bc_ota_start_ack_timeout_secs,
             bytes_ota_chunk_size,
             bytes_ota_app_crc_override,
+            bytes_a_ota_app_version,
             transfer_max_retries,
             voice_transfer_packet_delay_ms,
             voice_transfer_ack_timeout_secs,
@@ -826,6 +830,7 @@ impl MeshBcTesterApp {
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
         self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
+        self.config.bytes_a_ota_app_version = self.bytes_a_ota_app_version.clone();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -1732,14 +1737,34 @@ impl MeshBcTesterApp {
         } else {
             None
         };
+        let bytes_a_app_version =
+            if transfer_format == OtaTransferFormat::Bytes && kind == TransferKind::AOta {
+                match parse_bytes_a_ota_app_version(&self.bytes_a_ota_app_version) {
+                    Ok(Some(version)) => Some(version),
+                    Ok(None) => {
+                        self.set_error_notice("A灯 Bytes OTA 版本不能为空。");
+                        return;
+                    }
+                    Err(err) => {
+                        self.set_error_notice(err);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+        let transfer_options = TransferFormatOptions {
+            bytes_chunk_size,
+            bytes_app_crc_override,
+            bytes_a_app_version,
+        };
         let preview = transfer_preview_for_format(
             kind,
             transfer_format,
             &bytes,
             version,
             &voice_name,
-            bytes_chunk_size,
-            bytes_app_crc_override,
+            transfer_options,
         );
         let packets = match build_transfer_packets_for_format(
             kind,
@@ -1747,8 +1772,7 @@ impl MeshBcTesterApp {
             &bytes,
             version,
             &voice_name,
-            bytes_chunk_size,
-            bytes_app_crc_override,
+            transfer_options,
         ) {
             Ok(packets) => packets,
             Err(err) => {
@@ -2743,6 +2767,7 @@ impl MeshBcTesterApp {
                     "bc_ota_start_ack_timeout_secs": self.bc_ota_start_ack_timeout_secs,
                     "bytes_ota_chunk_size": self.bytes_ota_chunk_size,
                     "bytes_ota_app_crc_override": self.bytes_ota_app_crc_override,
+                    "bytes_a_ota_app_version": self.bytes_a_ota_app_version,
                     "max_retries": self.transfer_max_retries,
                     },
                     "voice": {
@@ -2824,6 +2849,7 @@ impl MeshBcTesterApp {
             bc_ota_start_ack_timeout_secs: BC_OTA_START_ACK_TIMEOUT_SECS,
             bytes_ota_chunk_size: DEFAULT_BYTES_OTA_CHUNK_SIZE,
             bytes_ota_app_crc_override: String::new(),
+            bytes_a_ota_app_version: "0000".into(),
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             voice_transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
             voice_transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
@@ -2960,6 +2986,7 @@ impl eframe::App for MeshBcTesterApp {
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
         self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
+        self.config.bytes_a_ota_app_version = self.bytes_a_ota_app_version.clone();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -3447,6 +3474,10 @@ fn warning_text_color(ui: &egui::Ui) -> egui::Color32 {
 }
 
 fn normalize_crc_override_text(value: &str) -> String {
+    normalize_hex_2byte_text(value)
+}
+
+fn normalize_hex_2byte_text(value: &str) -> String {
     let trimmed = value.trim();
     let trimmed = trimmed
         .strip_prefix("0x")
@@ -3462,6 +3493,13 @@ fn normalize_crc_override_text(value: &str) -> String {
 
 fn normalize_crc_override_text_in_place(value: &mut String) {
     let normalized = normalize_crc_override_text(value);
+    if *value != normalized {
+        *value = normalized;
+    }
+}
+
+fn normalize_hex_2byte_text_in_place(value: &mut String) {
+    let normalized = normalize_hex_2byte_text(value);
     if *value != normalized {
         *value = normalized;
     }
@@ -3988,6 +4026,17 @@ impl MeshBcTesterApp {
                         ui.small(RichText::new("覆盖").strong().color(warning_text_color(ui)));
                     }
                 });
+                if self.ota_transfer_kind == TransferKind::AOta {
+                    Self::action_field_row(ui, "A版本", |ui| {
+                        let response =
+                            Self::compact_text_edit(ui, 82.0, &mut self.bytes_a_ota_app_version);
+                        if response.changed() {
+                            normalize_hex_2byte_text_in_place(&mut self.bytes_a_ota_app_version);
+                        }
+                        response
+                            .on_hover_text("A灯 Bytes OTA 最后一帧追加的2字节版本字段，例如0102。");
+                    });
+                }
                 Self::action_button_row(ui, |ui| {
                     if Self::secondary_button(ui, "取消升级").clicked() {
                         self.queue_bytes_ota_cancel_command();

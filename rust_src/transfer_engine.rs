@@ -1281,7 +1281,9 @@ pub(crate) fn apply_transfer_retry_state(
 mod tests {
     use super::*;
     use crate::models::{BytesTransferFrame, OtaTransferFormat};
-    use crate::protocol::{build_transfer_packets_for_format, render_bytes_transfer_frame};
+    use crate::protocol::{
+        TransferFormatOptions, build_transfer_packets_for_format, render_bytes_transfer_frame,
+    };
 
     fn worker_with_events() -> (TransferEngineWorker, Receiver<TransferEngineEvent>) {
         let (_command_tx, command_rx) = mpsc::channel();
@@ -1562,8 +1564,7 @@ mod tests {
             b"abc",
             1,
             "",
-            1024,
-            None,
+            TransferFormatOptions::default(),
         )
         .unwrap();
         let first_message_id = packets[0].message_id().unwrap();
@@ -1609,8 +1610,7 @@ mod tests {
             &[1, 2, 3],
             1,
             "",
-            1024,
-            None,
+            TransferFormatOptions::default(),
         )
         .unwrap();
         let data_message_id = packets[1].message_id().unwrap();
