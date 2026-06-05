@@ -41,6 +41,10 @@ pub struct MeshBcTesterApp {
     device_editor: DeviceEditor,
     device_editor_open: bool,
     selected_devices: BTreeSet<u64>,
+    device_filter_a_light: bool,
+    device_filter_bc_light: bool,
+    device_filter_other: bool,
+    device_version_filter: String,
     auto_discovery_enabled: bool,
     auto_import_discovered: bool,
     discovered_devices: Vec<DiscoveredDevice>,
@@ -304,6 +308,10 @@ impl MeshBcTesterApp {
             device_editor: Self::blank_device_editor(),
             device_editor_open: false,
             selected_devices: BTreeSet::new(),
+            device_filter_a_light: true,
+            device_filter_bc_light: true,
+            device_filter_other: true,
+            device_version_filter: String::new(),
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
@@ -2830,6 +2838,10 @@ impl MeshBcTesterApp {
             device_editor: Self::blank_device_editor(),
             device_editor_open: false,
             selected_devices: BTreeSet::new(),
+            device_filter_a_light: true,
+            device_filter_bc_light: true,
+            device_filter_other: true,
+            device_version_filter: String::new(),
             auto_discovery_enabled: true,
             auto_import_discovered: false,
             discovered_devices: Vec::new(),
@@ -3454,6 +3466,58 @@ fn validate_ota_firmware_file_name(kind: TransferKind, file_path: &str) -> Resul
     ))
 }
 
+fn device_type_label(mesh_dev_type: u8) -> &'static str {
+    match mesh_dev_type {
+        0 => "A灯",
+        1 => "BC/C灯",
+        _ => "其他",
+    }
+}
+
+fn display_device_version(version: &str) -> &str {
+    let version = version.trim();
+    if version.is_empty() { "-" } else { version }
+}
+
+fn device_version_matches_filter(version: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    let filter = filter.to_lowercase();
+    device_version_search_tokens(version)
+        .into_iter()
+        .any(|token| token.contains(&filter))
+}
+
+fn device_version_search_tokens(version: &str) -> Vec<String> {
+    let version = version.trim();
+    let mut tokens = Vec::new();
+    if !version.is_empty() {
+        tokens.push(version.to_lowercase());
+    }
+    if let Some(value) = parse_device_version_number(version) {
+        tokens.push(value.to_string());
+        tokens.push(format!("0x{value:X}").to_lowercase());
+        tokens.push(format!("0x{value:02X}").to_lowercase());
+    }
+    tokens
+}
+
+fn parse_device_version_number(version: &str) -> Option<u64> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse::<u64>().ok()
+}
+
 fn transfer_snapshot_display_progress(transfer: &TransferSnapshot) -> String {
     let total =
         transfer_display_total_packets(transfer.kind, transfer.format, transfer.packet_count);
@@ -3689,6 +3753,35 @@ impl MeshBcTesterApp {
             .values()
             .filter(|state| state.online)
             .count()
+    }
+
+    fn device_type_filter_enabled(&self, mesh_dev_type: u8) -> bool {
+        match mesh_dev_type {
+            0 => self.device_filter_a_light,
+            1 => self.device_filter_bc_light,
+            _ => self.device_filter_other,
+        }
+    }
+
+    fn device_matches_filter(&self, device: &DeviceProfile, state: &DeviceRuntimeState) -> bool {
+        self.device_type_filter_enabled(device.mesh_dev_type)
+            && device_version_matches_filter(&state.last_version, &self.device_version_filter)
+    }
+
+    fn filtered_device_rows(&self) -> Vec<(DeviceProfile, DeviceRuntimeState)> {
+        self.config
+            .devices
+            .iter()
+            .filter_map(|device| {
+                let state = self
+                    .runtime_states
+                    .get(&device.local_id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.device_matches_filter(device, &state)
+                    .then_some((device.clone(), state))
+            })
+            .collect()
     }
 
     fn render_top_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -4293,18 +4386,29 @@ impl MeshBcTesterApp {
                 return;
             }
 
-            let devices = self.config.devices.clone();
+            self.render_device_filter_bar(ui);
+            let devices = self.filtered_device_rows();
+            let filtered_count = devices.len();
+            if filtered_count != self.config.devices.len() {
+                ui.small(
+                    RichText::new(format!(
+                        "显示 {filtered_count}/{}",
+                        self.config.devices.len()
+                    ))
+                    .color(ui.visuals().weak_text_color()),
+                );
+            }
+            if devices.is_empty() {
+                ui.label(RichText::new("没有匹配设备。").color(ui.visuals().weak_text_color()));
+                return;
+            }
+
             egui::ScrollArea::vertical()
                 .id_salt("configured-device-tree-scroll")
                 .max_height(280.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for device in devices {
-                        let state = self
-                            .runtime_states
-                            .get(&device.local_id)
-                            .cloned()
-                            .unwrap_or_default();
+                    for (device, state) in devices {
                         self.render_device_tree_row(ui, &device, &state);
                     }
                 });
@@ -4312,6 +4416,25 @@ impl MeshBcTesterApp {
         if add_requested {
             self.open_new_device_editor();
         }
+    }
+
+    fn render_device_filter_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(RichText::new("类型").color(ui.visuals().weak_text_color()));
+            ui.checkbox(&mut self.device_filter_a_light, "A灯");
+            ui.checkbox(&mut self.device_filter_bc_light, "BC/C灯");
+            ui.checkbox(&mut self.device_filter_other, "其他");
+        });
+        ui.horizontal(|ui| {
+            ui.small(RichText::new("版本").color(ui.visuals().weak_text_color()));
+            ui.add_sized(
+                [
+                    ui.available_width().clamp(80.0, 180.0),
+                    COMPACT_CONTROL_HEIGHT,
+                ],
+                TextEdit::singleline(&mut self.device_version_filter).hint_text("搜索版本"),
+            );
+        });
     }
 
     fn render_device_tree_row(
@@ -4360,8 +4483,10 @@ impl MeshBcTesterApp {
                             format!(" · {}ms", state.last_rtt_ms)
                         };
                         let meta = format!(
-                            "{} · RX {} TX {} 待{}{}",
+                            "{} · {} · V {} · RX {} TX {} 待{}{}",
                             Self::device_id_suffix(&device.device_id),
+                            device_type_label(device.mesh_dev_type),
+                            display_device_version(&state.last_version),
                             state.rx_count,
                             state.tx_count,
                             state.pending_count,
@@ -6310,6 +6435,55 @@ mod tests {
         assert!(app.pending_confirmation.is_none());
     }
 
+    #[test]
+    fn device_version_filter_matches_decimal_and_hex_versions() {
+        assert!(device_version_matches_filter("13", "0x0D"));
+        assert!(device_version_matches_filter("0x0D", "13"));
+        assert!(device_version_matches_filter("0x0D", "0d"));
+        assert!(!device_version_matches_filter("0x0E", "13"));
+        assert_eq!(display_device_version(""), "-");
+        assert_eq!(display_device_version(" 13 "), "13");
+    }
+
+    #[test]
+    fn device_filter_combines_type_checkboxes_and_version_text() {
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.config.devices = vec![
+            test_device_profile(1, "A灯", 0),
+            test_device_profile(2, "BC灯", 1),
+            test_device_profile(3, "其他灯", 2),
+        ];
+        app.runtime_states.insert(
+            1,
+            DeviceRuntimeState {
+                last_version: "0x0D".into(),
+                ..Default::default()
+            },
+        );
+        app.runtime_states.insert(
+            2,
+            DeviceRuntimeState {
+                last_version: "13".into(),
+                ..Default::default()
+            },
+        );
+        app.runtime_states.insert(
+            3,
+            DeviceRuntimeState {
+                last_version: "0x0E".into(),
+                ..Default::default()
+            },
+        );
+
+        app.device_filter_a_light = false;
+        app.device_filter_other = false;
+        app.device_version_filter = "0x0D".into();
+
+        let rows = app.filtered_device_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.local_id, 2);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn visual_style_suppresses_log_tail_rect_id_debug_overlay() {
@@ -6380,6 +6554,19 @@ mod tests {
         app.set_transfer_notice(1, "失败", "BC OTA升级失败");
         assert_eq!(app.system_notice_tone, ChipTone::Error);
         assert_eq!(app.system_notice, "BC灯: BC OTA升级失败");
+    }
+
+    fn test_device_profile(local_id: u64, name: &str, mesh_dev_type: u8) -> DeviceProfile {
+        DeviceProfile {
+            local_id,
+            name: name.into(),
+            device_id: format!("dev-{local_id}"),
+            up_topic: format!("/application/AP-C-BM/device/dev-{local_id}/up"),
+            down_topic: format!("/application/AP-C-BM/device/dev-{local_id}/down"),
+            mesh_dev_type,
+            default_dest_addr: 1,
+            subscribe_enabled: true,
+        }
     }
 
     fn log_entry(device_id: &str, opcode: &str, summary: &str) -> LogEntry {
