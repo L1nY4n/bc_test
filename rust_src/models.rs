@@ -449,7 +449,7 @@ fn default_bytes_ota_chunk_size() -> usize {
 }
 
 fn default_bytes_a_ota_app_version() -> String {
-    "0000".into()
+    String::new()
 }
 
 impl AppConfig {

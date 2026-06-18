@@ -267,7 +267,7 @@ impl MeshBcTesterApp {
             };
         let bytes_ota_app_crc_override =
             normalize_crc_override_text(&config.bytes_ota_app_crc_override);
-        let bytes_a_ota_app_version = normalize_hex_2byte_text(&config.bytes_a_ota_app_version);
+        let bytes_a_ota_app_version = String::new();
         let transfer_max_retries = if config.transfer_max_retries == 0 {
             TRANSFER_MAX_RETRIES
         } else {
@@ -840,7 +840,7 @@ impl MeshBcTesterApp {
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
         self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
-        self.config.bytes_a_ota_app_version = self.bytes_a_ota_app_version.clone();
+        self.config.bytes_a_ota_app_version.clear();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -1632,6 +1632,14 @@ impl MeshBcTesterApp {
         });
     }
 
+    fn apply_a_ota_app_version_from_file_name(&mut self) {
+        if self.ota_transfer_kind != TransferKind::AOta {
+            return;
+        }
+        self.bytes_a_ota_app_version =
+            extract_a_ota_app_version_from_file_name(&self.ota_transfer_file).unwrap_or_default();
+    }
+
     fn pick_voice_transfer_file(&mut self) {
         self.spawn_path_dialog(PendingFileDialogKind::VoiceTransferFile, || {
             FileDialog::new().pick_file()
@@ -1753,6 +1761,10 @@ impl MeshBcTesterApp {
         };
         let bytes_a_app_version =
             if transfer_format == OtaTransferFormat::Bytes && kind == TransferKind::AOta {
+                if self.bytes_a_ota_app_version.trim().is_empty() {
+                    self.bytes_a_ota_app_version =
+                        extract_a_ota_app_version_from_file_name(&file_path).unwrap_or_default();
+                }
                 match parse_bytes_a_ota_app_version(&self.bytes_a_ota_app_version) {
                     Ok(Some(version)) => Some(version),
                     Ok(None) => {
@@ -2582,6 +2594,7 @@ impl MeshBcTesterApp {
             Ok(Some(path)) => match pending.kind {
                 PendingFileDialogKind::OtaTransferFile => {
                     self.ota_transfer_file = path.display().to_string();
+                    self.apply_a_ota_app_version_from_file_name();
                     if let Err(err) = validate_ota_firmware_file_name(
                         self.ota_transfer_kind,
                         &self.ota_transfer_file,
@@ -2873,7 +2886,7 @@ impl MeshBcTesterApp {
             bc_ota_start_ack_timeout_secs: BC_OTA_START_ACK_TIMEOUT_SECS,
             bytes_ota_chunk_size: DEFAULT_BYTES_OTA_CHUNK_SIZE,
             bytes_ota_app_crc_override: String::new(),
-            bytes_a_ota_app_version: "0000".into(),
+            bytes_a_ota_app_version: String::new(),
             transfer_max_retries: TRANSFER_MAX_RETRIES,
             voice_transfer_packet_delay_ms: TRANSFER_PACKET_DELAY_MS,
             voice_transfer_ack_timeout_secs: TRANSFER_ACK_TIMEOUT_SECS,
@@ -3010,7 +3023,7 @@ impl eframe::App for MeshBcTesterApp {
         self.config.bc_ota_start_ack_timeout_secs = self.bc_ota_start_ack_timeout_secs;
         self.config.bytes_ota_chunk_size = self.bytes_ota_chunk_size;
         self.config.bytes_ota_app_crc_override = self.bytes_ota_app_crc_override.clone();
-        self.config.bytes_a_ota_app_version = self.bytes_a_ota_app_version.clone();
+        self.config.bytes_a_ota_app_version.clear();
         self.config.transfer_max_retries = self.transfer_max_retries;
         self.config.voice_transfer_packet_delay_ms = self.voice_transfer_packet_delay_ms;
         self.config.voice_transfer_ack_timeout_secs = self.voice_transfer_ack_timeout_secs;
@@ -3433,6 +3446,64 @@ fn ota_firmware_prefix_label(prefix: &str) -> &'static str {
     }
 }
 
+fn ota_firmware_prefix_display(prefix: &str) -> String {
+    format!("{prefix} / {}", prefix.replace('_', "-"))
+}
+
+fn ota_firmware_prefix_matches(file_name: &str, expected_prefix: &str) -> bool {
+    let normalized_file_name = file_name.replace('-', "_").to_ascii_uppercase();
+    let expected_prefix = expected_prefix.to_ascii_uppercase();
+    let mut start = 0;
+    while let Some(position) = normalized_file_name[start..].find(&expected_prefix) {
+        let position = start + position;
+        let before = normalized_file_name[..position].chars().next_back();
+        let after = normalized_file_name[position + expected_prefix.len()..]
+            .chars()
+            .next();
+        let has_left_boundary = before.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let has_right_boundary = after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if has_left_boundary && has_right_boundary {
+            return true;
+        }
+        start = position + expected_prefix.len();
+    }
+    false
+}
+
+fn extract_a_ota_app_version_from_file_name(file_path: &str) -> Option<String> {
+    let file_name = Path::new(file_path.trim()).file_name()?.to_str()?;
+    if !ota_firmware_prefix_matches(file_name, A_OTA_FIRMWARE_PREFIX) {
+        return None;
+    }
+    let mut tokens = file_name
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty());
+    while let Some(token) = tokens.next() {
+        if token.eq_ignore_ascii_case("release")
+            && let Some(version) = tokens
+                .next()
+                .and_then(normalize_extracted_a_ota_app_version)
+        {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn normalize_extracted_a_ota_app_version(value: &str) -> Option<String> {
+    let value = normalize_hex_2byte_text(value);
+    if value.is_empty() {
+        return None;
+    }
+    match value.len() {
+        1 | 2 => u8::from_str_radix(&value, 16)
+            .ok()
+            .map(|version| format!("{version:02X}")),
+        4 => Some(value),
+        _ => None,
+    }
+}
+
 fn validate_ota_firmware_file_name(kind: TransferKind, file_path: &str) -> Result<(), String> {
     let Some(expected_prefix) = expected_ota_firmware_prefix(kind) else {
         return Ok(());
@@ -3445,24 +3516,26 @@ fn validate_ota_firmware_file_name(kind: TransferKind, file_path: &str) -> Resul
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(trimmed_path);
-    if file_name.starts_with(expected_prefix) {
+    if ota_firmware_prefix_matches(file_name, expected_prefix) {
         return Ok(());
     }
     if let Some(actual_prefix) = [BC_OTA_FIRMWARE_PREFIX, A_OTA_FIRMWARE_PREFIX]
         .into_iter()
-        .find(|prefix| file_name.starts_with(prefix))
+        .find(|prefix| ota_firmware_prefix_matches(file_name, prefix))
     {
         return Err(format!(
             "当前升级类型为{}，但固件文件名以{}开头（{}）。请切换升级类型或选择以{}开头的固件，避免烧录错误固件导致设备变砖。",
             kind.label(),
-            actual_prefix,
+            ota_firmware_prefix_display(actual_prefix),
             ota_firmware_prefix_label(actual_prefix),
-            expected_prefix
+            ota_firmware_prefix_display(expected_prefix)
         ));
     }
     Err(format!(
         "OTA固件文件名必须以{}（C灯）或{}（A灯）开头，当前文件：{}。已禁止发起升级，避免烧录错误固件导致设备变砖。",
-        BC_OTA_FIRMWARE_PREFIX, A_OTA_FIRMWARE_PREFIX, file_name
+        ota_firmware_prefix_display(BC_OTA_FIRMWARE_PREFIX),
+        ota_firmware_prefix_display(A_OTA_FIRMWARE_PREFIX),
+        file_name
     ))
 }
 
@@ -4197,8 +4270,9 @@ impl MeshBcTesterApp {
                         if response.changed() {
                             normalize_hex_2byte_text_in_place(&mut self.bytes_a_ota_app_version);
                         }
-                        response
-                            .on_hover_text("A灯 Bytes OTA 最后一帧追加的2字节版本字段，例如0102。");
+                        response.on_hover_text(
+                            "A灯 Bytes OTA 最后一帧追加的版本字段，例如02或0102。选择release-02格式固件时会自动提取。",
+                        );
                     });
                 }
                 Self::action_button_row(ui, |ui| {
@@ -6404,19 +6478,32 @@ mod tests {
         assert!(
             validate_ota_firmware_file_name(TransferKind::BcOta, "/tmp/AP_C_BM_v1.bin").is_ok()
         );
+        assert!(
+            validate_ota_firmware_file_name(TransferKind::BcOta, "/tmp/AP-C-BM-v1.bin").is_ok()
+        );
         assert!(validate_ota_firmware_file_name(TransferKind::AOta, "/tmp/AP_A_BM_v1.bin").is_ok());
+        assert!(validate_ota_firmware_file_name(TransferKind::AOta, "/tmp/AP-A-BM-v1.bin").is_ok());
+        assert!(
+            validate_ota_firmware_file_name(
+                TransferKind::AOta,
+                "/tmp/Turbo-AP-A-BM-release-02.bin"
+            )
+            .is_ok()
+        );
         assert!(validate_ota_firmware_file_name(TransferKind::VoiceFile, "/tmp/voice.bin").is_ok());
 
-        let wrong_kind =
-            validate_ota_firmware_file_name(TransferKind::BcOta, "/tmp/AP_A_BM_v1.bin")
-                .unwrap_err();
+        let wrong_kind = validate_ota_firmware_file_name(
+            TransferKind::BcOta,
+            "/tmp/Turbo-AP-A-BM-release-02.bin",
+        )
+        .unwrap_err();
         assert!(wrong_kind.contains("当前升级类型为BC灯 OTA"));
         assert!(wrong_kind.contains("AP_C_BM"));
 
         let missing_prefix =
             validate_ota_firmware_file_name(TransferKind::AOta, "/tmp/firmware.bin").unwrap_err();
         assert!(missing_prefix.contains("AP_C_BM"));
-        assert!(missing_prefix.contains("AP_A_BM"));
+        assert!(missing_prefix.contains("AP-A-BM"));
     }
 
     #[test]
@@ -6432,6 +6519,50 @@ mod tests {
 
         assert_eq!(app.system_notice_tone, ChipTone::Error);
         assert!(app.system_notice.contains("OTA固件文件名必须以"));
+        assert!(app.pending_confirmation.is_none());
+    }
+
+    #[test]
+    fn a_ota_app_version_extracts_release_suffix_from_firmware_name() {
+        assert_eq!(
+            extract_a_ota_app_version_from_file_name("/tmp/Turbo-AP-A-BM-release-02.bin"),
+            Some("02".into())
+        );
+        assert_eq!(
+            extract_a_ota_app_version_from_file_name("/tmp/Turbo_AP_A_BM_release_0102.bin"),
+            Some("0102".into())
+        );
+        assert_eq!(
+            extract_a_ota_app_version_from_file_name("/tmp/Turbo-AP-A-BM-app.bin"),
+            None
+        );
+        assert_eq!(
+            extract_a_ota_app_version_from_file_name("/tmp/Turbo-AP-C-BM-release-02.bin"),
+            None
+        );
+    }
+
+    #[test]
+    fn start_transfer_requires_manual_a_version_when_file_name_has_no_release_version() {
+        let path =
+            std::env::temp_dir().join(format!("Turbo-AP-A-BM-app-{}.bin", current_time_stamp()));
+        fs::write(&path, [0x5A]).unwrap();
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.ota_transfer_format = OtaTransferFormat::Bytes;
+        app.config.devices = vec![test_device_profile(1, "A灯", 0)];
+        app.selected_devices.insert(1);
+
+        app.start_transfer(
+            TransferKind::AOta,
+            path.display().to_string(),
+            1,
+            String::new(),
+        );
+        let _ = fs::remove_file(path);
+
+        assert_eq!(app.system_notice_tone, ChipTone::Error);
+        assert_eq!(app.system_notice, "A灯 Bytes OTA 版本不能为空。");
+        assert!(app.bytes_a_ota_app_version.is_empty());
         assert!(app.pending_confirmation.is_none());
     }
 
@@ -7460,13 +7591,52 @@ mod tests {
             kind: PendingFileDialogKind::OtaTransferFile,
             rx,
         });
-        tx.send(Some(PathBuf::from("/tmp/AP_C_BM_firmware.bin")))
+        tx.send(Some(PathBuf::from("/tmp/AP-C-BM_firmware.bin")))
             .unwrap();
 
         app.poll_pending_file_dialog();
 
-        assert_eq!(app.ota_transfer_file, "/tmp/AP_C_BM_firmware.bin");
+        assert_eq!(app.ota_transfer_file, "/tmp/AP-C-BM_firmware.bin");
         assert!(app.pending_file_dialog.is_none());
+    }
+
+    #[test]
+    fn pending_a_ota_file_dialog_extracts_release_version() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.ota_transfer_kind = TransferKind::AOta;
+        app.pending_file_dialog = Some(PendingFileDialog {
+            kind: PendingFileDialogKind::OtaTransferFile,
+            rx,
+        });
+        tx.send(Some(PathBuf::from("/tmp/Turbo-AP-A-BM-release-02.bin")))
+            .unwrap();
+
+        app.poll_pending_file_dialog();
+
+        assert_eq!(app.ota_transfer_file, "/tmp/Turbo-AP-A-BM-release-02.bin");
+        assert_eq!(app.bytes_a_ota_app_version, "02");
+        assert!(app.system_notice.is_empty());
+    }
+
+    #[test]
+    fn pending_a_ota_file_dialog_clears_version_when_extract_fails() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = MeshBcTesterApp::new_for_test();
+        app.ota_transfer_kind = TransferKind::AOta;
+        app.bytes_a_ota_app_version = "0102".into();
+        app.pending_file_dialog = Some(PendingFileDialog {
+            kind: PendingFileDialogKind::OtaTransferFile,
+            rx,
+        });
+        tx.send(Some(PathBuf::from("/tmp/Turbo-AP-A-BM-app.bin")))
+            .unwrap();
+
+        app.poll_pending_file_dialog();
+
+        assert_eq!(app.ota_transfer_file, "/tmp/Turbo-AP-A-BM-app.bin");
+        assert!(app.bytes_a_ota_app_version.is_empty());
+        assert!(app.system_notice.is_empty());
     }
 
     #[test]
@@ -7477,12 +7647,12 @@ mod tests {
             kind: PendingFileDialogKind::OtaTransferFile,
             rx,
         });
-        tx.send(Some(PathBuf::from("/tmp/AP_A_BM_firmware.bin")))
+        tx.send(Some(PathBuf::from("/tmp/AP-A-BM_firmware.bin")))
             .unwrap();
 
         app.poll_pending_file_dialog();
 
-        assert_eq!(app.ota_transfer_file, "/tmp/AP_A_BM_firmware.bin");
+        assert_eq!(app.ota_transfer_file, "/tmp/AP-A-BM_firmware.bin");
         assert_eq!(app.system_notice_tone, ChipTone::Error);
         assert!(app.system_notice.contains("当前升级类型为BC灯 OTA"));
     }

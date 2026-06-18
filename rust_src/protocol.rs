@@ -1638,8 +1638,8 @@ pub fn parse_bytes_a_ota_app_version(value: &str) -> Result<Option<u16>, String>
     if value.is_empty() {
         return Ok(None);
     }
-    if value.len() != 4 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err("A灯 Bytes OTA 版本必须是2字节十六进制值，例如0102。".into());
+    if !matches!(value.len(), 2 | 4) || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("A灯 Bytes OTA 版本必须是十六进制值，例如02或0102。".into());
     }
     u16::from_str_radix(value, 16)
         .map(Some)
@@ -2243,8 +2243,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bytes_a_ota_app_version_requires_four_hex_digits() {
+    fn parse_bytes_a_ota_app_version_accepts_short_or_full_hex() {
         assert_eq!(parse_bytes_a_ota_app_version(""), Ok(None));
+        assert_eq!(parse_bytes_a_ota_app_version("02"), Ok(Some(0x0002)));
         assert_eq!(parse_bytes_a_ota_app_version("0102"), Ok(Some(0x0102)));
         assert!(parse_bytes_a_ota_app_version("102").is_err());
         assert!(parse_bytes_a_ota_app_version("01XZ").is_err());
